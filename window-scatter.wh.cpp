@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.3.7
+// @version         0.3.9
 // @author          SinCircle
 // @include         windhawk.exe
 // @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -lshell32 -lgdi32 -luser32 -luuid
@@ -15,8 +15,8 @@
 Win+Tab toggles the overview. Releasing the keys leaves the overview open.
 Click a window to switch; Escape or a background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
-this overview is already open. Alt+Tab retains its native behavior. Ctrl+Alt+Space and
-the tray icon are alternative triggers. Window titles are shown, with a system-accent
+this overview is already open. Alt+Tab retains its native behavior. Ctrl+Alt+Space is
+an alternative trigger. No tray icon is created. Window titles are shown, with a system-accent
 selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
@@ -34,7 +34,12 @@ Animations are submitted once; there is
 no application frame loop, screenshot loop or timer-resolution change. DWM runs
 at display refresh. Animation start and completion use the compositor's refresh
 timing. Equal animation functions share one object within a submission.
-The GPU device is prepared after startup and retained; cached wallpaper surfaces
+Automatic mode keeps the GPU device ready while memory is available. Windows
+low-memory notifications release rendering resources once the overview is hidden,
+leaving the keyboard/event listeners. Resident mode always keeps the device ready;
+Memory saver skips startup prewarming and releases it after each overview.
+Reopening after release recreates graphics resources. No periodic memory polling
+is used when Windows memory notifications are available. Cached wallpaper surfaces
 are reused per monitor and released after 60 seconds of inactivity. Wallpaper
 file timestamps and display/theme notifications invalidate stale backgrounds.
 One cached 64x64 corner mask is shared across windows. GPU transforms resize and
@@ -78,6 +83,13 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
   $description: Non-linear motion executed by DirectComposition. 0 disables animation.
 - cornerRadius: 12
   $name: Overview corner radius (DIP)
+- memoryMode: auto
+  $name: 内存模式 / Memory mode
+  $description: 自动：内存不足时在退出总览后释放图形资源。常驻：优先响应速度。省内存：每次退出后释放，下次打开需要重新初始化。
+  $options:
+  - auto: 自动 / Automatic
+  - resident: 常驻 / Resident
+  - saver: 省内存 / Memory saver
 */
 // ==/WindhawkModSettings==
 
@@ -110,7 +122,7 @@ namespace scatter {
 using Microsoft::WRL::ComPtr;
 constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
-constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kTray=WM_APP+4,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7;
+constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8;
 constexpr ULONG_PTR kInputMarker=0x57534354;
 struct Box {
     double x=0,y=0,w=0,h=0;
@@ -251,9 +263,11 @@ static double Curve(double t) {
 }
 static double CurveDerivative(double t){return 81*t*std::exp(-9*t)/(1-10*std::exp(-9.0));}
 
-struct Settings{bool winTab=true;int duration=320;float radius=12;};
+enum class MemoryMode{Automatic,Resident,Saver};
+struct Settings{bool winTab=true;int duration=320;float radius=12;MemoryMode memoryMode=MemoryMode::Automatic;};
 static std::atomic<bool> g_winTab{true};
 static std::atomic<int> g_duration{320},g_radius{12};
+static std::atomic<int> g_memoryMode{0};
 static std::atomic<HWND> g_controller{nullptr};
 static HANDLE g_thread=nullptr,g_stopEvent=nullptr,g_readyEvent=nullptr;
 static std::atomic<bool> g_ready{false};
@@ -306,6 +320,14 @@ static void ContinuousCorner(ID2D1GeometrySink*s,float x,float y,float xx,float 
 }
 static float CornerExtent(double width,double height,float radius){return std::clamp(1.5f*radius,.001f,float(std::max(.001,std::min(width,height)*.5)));}
 struct Item {
+    Item()=default;
+    Item(const Item&)=delete;
+    Item& operator=(const Item&)=delete;
+    Item(Item&&) noexcept=default;
+    Item& operator=(Item&& other) noexcept{
+        if(this!=&other){std::destroy_at(this);std::construct_at(this,std::move(other));}
+        return *this;
+    }
     HWND source=nullptr;
     Box original,target;
     Box motionFrom,motionTo;
@@ -323,6 +345,18 @@ struct Item {
     UINT32 borderColor=0;bool borderAttached=false;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
     float Outset()const{return stroke+gap;}
+    ~Item(){
+        // DComp filter inputs can keep the effect graph/device alive after the
+        // owning visuals are released. Break those links after hiding the scene,
+        // also covering partially constructed items on error paths.
+        if(content)content->SetEffect(nullptr);
+        if(cornerMask)cornerMask->SetInput(1,nullptr,0);
+        for(int n=0;n<2;++n){
+            if(cornerUnion)cornerUnion->SetInput(n,nullptr,0);
+            for(int j=0;j<2;++j)if(cornerRows[n])cornerRows[n]->SetInput(j,nullptr,0);
+        }
+        for(auto&c:corners)if(c)c->SetInput(0,nullptr,0);
+    }
 };
 struct View {
     HWND hwnd=nullptr;HMONITOR monitor=nullptr;RECT bounds{};float dpi=1;
@@ -342,7 +376,7 @@ enum class Phase{Hidden,Opening,Settled,Closing};
 class App {
 public:
     static App* instance;
-    HWND controller=nullptr;HANDLE timer=nullptr,keyboardThread=nullptr,keyboardReady=nullptr;
+    HWND controller=nullptr;HANDLE timer=nullptr,keyboardThread=nullptr,keyboardReady=nullptr,lowMemoryEvent=nullptr;
     DWORD keyboardThreadId=0;std::atomic<bool> keyboardOK{false};
     HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr;
     ComPtr<IVirtualDesktopManager> desktops;
@@ -363,11 +397,12 @@ public:
     Settings settings;Phase phase=Phase::Hidden;
     HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr;
     POINT lastPointer{};
-    bool trayAdded=false,idleTimer=false,building=false;
+    bool idleTimer=false,building=false;
+    bool memoryPressure=false;
     UINT deferredCommand=0;
     struct BuildGuard {
-        App&a;explicit BuildGuard(App&app):a(app){a.building=true;}
-        ~BuildGuard(){a.building=false;if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);}
+        App&a;bool wasBuilding;explicit BuildGuard(App&app):a(app),wasBuilding(app.building){a.building=true;}
+        ~BuildGuard(){a.building=wasBuilding;if(!wasBuilding)if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);}
     };
     LARGE_INTEGER frequency{};
     double start=0,seconds=0,from=0,to=1,progress=0;
@@ -377,7 +412,33 @@ public:
     double frameSeconds=1./60;
 
     double Now()const{LARGE_INTEGER t;QueryPerformanceCounter(&t);return double(t.QuadPart)/frequency.QuadPart;}
-    void LoadSettings(){settings={g_winTab.load(),std::clamp(g_duration.load(),0,900),float(std::clamp(g_radius.load(),0,32))};}
+    void LoadSettings(){settings={g_winTab.load(),std::clamp(g_duration.load(),0,900),float(std::clamp(g_radius.load(),0,32)),MemoryMode(std::clamp(g_memoryMode.load(),0,2))};}
+    bool LowMemory()const{
+        BOOL low=FALSE;if(lowMemoryEvent&&QueryMemoryResourceNotification(lowMemoryEvent,&low))return low!=FALSE;
+        MEMORYSTATUSEX status{sizeof(status)};
+        return GlobalMemoryStatusEx(&status)&&status.ullAvailPhys<std::min<ULONGLONG>(1024ull*1024*1024,status.ullTotalPhys/20);
+    }
+    bool ShouldReleaseGraphics()const{
+        return settings.memoryMode==MemoryMode::Saver||
+            (settings.memoryMode==MemoryMode::Automatic&&(memoryPressure||LowMemory()));
+    }
+    void ReleaseInactiveGraphics(){
+        if(building||phase!=Phase::Hidden||!ShouldReleaseGraphics())return;
+        BuildGuard guard(*this);if(timer)CancelWaitableTimer(timer);idleTimer=false;
+        ReleaseDevice();desktops.Reset();memoryPressure=false;
+        CoFreeUnusedLibrariesEx(0,0);
+        HEAP_OPTIMIZE_RESOURCES_INFORMATION info{HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,0};
+        HeapSetInformation(nullptr,HeapOptimizeResources,&info,sizeof(info));
+        // Graphics ownership is already gone. Under the low-memory/saver policy,
+        // let Windows reclaim also the now-unused DLL/allocator resident pages.
+        // This trims physical residency; it does not pretend to remove commit.
+        SetProcessWorkingSetSize(GetCurrentProcess(),SIZE_T(-1),SIZE_T(-1));
+    }
+    void MemoryBecameLow(){
+        if(settings.memoryMode!=MemoryMode::Automatic)return;
+        memoryPressure=true;
+        if(phase==Phase::Hidden)ReleaseInactiveGraphics();
+    }
     static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){return instance?instance->Message(hwnd,msg,wp,lp):DefWindowProc(hwnd,msg,wp,lp);}
     static LRESULT CALLBACK Keyboard(int code,WPARAM wp,LPARAM lp){
         // This hook has its own message thread: driver setup, wallpaper decode
@@ -433,7 +494,8 @@ public:
         controller=CreateWindowEx(WS_EX_TOOLWINDOW,kController,L"Window Scatter Controller",0,0,0,0,0,nullptr,nullptr,g_instance,nullptr);
         if(!controller)return false;g_controller.store(controller);
         timer=CreateWaitableTimer(nullptr,FALSE,nullptr);if(!timer)return false;
-        CoCreateInstance(CLSID_VirtualDesktopManager,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&desktops));
+        lowMemoryEvent=CreateMemoryResourceNotification(LowMemoryResourceNotification);
+        if(!lowMemoryEvent)Log(L"Memory notifications unavailable; using idle fallback",HRESULT_FROM_WIN32(GetLastError()));
 #ifdef SCATTER_STANDALONE
         if(g_probe)return true;
 #endif
@@ -442,8 +504,6 @@ public:
         HANDLE ready[]{keyboardReady,keyboardThread};
         if(WaitForMultipleObjects(2,ready,FALSE,5000)!=WAIT_OBJECT_0||!keyboardOK.load())return false;
         RegisterHotKey(controller,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_SPACE);
-        NOTIFYICONDATA ni{sizeof(ni)};ni.hWnd=controller;ni.uID=1;ni.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;
-        ni.uCallbackMessage=kTray;ni.hIcon=LoadIcon(nullptr,IDI_APPLICATION);wcscpy_s(ni.szTip,L"Window Scatter | Win+Tab");trayAdded=Shell_NotifyIcon(NIM_ADD,&ni)!=FALSE;
         PostMessage(controller,kWarmup,0,0);
         return true;
     }
@@ -461,7 +521,13 @@ public:
         if(SUCCEEDED(hr))hr=CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&imageFactory));
         if(FAILED(hr)){Log(L"Create compositor",hr);ReleaseDevice();return false;}return true;
     }
-    void ReleaseDevice(){desktopCache.clear();animations.clear();cornerTexture.Reset();imageFactory.Reset();textFactory.Reset();surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();effects.Reset();device.Reset();dxgi.Reset();d3d.Reset();}
+    void ReleaseDevice(){
+        BuildGuard guard(*this);
+        desktopCache.clear();animations.clear();cornerTexture.Reset();imageFactory.Reset();textFactory.Reset();
+        surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();effects.Reset();
+        if(device){HRESULT hr=device->Commit();if(SUCCEEDED(hr))device->WaitForCommitCompletion();}
+        device.Reset();dxgi.Reset();d3d.Reset();
+    }
     template<class Draw> HRESULT Paint(ComPtr<IDCompositionSurface>&surface,UINT width,UINT height,bool opaque,Draw draw){
         HRESULT hr=surfaceFactory->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,
             opaque?DXGI_ALPHA_MODE_IGNORE:DXGI_ALPHA_MODE_PREMULTIPLIED,surface.ReleaseAndGetAddressOf());
@@ -528,7 +594,7 @@ public:
         auto&a=*reinterpret_cast<App*>(data);MONITORINFO mi{sizeof(mi)};if(GetMonitorInfo(monitor,&mi)){View v;v.monitor=monitor;v.bounds=mi.rcWork;a.PrepareDesktop(v);}return TRUE;
     }
     void Warmup(){
-        if(phase!=Phase::Hidden||building)return;BuildGuard guard(*this);
+        if(phase!=Phase::Hidden||building||ShouldReleaseGraphics())return;BuildGuard guard(*this);
         if(!EnsureDevice())return;
         EnumDisplayMonitors(nullptr,nullptr,WarmMonitor,reinterpret_cast<LPARAM>(this));
         device->Commit();idleTimer=true;Schedule(60);
@@ -650,17 +716,23 @@ public:
     void Cleanup(){
         if(keyboardThread){PostThreadMessage(keyboardThreadId,WM_QUIT,0,0);WaitForSingleObject(keyboardThread,INFINITE);CloseHandle(keyboardThread);keyboardThread=nullptr;}
         if(keyboardReady){CloseHandle(keyboardReady);keyboardReady=nullptr;}
+        if(lowMemoryEvent){CloseHandle(lowMemoryEvent);lowMemoryEvent=nullptr;}
         End(false,false);
-        if(controller){UnregisterHotKey(controller,1);if(trayAdded){NOTIFYICONDATA ni{sizeof(ni)};ni.hWnd=controller;ni.uID=1;Shell_NotifyIcon(NIM_DELETE,&ni);}g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
+        if(controller){UnregisterHotKey(controller,1);g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
         if(timer){CloseHandle(timer);timer=nullptr;}ReleaseDevice();desktops.Reset();UnregisterClass(kOverlay,g_instance);UnregisterClass(kController,g_instance);
     }
     void Schedule(double delay){LARGE_INTEGER due;due.QuadPart=-std::max<LONGLONG>(1,LONGLONG(delay*10000000));SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE);}
     void Loop(){
-        HANDLE handles[]{g_stopEvent,timer};
         for(;;){
-            DWORD r=MsgWaitForMultipleObjectsEx(2,handles,INFINITE,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+            // Do not wait on an already-signaled pressure event after recording
+            // it, or after releasing graphics: that would spin while memory is low.
+            bool watch=settings.memoryMode==MemoryMode::Automatic&&device&&!memoryPressure;
+            HANDLE handles[]{g_stopEvent,timer,lowMemoryEvent};DWORD count=watch&&lowMemoryEvent?3:2;
+            DWORD timeout=watch&&!lowMemoryEvent?5000:INFINITE;
+            DWORD r=MsgWaitForMultipleObjectsEx(count,handles,timeout,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
             if(r==WAIT_OBJECT_0||r==WAIT_FAILED)break;
             if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden){idleTimer=false;desktopCache.clear();if(d2dDevice)d2dDevice->ClearResources(0);if(device)device->Commit();}else FinishTransition();}
+            if((count==3&&r==WAIT_OBJECT_0+2)||(r==WAIT_TIMEOUT&&LowMemory()))MemoryBecameLow();
             MSG msg;for(int n=0;n<64&&PeekMessage(&msg,nullptr,0,0,PM_REMOVE);++n){if(msg.message==WM_QUIT)return;TranslateMessage(&msg);DispatchMessage(&msg);}
         }
     }
@@ -765,7 +837,9 @@ public:
         if(phase!=Phase::Hidden||building)return false;
         CancelWaitableTimer(timer);idleTimer=false;
         previous=GetForegroundWindow();chosen=nullptr;progress=0;BuildGuard guard(*this);RefreshAccent();
+        memoryPressure=settings.memoryMode==MemoryMode::Automatic&&LowMemory();
         if(!EnsureDevice()){building=false;return false;}
+        if(!desktops)CoCreateInstance(CLSID_VirtualDesktopManager,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&desktops));
         EnumDisplayMonitors(nullptr,nullptr,AddMonitor,reinterpret_cast<LPARAM>(this));
         EnumWindows(AddWindow,reinterpret_cast<LPARAM>(this));
         for(auto&v:views)if(!v->items.empty()&&!CreateView(*v)){building=false;End(false);return false;}
@@ -969,7 +1043,11 @@ public:
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
         views.clear();previous=chosen=selectedSource=nullptr;progress=0;
-        if(idle&&timer&&device){idleTimer=true;Schedule(60);}
+        if(device)device->Commit(); // Submit the filter-input detachments from Item destruction.
+        if(idle&&timer&&device){
+            if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
+            else{idleTimer=true;Schedule(60);}
+        }
     }
     int Hit(const View&v,POINT p){
         auto hit=[&](int n){Box b=CurrentBox(v.items[n]);return p.x>=b.x&&p.x<b.right()&&p.y>=b.y&&p.y<b.bottom();};
@@ -1010,27 +1088,24 @@ public:
                                       (GetAsyncKeyState(VK_LSHIFT)&0x8000)!=0,(GetAsyncKeyState(VK_RSHIFT)&0x8000)!=0);
         if(SendInput(UINT(keys.size()),keys.data(),sizeof(INPUT))!=keys.size())Log(L"Open Windows Task View",HRESULT_FROM_WIN32(GetLastError()));
     }
-    void TrayMenu(){
-        HMENU menu=CreatePopupMenu();AppendMenu(menu,MF_STRING,1,L"打开窗口总览");AppendMenu(menu,MF_STRING,2,L"退出");POINT p;GetCursorPos(&p);SetForegroundWindow(controller);
-        UINT cmd=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTBUTTON,p.x,p.y,0,controller,nullptr);DestroyMenu(menu);PostMessage(controller,WM_NULL,0,0);
-        if(cmd==1)Begin();else if(cmd==2)SetEvent(g_stopEvent);
-    }
     LRESULT Message(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(msg==WM_NCCREATE){auto cs=reinterpret_cast<CREATESTRUCT*>(lp);if(cs->lpCreateParams)SetWindowLongPtr(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(cs->lpCreateParams));}
         auto v=reinterpret_cast<View*>(GetWindowLongPtr(hwnd,GWLP_USERDATA));
         if(building){
-            if(msg==kToggle||(msg==WM_HOTKEY&&wp==1)||(msg==kTray&&lp==WM_LBUTTONUP)){deferredCommand=deferredCommand==kToggle?0:kToggle;return 0;}
+            if(msg==kToggle||(msg==WM_HOTKEY&&wp==1)){deferredCommand=deferredCommand==kToggle?0:kToggle;return 0;}
             if(msg==kSettings||msg==kNativeTaskView){deferredCommand=msg;return 0;}
         }
         switch(msg){
         case WM_HOTKEY:if(wp==1){if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);}return 0;
         case kToggle:if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);return 0;
         case kNativeTaskView:NativeTaskView();return 0;
-        case kSettings:End(false);LoadSettings();return 0;
+        case kSettings:End(false);LoadSettings();memoryPressure=false;
+            if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
+            else if(!device)PostMessage(controller,kWarmup,0,0);return 0;
+        case kReleaseInactive:ReleaseInactiveGraphics();return 0;
         case kWarmup:Warmup();return 0;
         case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
-        case kTray:if(lp==WM_LBUTTONUP){if(phase==Phase::Hidden)Begin();else Close(nullptr);}else if(lp==WM_RBUTTONUP||lp==WM_CONTEXTMENU)TrayMenu();return 0;
         case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
         case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:desktopCache.clear();if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
         case WM_QUERYENDSESSION:return TRUE;
@@ -1079,7 +1154,12 @@ static void Stop(){if(g_stopEvent)SetEvent(g_stopEvent);if(g_thread){WaitForSing
 } // namespace scatter
 
 #ifndef SCATTER_STANDALONE
-static void ReadSettings(){scatter::g_winTab=Wh_GetIntSetting(L"replaceWinTab")!=0;scatter::g_duration=Wh_GetIntSetting(L"durationMs");scatter::g_radius=Wh_GetIntSetting(L"cornerRadius");}
+static void ReadSettings(){
+    scatter::g_winTab=Wh_GetIntSetting(L"replaceWinTab")!=0;scatter::g_duration=Wh_GetIntSetting(L"durationMs");scatter::g_radius=Wh_GetIntSetting(L"cornerRadius");
+    auto mode=Wh_GetStringSetting(L"memoryMode");
+    scatter::g_memoryMode=mode&&!wcscmp(mode,L"resident")?1:mode&&!wcscmp(mode,L"saver")?2:0;
+    if(mode)Wh_FreeStringSetting(mode);
+}
 BOOL WhTool_ModInit(){GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&WhTool_ModInit),&scatter::g_instance);ReadSettings();if(!scatter::Start()){scatter::Stop();return FALSE;}return TRUE;}
 void WhTool_ModSettingsChanged(){ReadSettings();if(auto hwnd=scatter::g_controller.load())PostMessage(hwnd,scatter::kSettings,0,0);}
 void WhTool_ModUninit(){scatter::Stop();}
