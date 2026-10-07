@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.3.6
+// @version         0.3.7
 // @author          SinCircle
 // @include         windhawk.exe
 // @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -lshell32 -lgdi32 -luser32 -luuid
@@ -32,12 +32,19 @@ motion. Source rectangles use visible-frame coordinates relative to the outer
 window, preventing invisible resize margins from shifting or clipping previews.
 Animations are submitted once; there is
 no application frame loop, screenshot loop or timer-resolution change. DWM runs
-at display refresh. One-shot timers finish transitions and release the cached GPU
-device after 15 seconds of inactivity.
+at display refresh. Animation start and completion use the compositor's refresh
+timing. Equal animation functions share one object within a submission.
+The GPU device is prepared after startup and retained; cached wallpaper surfaces
+are reused per monitor and released after 60 seconds of inactivity. Wallpaper
+file timestamps and display/theme notifications invalidate stale backgrounds.
 One cached 64x64 corner mask is shared across windows. GPU transforms resize and
 place its four copies; no masks or window screenshots are redrawn during animation.
 The outline follows the same C2 path at a constant 4 DIP distance and tracks the
 Windows accent color when opening the overview or receiving a theme notification.
+Only a hovered window allocates an outline; inactive outlines are detached.
+Keyboard interception runs on a separate sleeping thread. Native activation
+happens after animation submission, so a slow input queue cannot delay its start. Reversing a closing animation reuses the existing scene.
+Animated click targets follow the same front-to-back order as the previews.
 
 An opaque wallpaper background covers the original windows during the overview.
 The wallpaper is beneath all window previews, with the selection outline behind
@@ -96,13 +103,14 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <memory>
 #include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace scatter {
 using Microsoft::WRL::ComPtr;
 constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
-constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kTray=WM_APP+4,kNativeTaskView=WM_APP+5;
+constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kTray=WM_APP+4,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7;
 constexpr ULONG_PTR kInputMarker=0x57534354;
 struct Box {
     double x=0,y=0,w=0,h=0;
@@ -300,6 +308,8 @@ static float CornerExtent(double width,double height,float radius){return std::c
 struct Item {
     HWND source=nullptr;
     Box original,target;
+    Box motionFrom,motionTo;
+    float radiusFrom=0,radiusTo=0;
     SIZE pixels{};
     float nativeRadius=0;
     HTHUMBNAIL thumbnail=nullptr;
@@ -310,22 +320,30 @@ struct Item {
     ComPtr<CompositeEffect> cornerRows[2],cornerUnion,cornerMask;
     ComPtr<IDCompositionEffectGroup> borderEffect,labelEffect;
     ComPtr<IDCompositionSurface> labelSurface,borderSurface;
+    UINT32 borderColor=0;bool borderAttached=false;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
     float Outset()const{return stroke+gap;}
 };
 struct View {
     HWND hwnd=nullptr;HMONITOR monitor=nullptr;RECT bounds{};float dpi=1;
     std::vector<Item> items;int selected=-1;
+    std::vector<int> hitOrder; // Front to back, matching the visual tree.
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual2> root,windows,desktop;
     ComPtr<IDCompositionSurface> wallpaperSurface;
+};
+struct DesktopCache {
+    HMONITOR monitor=nullptr;RECT bounds{},display{};std::wstring path;
+    FILETIME modified{};COLORREF color=0;DESKTOP_WALLPAPER_POSITION mode=DWPOS_FILL;
+    ComPtr<IDCompositionSurface> surface;
 };
 enum class Phase{Hidden,Opening,Settled,Closing};
 
 class App {
 public:
     static App* instance;
-    HWND controller=nullptr;HANDLE timer=nullptr;HHOOK keyboard=nullptr;
+    HWND controller=nullptr;HANDLE timer=nullptr,keyboardThread=nullptr,keyboardReady=nullptr;
+    DWORD keyboardThreadId=0;std::atomic<bool> keyboardOK{false};
     HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr;
     ComPtr<IVirtualDesktopManager> desktops;
     ComPtr<ID3D11Device> d3d;
@@ -339,35 +357,45 @@ public:
     UINT32 accentColor=0;
     ComPtr<IDWriteFactory> textFactory;
     ComPtr<IWICImagingFactory> imageFactory;
-    std::wstring cachedWallpaperPath;
-    ComPtr<IWICBitmap> cachedWallpaper;
+    std::vector<DesktopCache> desktopCache;
     PrivateDwm api;
     std::vector<std::unique_ptr<View>> views;
     Settings settings;Phase phase=Phase::Hidden;
     HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr;
     POINT lastPointer{};
-    bool swallowedTab=false,trayAdded=false,idleTimer=false,building=false;
+    bool trayAdded=false,idleTimer=false,building=false;
+    UINT deferredCommand=0;
+    struct BuildGuard {
+        App&a;explicit BuildGuard(App&app):a(app){a.building=true;}
+        ~BuildGuard(){a.building=false;if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);}
+    };
     LARGE_INTEGER frequency{};
     double start=0,seconds=0,from=0,to=1,progress=0;
     LONGLONG animationStart=0;
+    struct AnimationEntry {double a,b;ComPtr<IDCompositionAnimation> animation;};
+    std::vector<AnimationEntry> animations;
+    double frameSeconds=1./60;
 
     double Now()const{LARGE_INTEGER t;QueryPerformanceCounter(&t);return double(t.QuadPart)/frequency.QuadPart;}
     void LoadSettings(){settings={g_winTab.load(),std::clamp(g_duration.load(),0,900),float(std::clamp(g_radius.load(),0,32))};}
     static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){return instance?instance->Message(hwnd,msg,wp,lp):DefWindowProc(hwnd,msg,wp,lp);}
     static LRESULT CALLBACK Keyboard(int code,WPARAM wp,LPARAM lp){
+        // This hook has its own message thread: driver setup, wallpaper decode
+        // and presentation fences must never stall the system keyboard queue.
+        static thread_local bool swallowedTab=false;
         App*a=instance;
         if(code==HC_ACTION&&a){
             auto&k=*reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
             if(k.dwExtraInfo==kInputMarker)return CallNextHookEx(nullptr,code,wp,lp);
             bool down=wp==WM_KEYDOWN||wp==WM_SYSKEYDOWN,up=wp==WM_KEYUP||wp==WM_SYSKEYUP;
             if(k.vkCode==VK_TAB){
-                if(up&&a->swallowedTab){a->swallowedTab=false;return 1;}
-                if(down&&a->swallowedTab)return 1; // No autorepeat toggles.
+                if(up&&swallowedTab){swallowedTab=false;return 1;}
+                if(down&&swallowedTab)return 1; // No autorepeat toggles.
                 bool win=(GetAsyncKeyState(VK_LWIN)&0x8000)||(GetAsyncKeyState(VK_RWIN)&0x8000);
                 bool alt=(k.flags&LLKHF_ALTDOWN)||(GetAsyncKeyState(VK_MENU)&0x8000);
                 bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
-                if(down&&a->settings.winTab&&win&&!alt&&!ctrl){
-                    a->swallowedTab=true;
+                if(down&&g_winTab.load()&&win&&!alt&&!ctrl){
+                    swallowedTab=true;
                     // Prevent a bare Win key release from opening Start after
                     // we consume Tab. Our tagged events bypass this hook.
                     INPUT mask[2]{};for(auto&i:mask){i.type=INPUT_KEYBOARD;i.ki.wVk=0xFF;i.ki.dwExtraInfo=kInputMarker;}
@@ -378,9 +406,21 @@ public:
             }
         }return CallNextHookEx(nullptr,code,wp,lp);
     }
+    static DWORD WINAPI KeyboardMain(void* context){
+        auto&a=*static_cast<App*>(context);MSG msg;PeekMessage(&msg,nullptr,0,0,PM_NOREMOVE);
+        HHOOK hook=SetWindowsHookEx(WH_KEYBOARD_LL,Keyboard,g_instance,0);
+        a.keyboardOK.store(hook!=nullptr);SetEvent(a.keyboardReady);
+        if(hook){while(GetMessage(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessage(&msg);}UnhookWindowsHookEx(hook);}
+        return 0;
+    }
+    void FocusOverview(){
+        HWND focus=nullptr;POINT p{};GetCursorPos(&p);HMONITOR monitor=MonitorFromPoint(p,MONITOR_DEFAULTTONEAREST);
+        for(auto&v:views)if(v->hwnd&&(!focus||v->monitor==monitor))focus=v->hwnd;
+        if(focus){SetForegroundWindow(focus);SetFocus(focus);}
+    }
     static void CALLBACK Event(HWINEVENTHOOK,DWORD event,HWND hwnd,LONG object,LONG child,DWORD,DWORD){
         App*a=instance;if(!a||a->phase==Phase::Hidden)return;
-        if(event==EVENT_SYSTEM_FOREGROUND)PostMessage(a->controller,kDismiss,0,0);
+        if(event==EVENT_SYSTEM_FOREGROUND)PostMessage(a->controller,a->phase==Phase::Closing?kSyncOrder:kDismiss,0,0);
         else if(event==EVENT_OBJECT_DESTROY&&object==OBJID_WINDOW&&child==0)
             for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){PostMessage(a->controller,kDismiss,1,0);return;}
     }
@@ -397,14 +437,19 @@ public:
 #ifdef SCATTER_STANDALONE
         if(g_probe)return true;
 #endif
-        if(settings.winTab){keyboard=SetWindowsHookEx(WH_KEYBOARD_LL,Keyboard,g_instance,0);if(!keyboard)return false;}
+        keyboardReady=CreateEvent(nullptr,TRUE,FALSE,nullptr);if(!keyboardReady)return false;
+        keyboardThread=CreateThread(nullptr,0,KeyboardMain,this,0,&keyboardThreadId);if(!keyboardThread)return false;
+        HANDLE ready[]{keyboardReady,keyboardThread};
+        if(WaitForMultipleObjects(2,ready,FALSE,5000)!=WAIT_OBJECT_0||!keyboardOK.load())return false;
         RegisterHotKey(controller,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_SPACE);
         NOTIFYICONDATA ni{sizeof(ni)};ni.hWnd=controller;ni.uID=1;ni.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;
         ni.uCallbackMessage=kTray;ni.hIcon=LoadIcon(nullptr,IDI_APPLICATION);wcscpy_s(ni.szTip,L"Window Scatter | Win+Tab");trayAdded=Shell_NotifyIcon(NIM_ADD,&ni)!=FALSE;
+        PostMessage(controller,kWarmup,0,0);
         return true;
     }
     bool EnsureDevice(){
-        if(device)return true;
+        if(device&&d3d&&SUCCEEDED(d3d->GetDeviceRemovedReason()))return true;
+        if(device)ReleaseDevice();
         HRESULT hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&d3d,nullptr,nullptr);
         if(SUCCEEDED(hr))hr=d3d.As(&dxgi);
         if(SUCCEEDED(hr))hr=DCompositionCreateDevice3(dxgi.Get(),IID_PPV_ARGS(&device));
@@ -416,7 +461,7 @@ public:
         if(SUCCEEDED(hr))hr=CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&imageFactory));
         if(FAILED(hr)){Log(L"Create compositor",hr);ReleaseDevice();return false;}return true;
     }
-    void ReleaseDevice(){cachedWallpaper.Reset();cachedWallpaperPath.clear();cornerTexture.Reset();imageFactory.Reset();textFactory.Reset();surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();effects.Reset();device.Reset();dxgi.Reset();d3d.Reset();}
+    void ReleaseDevice(){desktopCache.clear();animations.clear();cornerTexture.Reset();imageFactory.Reset();textFactory.Reset();surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();effects.Reset();device.Reset();dxgi.Reset();d3d.Reset();}
     template<class Draw> HRESULT Paint(ComPtr<IDCompositionSurface>&surface,UINT width,UINT height,bool opaque,Draw draw){
         HRESULT hr=surfaceFactory->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,
             opaque?DXGI_ALPHA_MODE_IGNORE:DXGI_ALPHA_MODE_PREMULTIPLIED,surface.ReleaseAndGetAddressOf());
@@ -428,7 +473,7 @@ public:
         ctx->Clear(D2D1::ColorF(0,0.f));draw(ctx.Get());ctx->PopAxisAlignedClip();
         return surface->EndDraw();
     }
-    bool CreateDesktop(View&v){
+    bool PrepareDesktop(View&v){
         MONITORINFO mi{sizeof(mi)};GetMonitorInfo(v.monitor,&mi);
         RECT display=mi.rcMonitor;COLORREF color=GetSysColor(COLOR_DESKTOP);
         DESKTOP_WALLPAPER_POSITION mode=DWPOS_FILL;std::wstring path;
@@ -443,23 +488,27 @@ public:
             }
         }
         if(path.empty()){wchar_t file[32768]{};if(SystemParametersInfo(SPI_GETDESKWALLPAPER,32768,file,0))path=file;}
-        if(path!=cachedWallpaperPath){
-            cachedWallpaper.Reset();cachedWallpaperPath=path;
+        if(mode==DWPOS_SPAN)display={GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo{};if(!path.empty())GetFileAttributesEx(path.c_str(),GetFileExInfoStandard,&fileInfo);
+        auto found=std::find_if(desktopCache.begin(),desktopCache.end(),[&](const auto&c){return c.monitor==v.monitor;});
+        if(found!=desktopCache.end()&&found->path==path&&found->mode==mode&&found->color==color&&
+           EqualRect(&found->bounds,&v.bounds)&&EqualRect(&found->display,&display)&&CompareFileTime(&found->modified,&fileInfo.ftLastWriteTime)==0){v.wallpaperSurface=found->surface;return true;}
+        ComPtr<IWICBitmap> bitmapSource;
+        {
             ComPtr<IWICBitmapDecoder> decoder;ComPtr<IWICBitmapFrameDecode> frame;ComPtr<IWICFormatConverter> converter;
             HRESULT hr=path.empty()?E_FAIL:imageFactory->CreateDecoderFromFilename(path.c_str(),nullptr,GENERIC_READ,WICDecodeMetadataCacheOnLoad,&decoder);
             if(SUCCEEDED(hr))hr=decoder->GetFrame(0,&frame);
             if(SUCCEEDED(hr))hr=imageFactory->CreateFormatConverter(&converter);
             if(SUCCEEDED(hr))hr=converter->Initialize(frame.Get(),GUID_WICPixelFormat32bppPBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom);
-            if(SUCCEEDED(hr))imageFactory->CreateBitmapFromSource(converter.Get(),WICBitmapCacheOnLoad,&cachedWallpaper);
+            if(SUCCEEDED(hr))imageFactory->CreateBitmapFromSource(converter.Get(),WICBitmapCacheOnLoad,&bitmapSource);
         }
-        if(mode==DWPOS_SPAN)display={GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)};
         UINT width=v.bounds.right-v.bounds.left,height=v.bounds.bottom-v.bounds.top;
         HRESULT hr=Paint(v.wallpaperSurface,width,height,true,[&](ID2D1DeviceContext*ctx){
             // This opaque base is mandatory: excluding a live window may leave
             // transparent pixels, which otherwise expose the ORIGINAL window.
             ctx->Clear(D2D1::ColorF(GetRValue(color)/255.f,GetGValue(color)/255.f,GetBValue(color)/255.f,1.f));
-            if(!cachedWallpaper)return;ComPtr<ID2D1Bitmap> bitmap;
-            if(FAILED(ctx->CreateBitmapFromWicBitmap(cachedWallpaper.Get(),nullptr,&bitmap)))return;
+            if(!bitmapSource)return;ComPtr<ID2D1Bitmap> bitmap;
+            if(FAILED(ctx->CreateBitmapFromWicBitmap(bitmapSource.Get(),nullptr,&bitmap)))return;
             auto size=bitmap->GetSize();if(size.width<1||size.height<1)return;
             float mw=float(display.right-display.left),mh=float(display.bottom-display.top);
             float x=float(display.left-v.bounds.left),y=float(display.top-v.bounds.top),w=size.width,h=size.height;
@@ -468,7 +517,25 @@ public:
             else if(mode!=DWPOS_CENTER){float scale=mode==DWPOS_FIT?std::min(mw/w,mh/h):std::max(mw/w,mh/h);w*=scale;h*=scale;}
             x+=(mw-w)*.5f;y+=(mh-h)*.5f;ctx->DrawBitmap(bitmap.Get(),D2D1::RectF(x,y,x+w,y+h));
         });
-        if(SUCCEEDED(hr))hr=device->CreateVisual(&v.desktop);
+        if(FAILED(hr)){Log(L"Prepare wallpaper",hr);return false;}
+        DesktopCache entry{v.monitor,v.bounds,display,path,fileInfo.ftLastWriteTime,color,mode,v.wallpaperSurface};
+        // COM/painting can dispatch a settings notification that invalidates
+        // the cache; never retain an iterator across those calls.
+        std::erase_if(desktopCache,[&](const auto&c){return c.monitor==v.monitor;});desktopCache.push_back(std::move(entry));
+        return true;
+    }
+    static BOOL CALLBACK WarmMonitor(HMONITOR monitor,HDC,LPRECT,LPARAM data){
+        auto&a=*reinterpret_cast<App*>(data);MONITORINFO mi{sizeof(mi)};if(GetMonitorInfo(monitor,&mi)){View v;v.monitor=monitor;v.bounds=mi.rcWork;a.PrepareDesktop(v);}return TRUE;
+    }
+    void Warmup(){
+        if(phase!=Phase::Hidden||building)return;BuildGuard guard(*this);
+        if(!EnsureDevice())return;
+        EnumDisplayMonitors(nullptr,nullptr,WarmMonitor,reinterpret_cast<LPARAM>(this));
+        device->Commit();idleTimer=true;Schedule(60);
+    }
+    bool CreateDesktop(View&v){
+        if(!PrepareDesktop(v))return false;
+        HRESULT hr=device->CreateVisual(&v.desktop);
         if(SUCCEEDED(hr))hr=v.desktop->SetContent(v.wallpaperSurface.Get());
         // With a null reference, AddVisual(FALSE) inserts ABOVE all siblings.
         // An explicit sibling reference keeps the wallpaper below the windows.
@@ -482,7 +549,7 @@ public:
         else{COLORREF c=GetSysColor(COLOR_HIGHLIGHT);rgb=(GetRValue(c)<<16)|(GetGValue(c)<<8)|GetBValue(c);}
         if(rgb==accentColor)return;accentColor=rgb;
         if(!building&&phase!=Phase::Hidden&&device){
-            for(auto&v:views)for(auto&i:v->items)if(!CreateOutline(*v,i)){End(false);return;}
+            for(auto&v:views)for(auto&i:v->items)if(i.borderAttached&&!CreateOutline(*v,i)){End(false);return;}
             device->Commit();
         }
     }
@@ -550,10 +617,13 @@ public:
             ctx->FillGeometry(path.Get(),clear.Get());ctx->DrawGeometry(path.Get(),clear.Get(),2*i.gap);
         });
         if(SUCCEEDED(hr))hr=i.borderFill->SetContent(i.borderSurface.Get());
+        if(SUCCEEDED(hr))i.borderColor=accentColor;
         return SUCCEEDED(hr);
     }
     bool CreateTitle(View&v,Item&i){
-        if(!CreateOutline(v,i))return false;
+        // Only the selected preview needs a border surface. Avoid allocating
+        // and rasterizing one full-size transparent bitmap for every window.
+        i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
         wchar_t title[512]{};GetWindowText(i.source,title,512);if(!title[0])wcscpy_s(title,L"Window");
         UINT width=UINT(std::max(1.,std::ceil(i.target.w))),height=UINT(std::ceil(25*v.dpi));
         HRESULT hr=Paint(i.labelSurface,width,height,false,[&](ID2D1DeviceContext*ctx){
@@ -578,7 +648,9 @@ public:
         return SUCCEEDED(hr);
     }
     void Cleanup(){
-        End(false,false);if(keyboard){UnhookWindowsHookEx(keyboard);keyboard=nullptr;}
+        if(keyboardThread){PostThreadMessage(keyboardThreadId,WM_QUIT,0,0);WaitForSingleObject(keyboardThread,INFINITE);CloseHandle(keyboardThread);keyboardThread=nullptr;}
+        if(keyboardReady){CloseHandle(keyboardReady);keyboardReady=nullptr;}
+        End(false,false);
         if(controller){UnregisterHotKey(controller,1);if(trayAdded){NOTIFYICONDATA ni{sizeof(ni)};ni.hWnd=controller;ni.uID=1;Shell_NotifyIcon(NIM_DELETE,&ni);}g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
         if(timer){CloseHandle(timer);timer=nullptr;}ReleaseDevice();desktops.Reset();UnregisterClass(kOverlay,g_instance);UnregisterClass(kController,g_instance);
     }
@@ -588,7 +660,7 @@ public:
         for(;;){
             DWORD r=MsgWaitForMultipleObjectsEx(2,handles,INFINITE,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
             if(r==WAIT_OBJECT_0||r==WAIT_FAILED)break;
-            if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden){idleTimer=false;ReleaseDevice();}else FinishTransition();}
+            if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden){idleTimer=false;desktopCache.clear();if(d2dDevice)d2dDevice->ClearResources(0);if(device)device->Commit();}else FinishTransition();}
             MSG msg;for(int n=0;n<64&&PeekMessage(&msg,nullptr,0,0,PM_REMOVE);++n){if(msg.message==WM_QUIT)return;TranslateMessage(&msg);DispatchMessage(&msg);}
         }
     }
@@ -683,7 +755,6 @@ public:
         i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);
         i.border->SetOffsetX(-i.Outset());i.border->SetOffsetY(-i.Outset());
         i.borderEffect->SetOpacity(0.f);i.border->SetEffect(i.borderEffect.Get());
-        i.position->AddVisual(i.border.Get(),FALSE,i.content.Get());
         i.nativeRadius=IsZoomed(i.source)?0.f:8.f*v.dpi;
         DWORD preference=DWMWCP_DEFAULT;
         if(SUCCEEDED(DwmGetWindowAttribute(i.source,DWMWA_WINDOW_CORNER_PREFERENCE,&preference,sizeof(preference)))&&preference==DWMWCP_DONOTROUND)i.nativeRadius=0;
@@ -691,9 +762,9 @@ public:
         return CreateCorners(i);
     }
     bool Begin(){
-        if(phase!=Phase::Hidden)return false;
+        if(phase!=Phase::Hidden||building)return false;
         CancelWaitableTimer(timer);idleTimer=false;
-        previous=GetForegroundWindow();chosen=nullptr;progress=0;building=true;RefreshAccent();
+        previous=GetForegroundWindow();chosen=nullptr;progress=0;BuildGuard guard(*this);RefreshAccent();
         if(!EnsureDevice()){building=false;return false;}
         EnumDisplayMonitors(nullptr,nullptr,AddMonitor,reinterpret_cast<LPARAM>(this));
         EnumWindows(AddWindow,reinterpret_cast<LPARAM>(this));
@@ -733,11 +804,11 @@ public:
     }
     template<class Setter> void Property(double a,double b,Setter setter){
         if(seconds<=0||std::abs(b-a)<.00001){setter(float(b));return;}
+        for(auto&e:animations)if(e.a==a&&e.b==b){setter(e.animation.Get());return;}
         ComPtr<IDCompositionAnimation> animation;
         if(FAILED(device->CreateAnimation(&animation))){setter(float(b));return;}
         // Twelve Hermite cubics approximate critically damped motion. All share
         // an absolute QPC start so position, scale and corner clips stay in sync.
-        LARGE_INTEGER begin{};begin.QuadPart=animationStart;animation->SetAbsoluteBeginTime(begin);
         constexpr int parts=12;double dt=seconds/parts,delta=b-a;
         for(int j=0;j<parts;++j){
             double u=double(j)/parts,v=double(j+1)/parts;
@@ -746,7 +817,7 @@ public:
             double c2=(3*(f1-f0)/dt-2*m0-m1)/dt,c3=(2*(f0-f1)/dt+m0+m1)/(dt*dt);
             animation->AddCubic(j*dt,float(f0),float(m0),float(c2),float(c3));
         }
-        animation->End(seconds,float(b));setter(animation.Get());
+        animation->End(seconds,float(b));setter(animation.Get());animations.push_back({a,b,std::move(animation)});
     }
     static void Corners(Item&i,const Box&b,float radius){
         float s=CornerExtent(b.w,b.h,radius)/kCornerTexture;
@@ -760,6 +831,19 @@ public:
             i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+2*i.Outset())/i.borderHeight);
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h+i.Outset()+6*v->dpi));i.labelEffect->SetOpacity(float(p));}
             Corners(i,b,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*p));
+            i.motionFrom=i.motionTo=b;i.radiusFrom=i.radiusTo=float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*p);
+        }
+    }
+    double MotionFraction()const{return Curve(seconds<=0?1:(Now()-start)/seconds);}
+    Box CurrentBox(const Item&i)const{
+        if(phase==Phase::Hidden)return i.original;if(phase==Phase::Settled)return i.target;
+        return Mix(i.motionFrom,i.motionTo,MotionFraction());
+    }
+    void CaptureMotion(){
+        double t=MotionFraction();
+        for(auto&v:views)for(auto&i:v->items){
+            Box b=CurrentBox(i);float r=phase==Phase::Hidden?i.nativeRadius:phase==Phase::Settled?settings.radius*v->dpi:float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*t);
+            i.motionFrom=b;i.radiusFrom=r;
         }
     }
     double CurrentProgress(){
@@ -767,14 +851,15 @@ public:
         if(phase==Phase::Hidden)return 0;
         return from+(to-from)*Curve(seconds<=0?1:(Now()-start)/seconds);
     }
-    void Animate(double destination){
+    void Animate(double destination,bool captured=false){
+        if(!captured)CaptureMotion();animations.clear();
         from=progress;to=destination;
-        BOOL animations=TRUE;SystemParametersInfo(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
-        seconds=(animations?settings.duration:0)/1000.0*std::abs(to-from);
-        LARGE_INTEGER qpc;QueryPerformanceCounter(&qpc);animationStart=qpc.QuadPart+frequency.QuadPart/120;
-        start=double(animationStart)/frequency.QuadPart;phase=to==1?Phase::Opening:Phase::Closing;
+        BOOL enabled=TRUE;SystemParametersInfo(SPI_GETCLIENTAREAANIMATION,0,&enabled,0);
+        seconds=(enabled?settings.duration:0)/1000.0*std::abs(to-from);
+        phase=to==1?Phase::Opening:Phase::Closing;
         for(auto&v:views)for(auto&i:v->items){
-            Box a=Mix(i.original,i.target,from),b=Mix(i.original,i.target,to);
+            Box a=i.motionFrom,b=destination==1?i.target:i.original;i.motionTo=b;
+            i.radiusTo=destination==1?settings.radius*v->dpi:i.nativeRadius;
             Property(a.x,b.x,[&](auto value){i.position->SetOffsetX(value);});
             Property(a.y,b.y,[&](auto value){i.position->SetOffsetY(value);});
             Property(a.w/i.pixels.cx,b.w/i.pixels.cx,[&](auto value){i.scale->SetScaleX(value);});
@@ -788,8 +873,8 @@ public:
                 Property(a.h+i.Outset()+6*v->dpi,b.h+i.Outset()+6*v->dpi,[&](auto value){i.label->SetOffsetY(value);});
                 Property(from,to,[&](auto value){i.labelEffect->SetOpacity(value);});
             }
-            double ra=CornerExtent(a.w,a.h,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*from))/kCornerTexture;
-            double rb=CornerExtent(b.w,b.h,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*to))/kCornerTexture;
+            double ra=CornerExtent(a.w,a.h,i.radiusFrom)/kCornerTexture;
+            double rb=CornerExtent(b.w,b.h,i.radiusTo)/kCornerTexture;
             for(int n=0;n<4;++n){
                 auto*c=i.corners[n].Get();float sx=(n&1)?-1.f:1.f,sy=(n&2)?-1.f:1.f;
                 Property(sx*ra,sx*rb,[&](auto value){c->SetTransformMatrixElement(0,0,value);});
@@ -798,8 +883,23 @@ public:
                 if(n&2)Property(a.h,b.h,[&](auto value){c->SetTransformMatrixElement(2,1,value);});
             }
         }
+        // Set one start AFTER building the batch. Expensive submission must not
+        // consume the beginning of the animation. Use the compositor's actual
+        // next-frame estimate instead of assuming a 120 Hz display.
+        LARGE_INTEGER qpc;QueryPerformanceCounter(&qpc);animationStart=qpc.QuadPart;
+        DCOMPOSITION_FRAME_STATISTICS stats{};
+        if(SUCCEEDED(device->GetFrameStatistics(&stats))){
+            if(stats.currentCompositionRate.Numerator&&stats.currentCompositionRate.Denominator)
+                frameSeconds=std::clamp(double(stats.currentCompositionRate.Denominator)/stats.currentCompositionRate.Numerator,1./360,.1);
+            if(stats.nextEstimatedFrameTime.QuadPart>=qpc.QuadPart&&stats.nextEstimatedFrameTime.QuadPart-qpc.QuadPart<frequency.QuadPart/10)
+                animationStart=stats.nextEstimatedFrameTime.QuadPart;
+        }
+        start=double(animationStart)/frequency.QuadPart;LARGE_INTEGER begin{};begin.QuadPart=animationStart;
+        for(auto&e:animations)e.animation->SetAbsoluteBeginTime(begin);
         HRESULT hr=device->Commit();if(FAILED(hr)){Log(L"Animate",hr);End(true);return;}
-        Schedule(seconds+.045);
+        animations.clear();
+        if(seconds<=0){FinishTransition();return;}
+        Schedule(std::max(0.,start+seconds-Now())+frameSeconds);
     }
     void FinishTransition(){
         if(phase!=Phase::Opening&&phase!=Phase::Closing)return;
@@ -808,36 +908,43 @@ public:
         phase=Phase::Settled;
     }
     static BOOL CALLBACK CollectZOrder(HWND hwnd,LPARAM p){reinterpret_cast<std::vector<HWND>*>(p)->push_back(hwnd);return TRUE;}
-    void FollowNativeZOrder(){
+    void FollowNativeZOrder(HWND preferred=nullptr){
         std::vector<HWND> native;
         EnumWindows(CollectZOrder,reinterpret_cast<LPARAM>(&native));
+        if(preferred){std::erase(native,preferred);auto position=native.begin();
+            if(!(GetWindowLongPtr(preferred,GWL_EXSTYLE)&WS_EX_TOPMOST))position=std::find_if(native.begin(),native.end(),[](HWND w){return !(GetWindowLongPtr(w,GWL_EXSTYLE)&WS_EX_TOPMOST);});
+            native.insert(position,preferred);
+        }
         for(auto&v:views)if(v->windows){
             v->windows->RemoveAllVisuals();
+            v->hitOrder.clear();for(HWND w:native)for(size_t n=0;n<v->items.size();++n)if(v->items[n].source==w)v->hitOrder.push_back(int(n));
             for(auto hwnd=native.rbegin();hwnd!=native.rend();++hwnd)
                 for(auto&i:v->items)if(i.source==*hwnd){v->windows->AddVisual(i.position.Get(),FALSE,nullptr);break;}
         }
     }
     void Close(HWND selection){
         if(phase==Phase::Hidden||phase==Phase::Closing)return;
-        progress=CurrentProgress();chosen=selection;phase=Phase::Closing;
+        progress=CurrentProgress();CaptureMotion();chosen=selection;
         HWND target=chosen?chosen:previous;
-        // Activate FIRST, behind the compositor scene. Both real windows and
-        // returning visuals then share the native order and active decoration.
-        if(IsWindow(target)){
-            SetForegroundWindow(target);
-            // Foreground activation is asynchronous across input queues. Wait
-            // for the app to process it before reading its resulting Z order.
-            DWORD_PTR ignored=0;SendMessageTimeout(target,WM_NULL,0,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,100,&ignored);
-        }
         // Match the current native rectangle at handoff, including app-driven
         // size changes that may have happened while the overview was open.
         for(auto&v:views)for(auto&i:v->items){RECT r{};if(Bounds(i.source,r))i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};}
-        for(auto&v:views)for(auto&i:v->items)i.borderEffect->SetOpacity(0.f);
-        FollowNativeZOrder();
-        Animate(0);
+        ClearSelection();
+        // Anticipate foreground order while preserving topmost windows; the
+        // foreground event then reconciles the exact native order.
+        FollowNativeZOrder(target);
+        Animate(0,true);
+        // Submit motion before calling the native activation API: another
+        // input queue may take ~100 ms to respond, while DWM keeps animating.
+        if(phase==Phase::Closing&&IsWindow(target))SetForegroundWindow(target);
+    }
+    void Reopen(){
+        progress=CurrentProgress();chosen=nullptr;previous=GetForegroundWindow();
+        FocusOverview();Animate(1);
     }
     void End(bool restore,bool idle=true){
         if(timer)CancelWaitableTimer(timer);idleTimer=false;
+        animations.clear();
         bool visible=std::any_of(views.begin(),views.end(),[](const auto&v){return v->hwnd&&IsWindowVisible(v->hwnd);});
         phase=Phase::Hidden;
         if(foregroundHook){UnhookWinEvent(foregroundHook);foregroundHook=nullptr;}
@@ -862,16 +969,25 @@ public:
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
         views.clear();previous=chosen=selectedSource=nullptr;progress=0;
-        if(idle&&timer&&device){idleTimer=true;Schedule(15);}
+        if(idle&&timer&&device){idleTimer=true;Schedule(60);}
     }
     int Hit(const View&v,POINT p){
-        double progress=CurrentProgress();
-        for(size_t n=0;n<v.items.size();++n){Box b=Mix(v.items[n].original,v.items[n].target,progress);if(p.x>=b.x&&p.x<b.right()&&p.y>=b.y&&p.y<b.bottom())return int(n);}return -1;
+        auto hit=[&](int n){Box b=CurrentBox(v.items[n]);return p.x>=b.x&&p.x<b.right()&&p.y>=b.y&&p.y<b.bottom();};
+        if(!v.hitOrder.empty()){for(int n:v.hitOrder)if(hit(n))return n;}
+        else for(size_t n=0;n<v.items.size();++n)if(hit(int(n)))return int(n);
+        return -1;
+    }
+    void ClearSelection(){
+        selectedSource=nullptr;for(auto&v:views){v->selected=-1;for(auto&i:v->items)if(i.borderAttached){i.position->RemoveVisual(i.border.Get());i.borderAttached=false;i.borderEffect->SetOpacity(0.f);}}
     }
     void Select(HWND source){
         if(phase==Phase::Closing||phase==Phase::Hidden)return;
+        if(selectedSource==source)return;ClearSelection();
         selectedSource=source;
-        for(auto&v:views){v->selected=-1;for(size_t n=0;n<v->items.size();++n){auto&i=v->items[n];bool selected=i.source==source;if(selected)v->selected=int(n);i.borderEffect->SetOpacity(selected?1.f:0.f);}}
+        for(auto&v:views)for(size_t n=0;n<v->items.size();++n){auto&i=v->items[n];if(i.source!=source)continue;
+            if((!i.borderSurface||i.borderColor!=accentColor)&&!CreateOutline(*v,i)){End(false);return;}
+            i.position->AddVisual(i.border.Get(),FALSE,i.content.Get());i.borderAttached=true;i.borderEffect->SetOpacity(1.f);v->selected=int(n);
+        }
         device->Commit();
     }
     static std::vector<INPUT> NativeTaskViewInputs(bool leftWin,bool rightWin,bool leftShift,bool rightShift){
@@ -902,20 +1018,27 @@ public:
     LRESULT Message(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(msg==WM_NCCREATE){auto cs=reinterpret_cast<CREATESTRUCT*>(lp);if(cs->lpCreateParams)SetWindowLongPtr(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(cs->lpCreateParams));}
         auto v=reinterpret_cast<View*>(GetWindowLongPtr(hwnd,GWLP_USERDATA));
+        if(building){
+            if(msg==kToggle||(msg==WM_HOTKEY&&wp==1)||(msg==kTray&&lp==WM_LBUTTONUP)){deferredCommand=deferredCommand==kToggle?0:kToggle;return 0;}
+            if(msg==kSettings||msg==kNativeTaskView){deferredCommand=msg;return 0;}
+        }
         switch(msg){
-        case WM_HOTKEY:if(wp==1){if(phase==Phase::Hidden)Begin();else Close(nullptr);}return 0;
-        case kToggle:if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing){End(true);Begin();}else Close(nullptr);return 0;
+        case WM_HOTKEY:if(wp==1){if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);}return 0;
+        case kToggle:if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);return 0;
         case kNativeTaskView:NativeTaskView();return 0;
-        case kSettings:End(false);LoadSettings();if(keyboard){UnhookWindowsHookEx(keyboard);keyboard=nullptr;}swallowedTab=false;if(settings.winTab)keyboard=SetWindowsHookEx(WH_KEYBOARD_LL,Keyboard,g_instance,0);return 0;
-        case kDismiss:if(!building&&phase!=Phase::Hidden&&phase!=Phase::Closing&&(wp||!IsOurWindow(GetForegroundWindow())))End(false);return 0;
+        case kSettings:End(false);LoadSettings();return 0;
+        case kWarmup:Warmup();return 0;
+        case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
+        case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
         case kTray:if(lp==WM_LBUTTONUP){if(phase==Phase::Hidden)Begin();else Close(nullptr);}else if(lp==WM_RBUTTONUP||lp==WM_CONTEXTMENU)TrayMenu();return 0;
         case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
-        case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
+        case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:desktopCache.clear();if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
         case WM_QUERYENDSESSION:return TRUE;
         case WM_ENDSESSION:if(wp)SetEvent(g_stopEvent);return 0;
         case WM_ERASEBKGND:return 1;
-        case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);return 0;}
-        case WM_MOUSEMOVE:if(v&&phase==Phase::Settled){POINT p;GetCursorPos(&p);if(p.x!=lastPointer.x||p.y!=lastPointer.y){lastPointer=p;int i=Hit(*v,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});HWND hover=i>=0?v->items[i].source:nullptr;if(selectedSource!=hover)Select(hover);}}return 0;
+        case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);if(!building&&d3d&&FAILED(d3d->GetDeviceRemovedReason())){End(false,false);ReleaseDevice();PostMessage(controller,kWarmup,0,0);}return 0;}
+        case WM_MOUSEMOVE:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT p;GetCursorPos(&p);if(p.x!=lastPointer.x||p.y!=lastPointer.y){lastPointer=p;int i=Hit(*v,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});HWND hover=i>=0?v->items[i].source:nullptr;if(selectedSource!=hover)Select(hover);}TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
+        case WM_MOUSELEAVE:if(v&&v->selected>=0)Select(nullptr);return 0;
         case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){int i=Hit(*v,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});Close(i<0?nullptr:v->items[i].source);}return 0;
         case WM_RBUTTONUP:Close(nullptr);return 0;
         case WM_SYSKEYDOWN:case WM_KEYDOWN:
@@ -937,7 +1060,7 @@ public:
         if(ok)ok=CreateItem(view,i);
         if(ok)ok=CreateTitle(view,i);
         if(ok){view.windows->AddVisual(i.position.Get(),TRUE,nullptr);view.items.push_back(std::move(i));ok=CreateDesktop(view);Log(L"Wallpaper below preview tree",ok?S_OK:E_FAIL);}
-        if(ok)view.items[0].borderEffect->SetOpacity(1.f);
+        if(ok){ok=CreateOutline(view,view.items[0]);view.items[0].position->AddVisual(view.items[0].border.Get(),FALSE,view.items[0].content.Get());view.items[0].borderAttached=true;view.items[0].borderEffect->SetOpacity(1.f);}
         if(ok){StaticPose(0);Animate(1);HRESULT hr=device->WaitForCommitCompletion();ok=SUCCEEDED(hr);Log(L"Hidden composition probe",hr);}
         End(false,false);DestroyWindow(fixture);return ok;
     }
