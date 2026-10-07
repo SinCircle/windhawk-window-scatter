@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.3.5
+// @version         0.3.6
 // @author          SinCircle
 // @include         windhawk.exe
 // @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -lshell32 -lgdi32 -luser32 -luuid
@@ -16,7 +16,7 @@ Win+Tab toggles the overview. Releasing the keys leaves the overview open.
 Click a window to switch; Escape or a background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
 this overview is already open. Alt+Tab retains its native behavior. Ctrl+Alt+Space and
-the tray icon are alternative triggers. Window titles are shown, with a blue
+the tray icon are alternative triggers. Window titles are shown, with a system-accent
 selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
@@ -26,7 +26,7 @@ window inside its actual group, and centers the entire arrangement. All windows
 share one scale. Size, compactness, visual balance and the original left/right
 and top/bottom relationships determine the arrangement. There are no equal-sized cells.
 
-DirectComposition renders complete live window surfaces, rounded rectangle clips,
+DirectComposition renders complete live window surfaces, C2-continuous corners,
 linear bitmap filtering, antialiased clip edges, and non-linear critically damped
 motion. Source rectangles use visible-frame coordinates relative to the outer
 window, preventing invisible resize margins from shifting or clipping previews.
@@ -34,6 +34,10 @@ Animations are submitted once; there is
 no application frame loop, screenshot loop or timer-resolution change. DWM runs
 at display refresh. One-shot timers finish transitions and release the cached GPU
 device after 15 seconds of inactivity.
+One cached 64x64 corner mask is shared across windows. GPU transforms resize and
+place its four copies; no masks or window screenshots are redrawn during animation.
+The outline follows the same C2 path at a constant 4 DIP distance and tracks the
+Windows accent color when opening the overview or receiving a theme notification.
 
 An opaque wallpaper background covers the original windows during the overview.
 The wallpaper is beneath all window previews, with the selection outline behind
@@ -78,6 +82,7 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <dxgi.h>
 #include <dcomp.h>
 #include <d2d1_1.h>
+#include <d2d1effects.h>
 #include <dwrite.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -268,6 +273,30 @@ struct PrivateDwm {
         return createThumb&&querySize;
     }
 };
+// Public Windows SDK interfaces omitted by Windhawk's MinGW headers. Match the
+// SDK ABI (MinGW declares overloaded COM methods in reverse declaration order).
+struct CompositeEffect:IDCompositionFilterEffect {
+    virtual HRESULT STDMETHODCALLTYPE SetMode(D2D1_COMPOSITE_MODE)=0;
+};
+struct AffineEffect:IDCompositionFilterEffect {
+    virtual HRESULT STDMETHODCALLTYPE SetInterpolationMode(D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetBorderMode(D2D1_BORDER_MODE)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetTransformMatrix(const D2D1_MATRIX_3X2_F&)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetTransformMatrixElement(int,int,IDCompositionAnimation*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetTransformMatrixElement(int,int,float)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetSharpness(IDCompositionAnimation*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetSharpness(float)=0;
+};
+constexpr float kCornerTexture=64;
+// Two cubic Beziers: equal first/second derivatives at their join, zero second
+// derivative at the straight-edge endpoints. Unlike a circular arc, curvature
+// reaches zero continuously at both straight edges.
+static void ContinuousCorner(ID2D1GeometrySink*s,float x,float y,float xx,float xy,float yx,float yy){
+    auto p=[&](float a,float b){return D2D1::Point2F(x+a*xx+b*yx,y+a*xy+b*yy);};
+    s->AddBezier(D2D1::BezierSegment(p(1.f/3,0),p(2.f/3,0),p(5.f/6,1.f/6)));
+    s->AddBezier(D2D1::BezierSegment(p(1,1.f/3),p(1,2.f/3),p(1,1)));
+}
+static float CornerExtent(double width,double height,float radius){return std::clamp(1.5f*radius,.001f,float(std::max(.001,std::min(width,height)*.5)));}
 struct Item {
     HWND source=nullptr;
     Box original,target;
@@ -276,7 +305,9 @@ struct Item {
     HTHUMBNAIL thumbnail=nullptr;
     ComPtr<IDCompositionVisual2> surface,position,content,border,borderFill,label;
     ComPtr<IDCompositionScaleTransform> scale,borderScale;
-    ComPtr<IDCompositionRectangleClip> clip,borderClip;
+    ComPtr<IDCompositionRectangleClip> clip;
+    ComPtr<AffineEffect> corners[4];
+    ComPtr<CompositeEffect> cornerRows[2],cornerUnion,cornerMask;
     ComPtr<IDCompositionEffectGroup> borderEffect,labelEffect;
     ComPtr<IDCompositionSurface> labelSurface,borderSurface;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
@@ -300,9 +331,12 @@ public:
     ComPtr<ID3D11Device> d3d;
     ComPtr<IDXGIDevice> dxgi;
     ComPtr<IDCompositionDesktopDevice> device;
+    ComPtr<IDCompositionDevice3> effects;
     ComPtr<ID2D1Factory1> d2dFactory;
     ComPtr<ID2D1Device> d2dDevice;
     ComPtr<IDCompositionSurfaceFactory> surfaceFactory;
+    ComPtr<IDCompositionSurface> cornerTexture;
+    UINT32 accentColor=0;
     ComPtr<IDWriteFactory> textFactory;
     ComPtr<IWICImagingFactory> imageFactory;
     std::wstring cachedWallpaperPath;
@@ -352,7 +386,7 @@ public:
     }
     bool IsOurWindow(HWND hwnd)const{if(hwnd==controller)return true;for(auto&v:views)if(v->hwnd==hwnd)return true;return false;}
     bool Initialize(){
-        QueryPerformanceFrequency(&frequency);SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);LoadSettings();
+        QueryPerformanceFrequency(&frequency);SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);LoadSettings();RefreshAccent();
         if(!api.Load()){Log(L"Shared DWM APIs unavailable",E_NOINTERFACE);return false;}
         WNDCLASSEX wc{sizeof(wc)};wc.lpfnWndProc=WndProc;wc.hInstance=g_instance;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.lpszClassName=kController;
         if(!RegisterClassEx(&wc))return false;wc.lpszClassName=kOverlay;if(!RegisterClassEx(&wc))return false;
@@ -374,6 +408,7 @@ public:
         HRESULT hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&d3d,nullptr,nullptr);
         if(SUCCEEDED(hr))hr=d3d.As(&dxgi);
         if(SUCCEEDED(hr))hr=DCompositionCreateDevice3(dxgi.Get(),IID_PPV_ARGS(&device));
+        if(SUCCEEDED(hr))hr=device.As(&effects);
         if(SUCCEEDED(hr))hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,IID_PPV_ARGS(&d2dFactory));
         if(SUCCEEDED(hr))hr=d2dFactory->CreateDevice(dxgi.Get(),&d2dDevice);
         if(SUCCEEDED(hr))hr=device->CreateSurfaceFactory(d2dDevice.Get(),&surfaceFactory);
@@ -381,7 +416,7 @@ public:
         if(SUCCEEDED(hr))hr=CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&imageFactory));
         if(FAILED(hr)){Log(L"Create compositor",hr);ReleaseDevice();return false;}return true;
     }
-    void ReleaseDevice(){cachedWallpaper.Reset();cachedWallpaperPath.clear();imageFactory.Reset();textFactory.Reset();surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();device.Reset();dxgi.Reset();d3d.Reset();}
+    void ReleaseDevice(){cachedWallpaper.Reset();cachedWallpaperPath.clear();cornerTexture.Reset();imageFactory.Reset();textFactory.Reset();surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();effects.Reset();device.Reset();dxgi.Reset();d3d.Reset();}
     template<class Draw> HRESULT Paint(ComPtr<IDCompositionSurface>&surface,UINT width,UINT height,bool opaque,Draw draw){
         HRESULT hr=surfaceFactory->CreateSurface(width,height,DXGI_FORMAT_B8G8R8A8_UNORM,
             opaque?DXGI_ALPHA_MODE_IGNORE:DXGI_ALPHA_MODE_PREMULTIPLIED,surface.ReleaseAndGetAddressOf());
@@ -441,16 +476,78 @@ public:
         if(FAILED(hr)){Log(L"Opaque desktop",hr);return false;}
         return true;
     }
+    void RefreshAccent(){
+        DWORD color=0;BOOL opaque=FALSE;UINT32 rgb;
+        if(SUCCEEDED(DwmGetColorizationColor(&color,&opaque)))rgb=color&0xFFFFFF; // ARGB, not COLORREF.
+        else{COLORREF c=GetSysColor(COLOR_HIGHLIGHT);rgb=(GetRValue(c)<<16)|(GetGValue(c)<<8)|GetBValue(c);}
+        if(rgb==accentColor)return;accentColor=rgb;
+        if(!building&&phase!=Phase::Hidden&&device){
+            for(auto&v:views)for(auto&i:v->items)if(!CreateOutline(*v,i)){End(false);return;}
+            device->Commit();
+        }
+    }
+    bool CreateCorners(Item&i){
+        HRESULT hr=S_OK;
+        if(!cornerTexture){
+            ComPtr<ID2D1PathGeometry> path;ComPtr<ID2D1GeometrySink> sink;
+            hr=d2dFactory->CreatePathGeometry(&path);if(SUCCEEDED(hr))hr=path->Open(&sink);
+            if(SUCCEEDED(hr)){
+                sink->BeginFigure(D2D1::Point2F(0,0),D2D1_FIGURE_BEGIN_FILLED);sink->AddLine(D2D1::Point2F(0,kCornerTexture));
+                ContinuousCorner(sink.Get(),0,kCornerTexture,0,-kCornerTexture,kCornerTexture,0);
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);hr=sink->Close();
+            }
+            if(SUCCEEDED(hr))hr=Paint(cornerTexture,UINT(kCornerTexture),UINT(kCornerTexture),false,[&](ID2D1DeviceContext*c){
+                ComPtr<ID2D1SolidColorBrush>b;if(SUCCEEDED(c->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF),&b)))c->FillGeometry(path.Get(),b.Get());
+            });
+        }
+        if(SUCCEEDED(hr))hr=effects->CreateCompositeEffect(reinterpret_cast<void**>(i.cornerUnion.GetAddressOf()));
+        if(SUCCEEDED(hr))hr=i.cornerUnion->SetMode(D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        for(int row=0;row<2&&SUCCEEDED(hr);++row){
+            // Binary combines: some DWM versions silently ignore inputs > 1.
+            hr=effects->CreateCompositeEffect(reinterpret_cast<void**>(i.cornerRows[row].GetAddressOf()));
+            if(SUCCEEDED(hr))hr=i.cornerRows[row]->SetMode(D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            if(SUCCEEDED(hr))hr=i.cornerUnion->SetInput(row,i.cornerRows[row].Get(),0);
+        }
+        for(int n=0;n<4&&SUCCEEDED(hr);++n){
+            hr=effects->CreateAffineTransform2DEffect(reinterpret_cast<void**>(i.corners[n].GetAddressOf()));
+            if(SUCCEEDED(hr))hr=i.corners[n]->SetInput(0,cornerTexture.Get(),0);
+            if(SUCCEEDED(hr))hr=i.corners[n]->SetInterpolationMode(D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR);
+            // Clamp this MASK's exterior texels. Sampling transparent pixels
+            // beyond its edge leaves a thin uncut frame around the preview.
+            // The live window still uses soft, antialiased composition.
+            if(SUCCEEDED(hr))hr=i.corners[n]->SetBorderMode(D2D1_BORDER_MODE_HARD);
+            if(SUCCEEDED(hr))hr=i.cornerRows[n/2]->SetInput(n%2,i.corners[n].Get(),0);
+        }
+        if(SUCCEEDED(hr))hr=effects->CreateCompositeEffect(reinterpret_cast<void**>(i.cornerMask.GetAddressOf()));
+        if(SUCCEEDED(hr))hr=i.cornerMask->SetMode(D2D1_COMPOSITE_MODE_DESTINATION_OUT);
+        if(SUCCEEDED(hr))hr=i.cornerMask->SetInput(0,nullptr,0); // Live visual subtree; preserve its alpha.
+        if(SUCCEEDED(hr))hr=i.cornerMask->SetInput(1,i.cornerUnion.Get(),0);
+        if(SUCCEEDED(hr))hr=i.content->SetEffect(i.cornerMask.Get());
+        if(FAILED(hr))Log(L"Create continuous corners",hr);return SUCCEEDED(hr);
+    }
     bool CreateOutline(View&v,Item&i){
         // A hollow premultiplied surface leaves the requested gap transparent.
         // Rasterize once at overview size, then animate its transform on the GPU.
         i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
-        HRESULT hr=Paint(i.borderSurface,UINT(std::ceil(i.borderWidth)),UINT(std::ceil(i.borderHeight)),false,[&](ID2D1DeviceContext*ctx){
-            ComPtr<ID2D1SolidColorBrush> brush;
-            if(FAILED(ctx->CreateSolidColorBrush(D2D1::ColorF(0x4BA3FF),&brush)))return;
-            float half=i.stroke*.5f,r=settings.radius*v.dpi+i.gap+half;
+        ComPtr<ID2D1PathGeometry> path;ComPtr<ID2D1GeometrySink> sink;
+        HRESULT hr=d2dFactory->CreatePathGeometry(&path);if(SUCCEEDED(hr))hr=path->Open(&sink);
+        if(FAILED(hr))return false;
+        float o=i.Outset(),w=float(i.target.w),h=float(i.target.h),r=CornerExtent(w,h,settings.radius*v.dpi);
+        sink->BeginFigure(D2D1::Point2F(o+r,o),D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(D2D1::Point2F(o+w-r,o));ContinuousCorner(sink.Get(),o+w-r,o,r,0,0,r);
+        sink->AddLine(D2D1::Point2F(o+w,o+h-r));ContinuousCorner(sink.Get(),o+w,o+h-r,0,r,-r,0);
+        sink->AddLine(D2D1::Point2F(o+r,o+h));ContinuousCorner(sink.Get(),o+r,o+h,-r,0,0,-r);
+        sink->AddLine(D2D1::Point2F(o,o+r));ContinuousCorner(sink.Get(),o,o+r,0,-r,r,0);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);hr=sink->Close();if(FAILED(hr))return false;
+        hr=Paint(i.borderSurface,UINT(std::ceil(i.borderWidth)),UINT(std::ceil(i.borderHeight)),false,[&](ID2D1DeviceContext*ctx){
+            ComPtr<ID2D1SolidColorBrush> brush,clear;
+            if(FAILED(ctx->CreateSolidColorBrush(D2D1::ColorF(accentColor),&brush))||FAILED(ctx->CreateSolidColorBrush(D2D1::ColorF(0,0.f),&clear)))return;
             ctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            ctx->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(half,half,i.borderWidth-half,i.borderHeight-half),r,r),brush.Get(),i.stroke);
+            ctx->DrawGeometry(path.Get(),brush.Get(),2*i.Outset());
+            // Erase the interior and gap. This creates a true constant-distance
+            // offset of the SAME curve, including on transparent source windows.
+            ctx->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            ctx->FillGeometry(path.Get(),clear.Get());ctx->DrawGeometry(path.Get(),clear.Get(),2*i.gap);
         });
         if(SUCCEEDED(hr))hr=i.borderFill->SetContent(i.borderSurface.Get());
         return SUCCEEDED(hr);
@@ -574,7 +671,6 @@ public:
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.border);
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.borderFill);
         if(SUCCEEDED(hr))hr=device->CreateScaleTransform(&i.borderScale);
-        if(SUCCEEDED(hr))hr=device->CreateRectangleClip(&i.borderClip);
         if(SUCCEEDED(hr))hr=device->CreateEffectGroup(&i.borderEffect);
         if(SUCCEEDED(hr))hr=i.content->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
         if(SUCCEEDED(hr))hr=i.content->SetBorderMode(DCOMPOSITION_BORDER_MODE_SOFT);
@@ -584,7 +680,7 @@ public:
         i.surface->SetTransform(i.scale.Get());i.content->AddVisual(i.surface.Get(),TRUE,nullptr);i.content->SetClip(i.clip.Get());
         i.position->AddVisual(i.content.Get(),TRUE,nullptr);
         i.borderFill->SetTransform(i.borderScale.Get());
-        i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);i.border->SetClip(i.borderClip.Get());
+        i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);
         i.border->SetOffsetX(-i.Outset());i.border->SetOffsetY(-i.Outset());
         i.borderEffect->SetOpacity(0.f);i.border->SetEffect(i.borderEffect.Get());
         i.position->AddVisual(i.border.Get(),FALSE,i.content.Get());
@@ -592,13 +688,12 @@ public:
         DWORD preference=DWMWCP_DEFAULT;
         if(SUCCEEDED(DwmGetWindowAttribute(i.source,DWMWA_WINDOW_CORNER_PREFERENCE,&preference,sizeof(preference)))&&preference==DWMWCP_DONOTROUND)i.nativeRadius=0;
         i.clip->SetLeft(0.f);i.clip->SetTop(0.f);
-        i.borderClip->SetLeft(0.f);i.borderClip->SetTop(0.f);
-        return true;
+        return CreateCorners(i);
     }
     bool Begin(){
         if(phase!=Phase::Hidden)return false;
         CancelWaitableTimer(timer);idleTimer=false;
-        previous=GetForegroundWindow();chosen=nullptr;progress=0;building=true;
+        previous=GetForegroundWindow();chosen=nullptr;progress=0;building=true;RefreshAccent();
         if(!EnsureDevice()){building=false;return false;}
         EnumDisplayMonitors(nullptr,nullptr,AddMonitor,reinterpret_cast<LPARAM>(this));
         EnumWindows(AddWindow,reinterpret_cast<LPARAM>(this));
@@ -653,12 +748,9 @@ public:
         }
         animation->End(seconds,float(b));setter(animation.Get());
     }
-    static void Radius(Item&i,float r){
-        i.clip->SetTopLeftRadiusX(r);i.clip->SetTopLeftRadiusY(r);i.clip->SetTopRightRadiusX(r);i.clip->SetTopRightRadiusY(r);
-        i.clip->SetBottomLeftRadiusX(r);i.clip->SetBottomLeftRadiusY(r);i.clip->SetBottomRightRadiusX(r);i.clip->SetBottomRightRadiusY(r);
-        r+=i.Outset();
-        i.borderClip->SetTopLeftRadiusX(r);i.borderClip->SetTopLeftRadiusY(r);i.borderClip->SetTopRightRadiusX(r);i.borderClip->SetTopRightRadiusY(r);
-        i.borderClip->SetBottomLeftRadiusX(r);i.borderClip->SetBottomLeftRadiusY(r);i.borderClip->SetBottomRightRadiusX(r);i.borderClip->SetBottomRightRadiusY(r);
+    static void Corners(Item&i,const Box&b,float radius){
+        float s=CornerExtent(b.w,b.h,radius)/kCornerTexture;
+        for(int n=0;n<4;++n)i.corners[n]->SetTransformMatrix(D2D1::Matrix3x2F((n&1)?-s:s,0,0,(n&2)?-s:s,(n&1)?float(b.w):0,(n&2)?float(b.h):0));
     }
     void StaticPose(double p){
         for(auto&v:views)for(auto&i:v->items){
@@ -666,9 +758,8 @@ public:
             i.scale->SetScaleX(float(b.w/i.pixels.cx));i.scale->SetScaleY(float(b.h/i.pixels.cy));
             i.clip->SetRight(float(b.w));i.clip->SetBottom(float(b.h));
             i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+2*i.Outset())/i.borderHeight);
-            i.borderClip->SetRight(float(b.w+2*i.Outset()));i.borderClip->SetBottom(float(b.h+2*i.Outset()));
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h+i.Outset()+6*v->dpi));i.labelEffect->SetOpacity(float(p));}
-            Radius(i,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*p));
+            Corners(i,b,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*p));
         }
     }
     double CurrentProgress(){
@@ -692,23 +783,20 @@ public:
             Property(a.h,b.h,[&](auto value){i.clip->SetBottom(value);});
             Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
             Property((a.h+2*i.Outset())/i.borderHeight,(b.h+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
-            Property(a.w+2*i.Outset(),b.w+2*i.Outset(),[&](auto value){i.borderClip->SetRight(value);});
-            Property(a.h+2*i.Outset(),b.h+2*i.Outset(),[&](auto value){i.borderClip->SetBottom(value);});
             if(i.label){
                 Property((a.w-i.target.w)*.5,(b.w-i.target.w)*.5,[&](auto value){i.label->SetOffsetX(value);});
                 Property(a.h+i.Outset()+6*v->dpi,b.h+i.Outset()+6*v->dpi,[&](auto value){i.label->SetOffsetY(value);});
                 Property(from,to,[&](auto value){i.labelEffect->SetOpacity(value);});
             }
-            double ra=i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*from;
-            double rb=i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*to;
-            Property(ra,rb,[&](auto value){
-                i.clip->SetTopLeftRadiusX(value);i.clip->SetTopLeftRadiusY(value);i.clip->SetTopRightRadiusX(value);i.clip->SetTopRightRadiusY(value);
-                i.clip->SetBottomLeftRadiusX(value);i.clip->SetBottomLeftRadiusY(value);i.clip->SetBottomRightRadiusX(value);i.clip->SetBottomRightRadiusY(value);
-            });
-            Property(ra+i.Outset(),rb+i.Outset(),[&](auto value){
-                i.borderClip->SetTopLeftRadiusX(value);i.borderClip->SetTopLeftRadiusY(value);i.borderClip->SetTopRightRadiusX(value);i.borderClip->SetTopRightRadiusY(value);
-                i.borderClip->SetBottomLeftRadiusX(value);i.borderClip->SetBottomLeftRadiusY(value);i.borderClip->SetBottomRightRadiusX(value);i.borderClip->SetBottomRightRadiusY(value);
-            });
+            double ra=CornerExtent(a.w,a.h,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*from))/kCornerTexture;
+            double rb=CornerExtent(b.w,b.h,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*to))/kCornerTexture;
+            for(int n=0;n<4;++n){
+                auto*c=i.corners[n].Get();float sx=(n&1)?-1.f:1.f,sy=(n&2)?-1.f:1.f;
+                Property(sx*ra,sx*rb,[&](auto value){c->SetTransformMatrixElement(0,0,value);});
+                Property(sy*ra,sy*rb,[&](auto value){c->SetTransformMatrixElement(1,1,value);});
+                if(n&1)Property(a.w,b.w,[&](auto value){c->SetTransformMatrixElement(2,0,value);});
+                if(n&2)Property(a.h,b.h,[&](auto value){c->SetTransformMatrixElement(2,1,value);});
+            }
         }
         HRESULT hr=device->Commit();if(FAILED(hr)){Log(L"Animate",hr);End(true);return;}
         Schedule(seconds+.045);
@@ -821,6 +909,7 @@ public:
         case kSettings:End(false);LoadSettings();if(keyboard){UnhookWindowsHookEx(keyboard);keyboard=nullptr;}swallowedTab=false;if(settings.winTab)keyboard=SetWindowsHookEx(WH_KEYBOARD_LL,Keyboard,g_instance,0);return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&phase!=Phase::Closing&&(wp||!IsOurWindow(GetForegroundWindow())))End(false);return 0;
         case kTray:if(lp==WM_LBUTTONUP){if(phase==Phase::Hidden)Begin();else Close(nullptr);}else if(lp==WM_RBUTTONUP||lp==WM_CONTEXTMENU)TrayMenu();return 0;
+        case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
         case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
         case WM_QUERYENDSESSION:return TRUE;
         case WM_ENDSESSION:if(wp)SetEvent(g_stopEvent);return 0;
