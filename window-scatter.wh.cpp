@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.4
+// @version         0.4.5
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -23,8 +23,8 @@ The selected outline follows the gesture without moving the system mouse cursor.
 Click a window to switch; hover a preview and click its close button to ask the
 application to close normally. Escape or a background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
-this overview is already open. Alt+Tab retains its native behavior. Ctrl+Alt+Space is
-an alternative trigger. No tray icon is created. Window titles are shown, with a system-accent
+this overview is already open. Alt+Tab retains its native behavior.
+No tray icon is created. Window titles are shown, with a system-accent
 selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
@@ -514,7 +514,6 @@ public:
 #ifdef SCATTER_STANDALONE
         if(g_probe)return true;
 #endif
-        RegisterHotKey(controller,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_SPACE);
         RegisterHotKey(controller,2,MOD_WIN|MOD_SHIFT|MOD_NOREPEAT,VK_TAB);
         ChangeWindowMessageFilterEx(controller,kShellTaskView,MSGFLT_ALLOW,nullptr);
         ChangeWindowMessageFilterEx(controller,kNativeConsumed,MSGFLT_ALLOW,nullptr);
@@ -822,7 +821,7 @@ public:
         accentSubscribed=false;uiSettings.Reset();
         if(lowMemoryEvent){CloseHandle(lowMemoryEvent);lowMemoryEvent=nullptr;}
         End(false,false);
-        if(controller){UnregisterHotKey(controller,1);UnregisterHotKey(controller,2);g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
+        if(controller){UnregisterHotKey(controller,2);g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
         if(timer){CloseHandle(timer);timer=nullptr;}ReleaseDevice();desktops.Reset();UnregisterClass(kOverlay,g_instance);UnregisterClass(kController,g_instance);
     }
     void Schedule(double delay){LARGE_INTEGER due;due.QuadPart=-std::max<LONGLONG>(1,LONGLONG(delay*10000000));SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE);}
@@ -1278,11 +1277,11 @@ public:
                 return 0;
             }
             if(msg==kShow){if(!deferredCommand)deferredCommand=kShow;return 0;}
-            if(msg==kToggle||(msg==WM_HOTKEY&&wp==1)){deferredCommand=deferredCommand==kToggle?0:kToggle;return 0;}
+            if(msg==kToggle){deferredCommand=deferredCommand==kToggle?0:kToggle;return 0;}
             if(msg==kSettings||msg==kNativeTaskView){deferredCommand=msg;return 0;}
         }
         switch(msg){
-        case WM_HOTKEY:if(wp==1){if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);}else if(wp==2)PostMessage(controller,kNativeTaskView,0,0);return 0;
+        case WM_HOTKEY:if(wp==2)PostMessage(controller,kNativeTaskView,0,0);return 0;
         case kShellTaskView:{
             if(!settings.winTab)return 0;
             ULONG_PTR count=reinterpret_cast<ULONG_PTR>(GetProp(controller,L"WindowScatter.NativeRequests.v4"));
