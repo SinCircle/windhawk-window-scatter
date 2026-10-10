@@ -2,18 +2,26 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.3.9
+// @version         0.4.4
 // @author          SinCircle
 // @include         windhawk.exe
-// @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -lshell32 -lgdi32 -luser32 -luuid
+// @include         explorer.exe
+// @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -lshell32 -lgdi32 -luser32 -luuid -lruntimeobject
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 # Window Scatter
 
-Win+Tab toggles the overview. Releasing the keys leaves the overview open.
-Click a window to switch; Escape or a background click cancels. Tab does not
+Win+Tab and the system Task View touchpad gesture open this overview through
+Explorer's native Task View request. No global keyboard hook is installed.
+With the touchpad, a short upward swipe opens the overview and leaves it open.
+Keep three fingers down and move again to select windows by their actual position,
+including diagonally; lift after selecting to activate the window. A downward
+swipe while the overview is open cancels.
+The selected outline follows the gesture without moving the system mouse cursor.
+Click a window to switch; hover a preview and click its close button to ask the
+application to close normally. Escape or a background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
 this overview is already open. Alt+Tab retains its native behavior. Ctrl+Alt+Space is
 an alternative trigger. No tray icon is created. Window titles are shown, with a system-accent
@@ -36,7 +44,7 @@ at display refresh. Animation start and completion use the compositor's refresh
 timing. Equal animation functions share one object within a submission.
 Automatic mode keeps the GPU device ready while memory is available. Windows
 low-memory notifications release rendering resources once the overview is hidden,
-leaving the keyboard/event listeners. Resident mode always keeps the device ready;
+leaving the shell request/event listeners. Resident mode always keeps the device ready;
 Memory saver skips startup prewarming and releases it after each overview.
 Reopening after release recreates graphics resources. No periodic memory polling
 is used when Windows memory notifications are available. Cached wallpaper surfaces
@@ -47,7 +55,10 @@ place its four copies; no masks or window screenshots are redrawn during animati
 The outline follows the same C2 path at a constant 4 DIP distance and tracks the
 Windows accent color when opening the overview or receiving a theme notification.
 Only a hovered window allocates an outline; inactive outlines are detached.
-Keyboard interception runs on a separate sleeping thread. Native activation
+Explorer's Task View request is redirected to the dedicated renderer. The system
+recognizes Win+Tab and the configured three-finger upward swipe. There is no
+keyboard capture or periodic hook renewal. UISettings supplies the accent color
+and notifies color changes. Native activation
 happens after animation submission, so a slow input queue cannot delay its start. Reversing a closing animation reuses the existing scene.
 Animated click targets follow the same front-to-back order as the previews.
 
@@ -76,8 +87,8 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 // ==WindhawkModSettings==
 /*
 - replaceWinTab: true
-  $name: Use Win+Tab
-  $description: Win+Tab toggles the persistent overview. Click to switch. Shift+Win+Tab opens Windows Task View. Alt+Tab is unchanged.
+  $name: Replace system Task View
+  $description: Short swipe up opens and stays open. Keep three fingers down and move in any direction to select, then release to switch. Swipe down in the overview to cancel. Shift+Win+Tab opens Windows Task View.
 - durationMs: 320
   $name: Animation duration (ms)
   $description: Non-linear motion executed by DirectComposition. 0 disables animation.
@@ -107,12 +118,17 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <wrl/client.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <roapi.h>
+#include <winstring.h>
+#include <windows.ui.viewmanagement.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -122,8 +138,14 @@ namespace scatter {
 using Microsoft::WRL::ComPtr;
 constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
-constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8;
+constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8,kShellTaskView=WM_APP+10,kAccentChanged=WM_APP+11,kWindowGone=WM_APP+12,kNativeConsumed=WM_APP+13,kShow=WM_APP+14;
+constexpr UINT kGestureBegin=WM_APP+15,kGestureUpdate=WM_APP+16,kGestureEnd=WM_APP+17,kGestureCancel=WM_APP+18;
 constexpr ULONG_PTR kInputMarker=0x57534354;
+constexpr wchar_t kShellReadyProperty[]=L"WindowScatter.ShellReady.v4";
+constexpr wchar_t kNativeBypassProperty[]=L"WindowScatter.NativeTaskView.v4";
+constexpr wchar_t kOverviewProperty[]=L"WindowScatter.OverviewReady.v5";
+constexpr wchar_t kGestureProperty[]=L"WindowScatter.GestureToken.v5";
+constexpr ULONG_PTR kShellAck=0x57534334;
 struct Box {
     double x=0,y=0,w=0,h=0;
     double right()const{return x+w;} double bottom()const{return y+h;}
@@ -284,6 +306,21 @@ static void Log(const wchar_t*where,HRESULT hr) {
 #endif
 }
 
+using AccentEvent=ABI::Windows::Foundation::ITypedEventHandler<ABI::Windows::UI::ViewManagement::UISettings*,IInspectable*>;
+struct AccentWatcher final:AccentEvent {
+    std::atomic<ULONG> refs{1};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void**out) override{
+        if(!out)return E_POINTER;*out=nullptr;
+        if(iid!=IID_IUnknown&&iid!=__uuidof(AccentEvent)&&iid!=__uuidof(IAgileObject))return E_NOINTERFACE;
+        *out=static_cast<AccentEvent*>(this);AddRef();return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override{return ++refs;}
+    ULONG STDMETHODCALLTYPE Release() override{ULONG n=--refs;if(!n)delete this;return n;}
+    HRESULT STDMETHODCALLTYPE Invoke(ABI::Windows::UI::ViewManagement::IUISettings*,IInspectable*) override{
+        if(HWND hwnd=g_controller.load())PostMessage(hwnd,kAccentChanged,0,0);return S_OK;
+    }
+};
+
 struct PrivateDwm {
     using CreateThumb=HRESULT(WINAPI*)(HWND,HWND,DWORD,DWM_THUMBNAIL_PROPERTIES*,void*,void**,HTHUMBNAIL*);
     using QuerySize=HRESULT(WINAPI*)(HWND,BOOL,SIZE*);
@@ -328,21 +365,21 @@ struct Item {
         if(this!=&other){std::destroy_at(this);std::construct_at(this,std::move(other));}
         return *this;
     }
-    HWND source=nullptr;
+    HWND source=nullptr;DWORD sourceProcess=0;
     Box original,target;
     Box motionFrom,motionTo;
     float radiusFrom=0,radiusTo=0;
     SIZE pixels{};
     float nativeRadius=0;
     HTHUMBNAIL thumbnail=nullptr;
-    ComPtr<IDCompositionVisual2> surface,position,content,border,borderFill,label;
+    ComPtr<IDCompositionVisual2> surface,position,content,border,borderFill,label,closeButton;
     ComPtr<IDCompositionScaleTransform> scale,borderScale;
     ComPtr<IDCompositionRectangleClip> clip;
     ComPtr<AffineEffect> corners[4];
     ComPtr<CompositeEffect> cornerRows[2],cornerUnion,cornerMask;
     ComPtr<IDCompositionEffectGroup> borderEffect,labelEffect;
     ComPtr<IDCompositionSurface> labelSurface,borderSurface;
-    UINT32 borderColor=0;bool borderAttached=false;
+    UINT32 borderColor=0;bool borderAttached=false,closeAttached=false,closeHot=false;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
     float Outset()const{return stroke+gap;}
     ~Item(){
@@ -365,6 +402,7 @@ struct View {
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual2> root,windows,desktop;
     ComPtr<IDCompositionSurface> wallpaperSurface;
+    ComPtr<IDCompositionSurface> closeNormal,closeHot;
 };
 struct DesktopCache {
     HMONITOR monitor=nullptr;RECT bounds{},display{};std::wstring path;
@@ -376,8 +414,9 @@ enum class Phase{Hidden,Opening,Settled,Closing};
 class App {
 public:
     static App* instance;
-    HWND controller=nullptr;HANDLE timer=nullptr,keyboardThread=nullptr,keyboardReady=nullptr,lowMemoryEvent=nullptr;
-    DWORD keyboardThreadId=0;std::atomic<bool> keyboardOK{false};
+    HWND controller=nullptr;HANDLE timer=nullptr,lowMemoryEvent=nullptr;
+    ComPtr<ABI::Windows::UI::ViewManagement::IUISettings3> uiSettings;
+    EventRegistrationToken accentToken{};bool accentSubscribed=false;
     HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr;
     ComPtr<IVirtualDesktopManager> desktops;
     ComPtr<ID3D11Device> d3d;
@@ -388,21 +427,31 @@ public:
     ComPtr<ID2D1Device> d2dDevice;
     ComPtr<IDCompositionSurfaceFactory> surfaceFactory;
     ComPtr<IDCompositionSurface> cornerTexture;
-    UINT32 accentColor=0;
+    UINT32 accentColor=0x0078D4;bool accentValid=false;
     ComPtr<IDWriteFactory> textFactory;
     ComPtr<IWICImagingFactory> imageFactory;
     std::vector<DesktopCache> desktopCache;
     PrivateDwm api;
     std::vector<std::unique_ptr<View>> views;
     Settings settings;Phase phase=Phase::Hidden;
-    HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr;
+    HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedClose=nullptr;
     POINT lastPointer{};
+    UINT gestureToken=0;
+    double gestureOriginX=0,gestureOriginY=0,gestureWidth=1,gestureHeight=1;
+    ULONGLONG gestureStarted=0;
+    bool gestureNavigating=false,gestureReady=false,gestureOpenedAlready=false;
+    double gestureBaseX=0,gestureBaseY=0,gestureLastX=0,gestureLastY=0,gestureMinY=0,gestureReadyX=0,gestureReadyY=0;
+    struct GestureMessage {UINT message;WPARAM token;LPARAM data;};
+    std::vector<GestureMessage> deferredGestures;
     bool idleTimer=false,building=false;
     bool memoryPressure=false;
     UINT deferredCommand=0;
+    std::vector<HWND> deferredRemovals;
     struct BuildGuard {
         App&a;bool wasBuilding;explicit BuildGuard(App&app):a(app),wasBuilding(app.building){a.building=true;}
-        ~BuildGuard(){a.building=wasBuilding;if(!wasBuilding)if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);}
+        ~BuildGuard(){a.building=wasBuilding;if(!wasBuilding){if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);
+            for(HWND source:a.deferredRemovals)PostMessage(a.controller,kWindowGone,reinterpret_cast<WPARAM>(source),0);a.deferredRemovals.clear();
+            for(auto event:a.deferredGestures)PostMessage(a.controller,event.message,event.token,event.data);a.deferredGestures.clear();}}
     };
     LARGE_INTEGER frequency{};
     double start=0,seconds=0,from=0,to=1,progress=0;
@@ -440,40 +489,6 @@ public:
         if(phase==Phase::Hidden)ReleaseInactiveGraphics();
     }
     static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){return instance?instance->Message(hwnd,msg,wp,lp):DefWindowProc(hwnd,msg,wp,lp);}
-    static LRESULT CALLBACK Keyboard(int code,WPARAM wp,LPARAM lp){
-        // This hook has its own message thread: driver setup, wallpaper decode
-        // and presentation fences must never stall the system keyboard queue.
-        static thread_local bool swallowedTab=false;
-        App*a=instance;
-        if(code==HC_ACTION&&a){
-            auto&k=*reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
-            if(k.dwExtraInfo==kInputMarker)return CallNextHookEx(nullptr,code,wp,lp);
-            bool down=wp==WM_KEYDOWN||wp==WM_SYSKEYDOWN,up=wp==WM_KEYUP||wp==WM_SYSKEYUP;
-            if(k.vkCode==VK_TAB){
-                if(up&&swallowedTab){swallowedTab=false;return 1;}
-                if(down&&swallowedTab)return 1; // No autorepeat toggles.
-                bool win=(GetAsyncKeyState(VK_LWIN)&0x8000)||(GetAsyncKeyState(VK_RWIN)&0x8000);
-                bool alt=(k.flags&LLKHF_ALTDOWN)||(GetAsyncKeyState(VK_MENU)&0x8000);
-                bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
-                if(down&&g_winTab.load()&&win&&!alt&&!ctrl){
-                    swallowedTab=true;
-                    // Prevent a bare Win key release from opening Start after
-                    // we consume Tab. Our tagged events bypass this hook.
-                    INPUT mask[2]{};for(auto&i:mask){i.type=INPUT_KEYBOARD;i.ki.wVk=0xFF;i.ki.dwExtraInfo=kInputMarker;}
-                    mask[1].ki.dwFlags=KEYEVENTF_KEYUP;SendInput(2,mask,sizeof(INPUT));
-                    PostMessage(a->controller,(GetAsyncKeyState(VK_SHIFT)&0x8000)?kNativeTaskView:kToggle,0,0);
-                    return 1;
-                }
-            }
-        }return CallNextHookEx(nullptr,code,wp,lp);
-    }
-    static DWORD WINAPI KeyboardMain(void* context){
-        auto&a=*static_cast<App*>(context);MSG msg;PeekMessage(&msg,nullptr,0,0,PM_NOREMOVE);
-        HHOOK hook=SetWindowsHookEx(WH_KEYBOARD_LL,Keyboard,g_instance,0);
-        a.keyboardOK.store(hook!=nullptr);SetEvent(a.keyboardReady);
-        if(hook){while(GetMessage(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessage(&msg);}UnhookWindowsHookEx(hook);}
-        return 0;
-    }
     void FocusOverview(){
         HWND focus=nullptr;POINT p{};GetCursorPos(&p);HMONITOR monitor=MonitorFromPoint(p,MONITOR_DEFAULTTONEAREST);
         for(auto&v:views)if(v->hwnd&&(!focus||v->monitor==monitor))focus=v->hwnd;
@@ -482,28 +497,29 @@ public:
     static void CALLBACK Event(HWINEVENTHOOK,DWORD event,HWND hwnd,LONG object,LONG child,DWORD,DWORD){
         App*a=instance;if(!a||a->phase==Phase::Hidden)return;
         if(event==EVENT_SYSTEM_FOREGROUND)PostMessage(a->controller,a->phase==Phase::Closing?kSyncOrder:kDismiss,0,0);
-        else if(event==EVENT_OBJECT_DESTROY&&object==OBJID_WINDOW&&child==0)
-            for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){PostMessage(a->controller,kDismiss,1,0);return;}
+        else if((event==EVENT_OBJECT_DESTROY||event==EVENT_OBJECT_HIDE)&&object==OBJID_WINDOW&&child==0)
+            for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){PostMessage(a->controller,kWindowGone,reinterpret_cast<WPARAM>(hwnd),0);return;}
     }
     bool IsOurWindow(HWND hwnd)const{if(hwnd==controller)return true;for(auto&v:views)if(v->hwnd==hwnd)return true;return false;}
     bool Initialize(){
-        QueryPerformanceFrequency(&frequency);SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);LoadSettings();RefreshAccent();
+        QueryPerformanceFrequency(&frequency);SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);LoadSettings();
         if(!api.Load()){Log(L"Shared DWM APIs unavailable",E_NOINTERFACE);return false;}
         WNDCLASSEX wc{sizeof(wc)};wc.lpfnWndProc=WndProc;wc.hInstance=g_instance;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.lpszClassName=kController;
         if(!RegisterClassEx(&wc))return false;wc.lpszClassName=kOverlay;if(!RegisterClassEx(&wc))return false;
         controller=CreateWindowEx(WS_EX_TOOLWINDOW,kController,L"Window Scatter Controller",0,0,0,0,0,nullptr,nullptr,g_instance,nullptr);
-        if(!controller)return false;g_controller.store(controller);
+        if(!controller)return false;g_controller.store(controller);InitializeAccent();RefreshAccent();
         timer=CreateWaitableTimer(nullptr,FALSE,nullptr);if(!timer)return false;
         lowMemoryEvent=CreateMemoryResourceNotification(LowMemoryResourceNotification);
         if(!lowMemoryEvent)Log(L"Memory notifications unavailable; using idle fallback",HRESULT_FROM_WIN32(GetLastError()));
 #ifdef SCATTER_STANDALONE
         if(g_probe)return true;
 #endif
-        keyboardReady=CreateEvent(nullptr,TRUE,FALSE,nullptr);if(!keyboardReady)return false;
-        keyboardThread=CreateThread(nullptr,0,KeyboardMain,this,0,&keyboardThreadId);if(!keyboardThread)return false;
-        HANDLE ready[]{keyboardReady,keyboardThread};
-        if(WaitForMultipleObjects(2,ready,FALSE,5000)!=WAIT_OBJECT_0||!keyboardOK.load())return false;
         RegisterHotKey(controller,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_SPACE);
+        RegisterHotKey(controller,2,MOD_WIN|MOD_SHIFT|MOD_NOREPEAT,VK_TAB);
+        ChangeWindowMessageFilterEx(controller,kShellTaskView,MSGFLT_ALLOW,nullptr);
+        ChangeWindowMessageFilterEx(controller,kNativeConsumed,MSGFLT_ALLOW,nullptr);
+        for(UINT message:{kGestureBegin,kGestureUpdate,kGestureEnd,kGestureCancel})ChangeWindowMessageFilterEx(controller,message,MSGFLT_ALLOW,nullptr);
+        SetProp(controller,kShellReadyProperty,reinterpret_cast<HANDLE>(kShellAck));
         PostMessage(controller,kWarmup,0,0);
         return true;
     }
@@ -534,9 +550,11 @@ public:
         if(FAILED(hr))return hr;
         ComPtr<ID2D1DeviceContext> ctx;POINT offset{};
         hr=surface->BeginDraw(nullptr,IID_PPV_ARGS(&ctx),&offset);if(FAILED(hr))return hr;
-        ctx->SetDpi(96,96);ctx->SetTransform(D2D1::Matrix3x2F::Translation(float(offset.x),float(offset.y)));
+        ctx->SetDpi(96,96);ctx->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        ctx->SetTransform(D2D1::Matrix3x2F::Translation(float(offset.x),float(offset.y)));
         ctx->PushAxisAlignedClip(D2D1::RectF(0,0,float(width),float(height)),D2D1_ANTIALIAS_MODE_ALIASED);
         ctx->Clear(D2D1::ColorF(0,0.f));draw(ctx.Get());ctx->PopAxisAlignedClip();
+        ctx->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
         return surface->EndDraw();
     }
     bool PrepareDesktop(View&v){
@@ -609,10 +627,25 @@ public:
         if(FAILED(hr)){Log(L"Opaque desktop",hr);return false;}
         return true;
     }
+    void InitializeAccent(){
+        constexpr wchar_t name[]=L"Windows.UI.ViewManagement.UISettings";
+        HSTRING value=nullptr;ComPtr<IInspectable> settingsObject;
+        HRESULT hr=WindowsCreateString(name,ARRAYSIZE(name)-1,&value);
+        if(SUCCEEDED(hr))hr=RoActivateInstance(value,&settingsObject);
+        WindowsDeleteString(value);
+        if(SUCCEEDED(hr))hr=settingsObject.As(&uiSettings);
+        if(FAILED(hr)){Log(L"Read system accent",hr);return;}
+        ComPtr<AccentWatcher> watcher;watcher.Attach(new(std::nothrow) AccentWatcher);
+        if(watcher)accentSubscribed=SUCCEEDED(uiSettings->add_ColorValuesChanged(watcher.Get(),&accentToken));
+    }
+    static D2D1_COLOR_F OutlineColor(UINT32 rgb){
+        return D2D1::ColorF(float((rgb>>16)&255)/255.f,float((rgb>>8)&255)/255.f,float(rgb&255)/255.f,1.f);
+    }
     void RefreshAccent(){
-        DWORD color=0;BOOL opaque=FALSE;UINT32 rgb;
-        if(SUCCEEDED(DwmGetColorizationColor(&color,&opaque)))rgb=color&0xFFFFFF; // ARGB, not COLORREF.
-        else{COLORREF c=GetSysColor(COLOR_HIGHLIGHT);rgb=(GetRValue(c)<<16)|(GetGValue(c)<<8)|GetBValue(c);}
+        ABI::Windows::UI::Color color{};UINT32 rgb=accentColor;
+        if(uiSettings&&SUCCEEDED(uiSettings->GetColorValue(ABI::Windows::UI::ViewManagement::UIColorType_Accent,&color))&&color.A){
+            rgb=(UINT32(color.R)<<16)|(UINT32(color.G)<<8)|color.B;accentValid=true;
+        }else if(!accentValid){COLORREF c=GetSysColor(COLOR_HIGHLIGHT);rgb=(GetRValue(c)<<16)|(GetGValue(c)<<8)|GetBValue(c);}
         if(rgb==accentColor)return;accentColor=rgb;
         if(!building&&phase!=Phase::Hidden&&device){
             for(auto&v:views)for(auto&i:v->items)if(i.borderAttached&&!CreateOutline(*v,i)){End(false);return;}
@@ -672,9 +705,11 @@ public:
         sink->AddLine(D2D1::Point2F(o+r,o+h));ContinuousCorner(sink.Get(),o+r,o+h,-r,0,0,-r);
         sink->AddLine(D2D1::Point2F(o,o+r));ContinuousCorner(sink.Get(),o,o+r,0,-r,r,0);
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);hr=sink->Close();if(FAILED(hr))return false;
+        HRESULT drawResult=S_OK;
         hr=Paint(i.borderSurface,UINT(std::ceil(i.borderWidth)),UINT(std::ceil(i.borderHeight)),false,[&](ID2D1DeviceContext*ctx){
             ComPtr<ID2D1SolidColorBrush> brush,clear;
-            if(FAILED(ctx->CreateSolidColorBrush(D2D1::ColorF(accentColor),&brush))||FAILED(ctx->CreateSolidColorBrush(D2D1::ColorF(0,0.f),&clear)))return;
+            drawResult=ctx->CreateSolidColorBrush(OutlineColor(accentColor),&brush);if(FAILED(drawResult))return;
+            drawResult=ctx->CreateSolidColorBrush(D2D1::ColorF(0,0.f),&clear);if(FAILED(drawResult))return;
             ctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             ctx->DrawGeometry(path.Get(),brush.Get(),2*i.Outset());
             // Erase the interior and gap. This creates a true constant-distance
@@ -682,6 +717,7 @@ public:
             ctx->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
             ctx->FillGeometry(path.Get(),clear.Get());ctx->DrawGeometry(path.Get(),clear.Get(),2*i.gap);
         });
+        if(SUCCEEDED(hr))hr=drawResult;
         if(SUCCEEDED(hr))hr=i.borderFill->SetContent(i.borderSurface.Get());
         if(SUCCEEDED(hr))i.borderColor=accentColor;
         return SUCCEEDED(hr);
@@ -690,6 +726,7 @@ public:
         // Only the selected preview needs a border surface. Avoid allocating
         // and rasterizing one full-size transparent bitmap for every window.
         i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
+        if(i.label)i.position->RemoveVisual(i.label.Get());
         wchar_t title[512]{};GetWindowText(i.source,title,512);if(!title[0])wcscpy_s(title,L"Window");
         UINT width=UINT(std::max(1.,std::ceil(i.target.w))),height=UINT(std::ceil(25*v.dpi));
         HRESULT hr=Paint(i.labelSurface,width,height,false,[&](ID2D1DeviceContext*ctx){
@@ -713,12 +750,79 @@ public:
         if(SUCCEEDED(hr)){i.label->SetOffsetY(float(i.target.h+i.Outset()+6*v.dpi));i.labelEffect->SetOpacity(0.f);}
         return SUCCEEDED(hr);
     }
+    static float CloseSize(const View&v){return 28*v.dpi;}
+    static float CloseInset(const View&v){return 6*v.dpi;}
+    static Box CloseBox(const View&v,const Box&window){
+        double side=CloseSize(v),inset=CloseInset(v);
+        return {window.right()-side-inset,window.y+inset,side,side};
+    }
+    bool PrepareCloseButton(View&v,Item&i){
+        for(int hot=0;hot<2;++hot){
+            auto&surface=hot?v.closeHot:v.closeNormal;if(surface)continue;
+            UINT size=UINT(std::ceil(CloseSize(v)));HRESULT drawResult=S_OK;
+            HRESULT hr=Paint(surface,size,size,false,[&](ID2D1DeviceContext*ctx){
+                ComPtr<ID2D1SolidColorBrush> background,mark;
+                drawResult=ctx->CreateSolidColorBrush(D2D1::ColorF(hot?0xC42B1C:0x292C32,.98f),&background);if(FAILED(drawResult))return;
+                drawResult=ctx->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF),&mark);if(FAILED(drawResult))return;
+                float mid=CloseSize(v)*.5f,d=4*v.dpi;
+                ctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                ctx->FillEllipse(D2D1::Ellipse(D2D1::Point2F(mid,mid),mid-.5f*v.dpi,mid-.5f*v.dpi),background.Get());
+                ctx->DrawLine(D2D1::Point2F(mid-d,mid-d),D2D1::Point2F(mid+d,mid+d),mark.Get(),1.7f*v.dpi);
+                ctx->DrawLine(D2D1::Point2F(mid-d,mid+d),D2D1::Point2F(mid+d,mid-d),mark.Get(),1.7f*v.dpi);
+            });
+            if(FAILED(hr)||FAILED(drawResult)){surface.Reset();return false;}
+        }
+        i.closeHot=false;return SUCCEEDED(i.closeButton->SetContent(v.closeNormal.Get()));
+    }
+    bool IsCloseHit(const View&v,int index,POINT point)const{
+        if(index<0||index>=int(v.items.size()))return false;
+        const auto&i=v.items[index];if(!i.closeAttached||i.source!=selectedSource)return false;
+        Box b=CloseBox(v,CurrentBox(i));return point.x>=b.x&&point.x<b.right()&&point.y>=b.y&&point.y<b.bottom();
+    }
+    void HoverClose(View&v,int index,POINT point){
+        bool changed=false,hand=false;
+        for(size_t n=0;n<v.items.size();++n){auto&i=v.items[n];bool hot=int(n)==index&&IsCloseHit(v,int(n),point);
+            if(hot)hand=true;if(i.closeHot==hot)continue;i.closeHot=hot;
+            if(i.closeButton)i.closeButton->SetContent(hot?v.closeHot.Get():v.closeNormal.Get());changed=true;
+        }
+        SetCursor(LoadCursor(nullptr,hand?IDC_HAND:IDC_ARROW));if(changed)device->Commit();
+    }
+    static bool RequestClose(const Item&i){
+        DWORD process=0;GetWindowThreadProcessId(i.source,&process);
+        if(!IsWindow(i.source)||(i.sourceProcess&&process!=i.sourceProcess))return false;
+        // Let the application handle save prompts and cancellation. Never kill it.
+        return PostMessage(i.source,WM_SYSCOMMAND,SC_CLOSE,0)!=FALSE;
+    }
+    void RemoveWindowFromOverview(HWND source){
+        if(building){if(std::find(deferredRemovals.begin(),deferredRemovals.end(),source)==deferredRemovals.end())deferredRemovals.push_back(source);return;}
+        if(phase==Phase::Hidden)return;
+        if(phase==Phase::Closing){End(false);return;}
+        bool found=false;for(auto&v:views)for(auto&i:v->items)if(i.source==source)found=true;
+        if(!found)return;
+        CaptureMotion();ClearSelection();if(pressedClose==source)pressedClose=nullptr;
+        BuildGuard guard(*this);size_t remaining=0;
+        for(auto&v:views){
+            for(auto&i:v->items)if(i.source==source)v->windows->RemoveVisual(i.position.Get());
+            std::erase_if(v->items,[&](const Item&i){return i.source==source;});remaining+=v->items.size();
+            if(v->items.empty())continue;
+            std::vector<Box> original;for(auto&i:v->items)original.push_back(i.original);
+            double pad=28*v->dpi;Box area{pad,pad,std::max(1.,double(v->bounds.right-v->bounds.left)-2*pad),std::max(1.,double(v->bounds.bottom-v->bounds.top)-2*pad)};
+            auto layout=Layout(original,area,22*v->dpi,40*v->dpi);
+            if(layout.size()!=v->items.size()){End(false);return;}
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
+                if(!CreateTitle(*v,i)){End(false);return;}
+            }
+        }
+        if(!remaining){End(true);return;}
+        FollowNativeZOrder();progress=1;Animate(1,true,true);
+    }
     void Cleanup(){
-        if(keyboardThread){PostThreadMessage(keyboardThreadId,WM_QUIT,0,0);WaitForSingleObject(keyboardThread,INFINITE);CloseHandle(keyboardThread);keyboardThread=nullptr;}
-        if(keyboardReady){CloseHandle(keyboardReady);keyboardReady=nullptr;}
+        if(controller){RemoveProp(controller,kShellReadyProperty);RemoveProp(controller,kNativeBypassProperty);}
+        if(uiSettings&&accentSubscribed)uiSettings->remove_ColorValuesChanged(accentToken);
+        accentSubscribed=false;uiSettings.Reset();
         if(lowMemoryEvent){CloseHandle(lowMemoryEvent);lowMemoryEvent=nullptr;}
         End(false,false);
-        if(controller){UnregisterHotKey(controller,1);g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
+        if(controller){UnregisterHotKey(controller,1);UnregisterHotKey(controller,2);g_controller.store(nullptr);DestroyWindow(controller);controller=nullptr;}
         if(timer){CloseHandle(timer);timer=nullptr;}ReleaseDevice();desktops.Reset();UnregisterClass(kOverlay,g_instance);UnregisterClass(kController,g_instance);
     }
     void Schedule(double delay){LARGE_INTEGER due;due.QuadPart=-std::max<LONGLONG>(1,LONGLONG(delay*10000000));SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE);}
@@ -789,6 +893,7 @@ public:
         if(FAILED(hr)){Log(L"Create view",hr);return false;}return true;
     }
     bool CreateItem(View&v,Item&i){
+        GetWindowThreadProcessId(i.source,&i.sourceProcess);
         HRESULT hr=api.querySize(i.source,FALSE,&i.pixels);
         if(FAILED(hr)||i.pixels.cx<=0||i.pixels.cy<=0)return false;
         DWM_THUMBNAIL_PROPERTIES p{};
@@ -814,6 +919,7 @@ public:
         if(SUCCEEDED(hr))hr=device->CreateRectangleClip(&i.clip);
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.border);
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.borderFill);
+        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.closeButton);
         if(SUCCEEDED(hr))hr=device->CreateScaleTransform(&i.borderScale);
         if(SUCCEEDED(hr))hr=device->CreateEffectGroup(&i.borderEffect);
         if(SUCCEEDED(hr))hr=i.content->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
@@ -827,6 +933,7 @@ public:
         i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);
         i.border->SetOffsetX(-i.Outset());i.border->SetOffsetY(-i.Outset());
         i.borderEffect->SetOpacity(0.f);i.border->SetEffect(i.borderEffect.Get());
+        i.closeButton->SetOffsetY(CloseInset(v));
         i.nativeRadius=IsZoomed(i.source)?0.f:8.f*v.dpi;
         DWORD preference=DWMWCP_DEFAULT;
         if(SUCCEEDED(DwmGetWindowAttribute(i.source,DWMWA_WINDOW_CORNER_PREFERENCE,&preference,sizeof(preference)))&&preference==DWMWCP_DONOTROUND)i.nativeRadius=0;
@@ -868,12 +975,12 @@ public:
         StaticPose(0);
         if(FAILED(device->Commit())){building=false;End(false);return false;}
         device->WaitForCommitCompletion();
-        phase=Phase::Opening;
+        phase=Phase::Opening;SetProp(controller,kOverviewProperty,reinterpret_cast<HANDLE>(kShellAck));
         POINT cursor{};GetCursorPos(&cursor);HMONITOR active=MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST);HWND focus=nullptr;
         for(auto&v:views)if(v->hwnd){ShowWindow(v->hwnd,SW_SHOWNOACTIVATE);if(!focus||v->monitor==active)focus=v->hwnd;}
         if(focus){SetForegroundWindow(focus);SetFocus(focus);}
         foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT);
-        destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_DESTROY,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+        destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         building=false;Animate(1);return true;
     }
     template<class Setter> void Property(double a,double b,Setter setter){
@@ -903,6 +1010,7 @@ public:
             i.scale->SetScaleX(float(b.w/i.pixels.cx));i.scale->SetScaleY(float(b.h/i.pixels.cy));
             i.clip->SetRight(float(b.w));i.clip->SetBottom(float(b.h));
             i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+2*i.Outset())/i.borderHeight);
+            if(i.closeButton)i.closeButton->SetOffsetX(float(b.w)-CloseSize(*v)-CloseInset(*v));
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h+i.Outset()+6*v->dpi));i.labelEffect->SetOpacity(float(p));}
             Corners(i,b,float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*p));
             i.motionFrom=i.motionTo=b;i.radiusFrom=i.radiusTo=float(i.nativeRadius+(settings.radius*v->dpi-i.nativeRadius)*p);
@@ -925,11 +1033,11 @@ public:
         if(phase==Phase::Hidden)return 0;
         return from+(to-from)*Curve(seconds<=0?1:(Now()-start)/seconds);
     }
-    void Animate(double destination,bool captured=false){
+    void Animate(double destination,bool captured=false,bool reflow=false){
         if(!captured)CaptureMotion();animations.clear();
         from=progress;to=destination;
         BOOL enabled=TRUE;SystemParametersInfo(SPI_GETCLIENTAREAANIMATION,0,&enabled,0);
-        seconds=(enabled?settings.duration:0)/1000.0*std::abs(to-from);
+        seconds=(enabled?settings.duration:0)/1000.0*(reflow?1.:std::abs(to-from));
         phase=to==1?Phase::Opening:Phase::Closing;
         for(auto&v:views)for(auto&i:v->items){
             Box a=i.motionFrom,b=destination==1?i.target:i.original;i.motionTo=b;
@@ -942,6 +1050,7 @@ public:
             Property(a.h,b.h,[&](auto value){i.clip->SetBottom(value);});
             Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
             Property((a.h+2*i.Outset())/i.borderHeight,(b.h+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
+            if(i.closeButton)Property(a.w-CloseSize(*v)-CloseInset(*v),b.w-CloseSize(*v)-CloseInset(*v),[&](auto value){i.closeButton->SetOffsetX(value);});
             if(i.label){
                 Property((a.w-i.target.w)*.5,(b.w-i.target.w)*.5,[&](auto value){i.label->SetOffsetX(value);});
                 Property(a.h+i.Outset()+6*v->dpi,b.h+i.Outset()+6*v->dpi,[&](auto value){i.label->SetOffsetY(value);});
@@ -998,6 +1107,7 @@ public:
     }
     void Close(HWND selection){
         if(phase==Phase::Hidden||phase==Phase::Closing)return;
+        ResetGesture();RemoveProp(controller,kOverviewProperty);
         progress=CurrentProgress();CaptureMotion();chosen=selection;
         HWND target=chosen?chosen:previous;
         // Match the current native rectangle at handoff, including app-driven
@@ -1014,9 +1124,10 @@ public:
     }
     void Reopen(){
         progress=CurrentProgress();chosen=nullptr;previous=GetForegroundWindow();
-        FocusOverview();Animate(1);
+        SetProp(controller,kOverviewProperty,reinterpret_cast<HANDLE>(kShellAck));FocusOverview();Animate(1);
     }
     void End(bool restore,bool idle=true){
+        ResetGesture();RemoveProp(controller,kOverviewProperty);
         if(timer)CancelWaitableTimer(timer);idleTimer=false;
         animations.clear();
         bool visible=std::any_of(views.begin(),views.end(),[](const auto&v){return v->hwnd&&IsWindowVisible(v->hwnd);});
@@ -1042,7 +1153,7 @@ public:
         // Shared visuals own their private thumbnail references. Release visual
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
-        views.clear();previous=chosen=selectedSource=nullptr;progress=0;
+        views.clear();previous=chosen=selectedSource=pressedClose=nullptr;progress=0;
         if(device)device->Commit(); // Submit the filter-input detachments from Item destruction.
         if(idle&&timer&&device){
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
@@ -1055,8 +1166,74 @@ public:
         else for(size_t n=0;n<v.items.size();++n)if(hit(int(n)))return int(n);
         return -1;
     }
+    // Gesture selection uses final layout coordinates, so opening animations do
+    // not move the target out from under a held gesture.
+    HWND GestureChoice(double x,double y)const{
+        HWND result=nullptr;double best=std::numeric_limits<double>::infinity();
+        for(auto&v:views)for(auto&i:v->items){
+            Box b=i.target;b.x+=v->bounds.left;b.y+=v->bounds.top;
+            double dx=std::max({b.x-x,0.,x-b.right()}),dy=std::max({b.y-y,0.,y-b.bottom()});
+            double cx=x-b.cx(),cy=y-b.cy();double score=dx*dx+dy*dy+.02*(cx*cx+cy*cy);
+            if(score<best){best=score;result=i.source;}
+        }
+        return result;
+    }
+    void CountGesture(LPCWSTR property){if(controller)SetProp(controller,property,reinterpret_cast<HANDLE>(reinterpret_cast<ULONG_PTR>(GetProp(controller,property))+1));}
+    void ResetGesture(){gestureToken=0;gestureNavigating=false;gestureReady=false;if(controller)RemoveProp(controller,kGestureProperty);}
+    void BeginGesture(UINT token,bool alreadyOpen=false){
+        if(!token||!settings.winTab)return;
+        if(phase==Phase::Hidden&&!Begin())return;
+        if(phase==Phase::Closing)Reopen();
+        if(phase!=Phase::Opening&&phase!=Phase::Settled)return;
+        HWND initial=selectedSource?selectedSource:previous;
+        bool found=false;for(auto&v:views)for(auto&i:v->items)if(i.source==initial)found=true;
+        if(!found){POINT p{};GetCursorPos(&p);initial=GestureChoice(p.x,p.y);}
+        if(!initial)return;
+        for(auto&v:views)for(auto&i:v->items)if(i.source==initial){
+            gestureOriginX=v->bounds.left+i.target.cx();gestureOriginY=v->bounds.top+i.target.cy();
+            gestureWidth=std::max(1L,v->bounds.right-v->bounds.left);gestureHeight=std::max(1L,v->bounds.bottom-v->bounds.top);
+        }
+        gestureToken=token;gestureStarted=GetTickCount64();gestureNavigating=gestureReady=false;gestureOpenedAlready=alreadyOpen;
+        gestureBaseX=gestureBaseY=gestureLastX=gestureLastY=gestureMinY=gestureReadyX=gestureReadyY=0;
+        SetProp(controller,kGestureProperty,reinterpret_cast<HANDLE>(ULONG_PTR(token)));
+        CountGesture(L"WindowScatter.GestureStarts.v5");Select(initial);
+    }
+    void UpdateGesture(UINT token,LPARAM data){
+        if(!gestureToken||token!=gestureToken||(phase!=Phase::Opening&&phase!=Phase::Settled))return;
+        double nx=double(GET_X_LPARAM(data))/16384.,ny=double(GET_Y_LPARAM(data))/16384.;
+        CountGesture(L"WindowScatter.GestureUpdates.v5");
+        if(!gestureNavigating){
+            ULONGLONG elapsed=GetTickCount64()-gestureStarted;
+            gestureMinY=std::min(gestureMinY,ny);
+            // Separate the opening stroke from deliberate navigation. A short
+            // upward flick must not activate a window just because it generated
+            // several updates. A clear turn, or movement after holding, arms
+            // selection; the initial upward travel is then removed.
+            if(!gestureReady&&elapsed>=350){gestureReady=true;gestureReadyX=gestureLastX;gestureReadyY=gestureLastY;}
+            bool turned=!gestureOpenedAlready&&elapsed>=160&&(std::abs(nx)>=.035||ny-gestureMinY>=.035);
+            bool movedAfterHold=gestureReady&&std::hypot(nx-gestureReadyX,ny-gestureReadyY)>=.02;
+            if(gestureOpenedAlready&&std::hypot(nx,ny)>=.02){gestureBaseX=gestureBaseY=0;gestureNavigating=true;}
+            else if(turned){gestureBaseX=0;gestureBaseY=gestureMinY;gestureNavigating=true;}
+            else if(movedAfterHold){gestureBaseX=gestureReadyX;gestureBaseY=gestureReadyY;gestureNavigating=true;}
+            gestureLastX=nx;gestureLastY=ny;
+            if(!gestureNavigating)return;
+        }
+        double x=gestureOriginX+(nx-gestureBaseX)*gestureWidth*2.25;
+        double y=gestureOriginY+(ny-gestureBaseY)*gestureHeight*2.25;
+        HWND choice=GestureChoice(x,y);if(choice!=selectedSource)CountGesture(L"WindowScatter.GestureSelections.v5");Select(choice);
+    }
+    void FinishGesture(UINT token,bool commit){
+        if(!gestureToken||token!=gestureToken)return;
+        if(commit&&!gestureNavigating){CountGesture(L"WindowScatter.GestureOpens.v5");ResetGesture();return;}
+        HWND target=commit?selectedSource:nullptr;ResetGesture();
+        CountGesture(commit?L"WindowScatter.GestureCommits.v5":L"WindowScatter.GestureCancels.v5");
+        Close(target);
+    }
     void ClearSelection(){
-        selectedSource=nullptr;for(auto&v:views){v->selected=-1;for(auto&i:v->items)if(i.borderAttached){i.position->RemoveVisual(i.border.Get());i.borderAttached=false;i.borderEffect->SetOpacity(0.f);}}
+        selectedSource=nullptr;for(auto&v:views){v->selected=-1;for(auto&i:v->items){
+            if(i.borderAttached){i.position->RemoveVisual(i.border.Get());i.borderAttached=false;i.borderEffect->SetOpacity(0.f);}
+            if(i.closeAttached){i.position->RemoveVisual(i.closeButton.Get());i.closeAttached=false;i.closeHot=false;}
+        }}
     }
     void Select(HWND source){
         if(phase==Phase::Closing||phase==Phase::Hidden)return;
@@ -1064,7 +1241,9 @@ public:
         selectedSource=source;
         for(auto&v:views)for(size_t n=0;n<v->items.size();++n){auto&i=v->items[n];if(i.source!=source)continue;
             if((!i.borderSurface||i.borderColor!=accentColor)&&!CreateOutline(*v,i)){End(false);return;}
+            if(!PrepareCloseButton(*v,i)){End(false);return;}
             i.position->AddVisual(i.border.Get(),FALSE,i.content.Get());i.borderAttached=true;i.borderEffect->SetOpacity(1.f);v->selected=int(n);
+            i.position->AddVisual(i.closeButton.Get(),FALSE,nullptr);i.closeAttached=true;
         }
         device->Commit();
     }
@@ -1084,37 +1263,66 @@ public:
     }
     void NativeTaskView(){
         if(phase!=Phase::Hidden)End(true);
+        SetProp(controller,kNativeBypassProperty,reinterpret_cast<HANDLE>(ULONG_PTR(GetTickCount()+2000)));
         auto keys=NativeTaskViewInputs((GetAsyncKeyState(VK_LWIN)&0x8000)!=0,(GetAsyncKeyState(VK_RWIN)&0x8000)!=0,
                                       (GetAsyncKeyState(VK_LSHIFT)&0x8000)!=0,(GetAsyncKeyState(VK_RSHIFT)&0x8000)!=0);
-        if(SendInput(UINT(keys.size()),keys.data(),sizeof(INPUT))!=keys.size())Log(L"Open Windows Task View",HRESULT_FROM_WIN32(GetLastError()));
+        if(SendInput(UINT(keys.size()),keys.data(),sizeof(INPUT))!=keys.size()){RemoveProp(controller,kNativeBypassProperty);Log(L"Open Windows Task View",HRESULT_FROM_WIN32(GetLastError()));}
     }
     LRESULT Message(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(msg==WM_NCCREATE){auto cs=reinterpret_cast<CREATESTRUCT*>(lp);if(cs->lpCreateParams)SetWindowLongPtr(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(cs->lpCreateParams));}
         auto v=reinterpret_cast<View*>(GetWindowLongPtr(hwnd,GWLP_USERDATA));
         if(building){
+            if(msg>=kGestureBegin&&msg<=kGestureCancel){
+                if(msg==kGestureUpdate&&!deferredGestures.empty()&&deferredGestures.back().message==msg&&deferredGestures.back().token==wp)deferredGestures.back().data=lp;
+                else if(deferredGestures.size()<32)deferredGestures.push_back({msg,wp,lp});
+                return 0;
+            }
+            if(msg==kShow){if(!deferredCommand)deferredCommand=kShow;return 0;}
             if(msg==kToggle||(msg==WM_HOTKEY&&wp==1)){deferredCommand=deferredCommand==kToggle?0:kToggle;return 0;}
             if(msg==kSettings||msg==kNativeTaskView){deferredCommand=msg;return 0;}
         }
         switch(msg){
-        case WM_HOTKEY:if(wp==1){if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);}return 0;
+        case WM_HOTKEY:if(wp==1){if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);}else if(wp==2)PostMessage(controller,kNativeTaskView,0,0);return 0;
+        case kShellTaskView:{
+            if(!settings.winTab)return 0;
+            ULONG_PTR count=reinterpret_cast<ULONG_PTR>(GetProp(controller,L"WindowScatter.NativeRequests.v4"));
+            SetProp(controller,L"WindowScatter.NativeRequests.v4",reinterpret_cast<HANDLE>(count+1));
+            if(wp)SetProp(controller,L"WindowScatter.GestureRequests.v4",reinterpret_cast<HANDLE>(reinterpret_cast<ULONG_PTR>(GetProp(controller,L"WindowScatter.GestureRequests.v4"))+1));
+            return PostMessage(controller,wp?kShow:kToggle,0,0)?kShellAck:0;
+        }
+        case kNativeConsumed:if(reinterpret_cast<ULONG_PTR>(GetProp(controller,kNativeBypassProperty))==wp)RemoveProp(controller,kNativeBypassProperty);return 0;
         case kToggle:if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();else Close(nullptr);return 0;
+        case kShow:if(phase==Phase::Hidden)Begin();else if(phase==Phase::Closing)Reopen();return 0;
+        case kGestureBegin:BeginGesture(UINT(wp),lp!=0);return 0;
+        case kGestureUpdate:UpdateGesture(UINT(wp),lp);return 0;
+        case kGestureEnd:FinishGesture(UINT(wp),lp!=0);return 0;
+        case kGestureCancel:CountGesture(L"WindowScatter.GestureCancels.v5");Close(nullptr);return 0;
         case kNativeTaskView:NativeTaskView();return 0;
         case kSettings:End(false);LoadSettings();memoryPressure=false;
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
             else if(!device)PostMessage(controller,kWarmup,0,0);return 0;
         case kReleaseInactive:ReleaseInactiveGraphics();return 0;
+        case kWindowGone:RemoveWindowFromOverview(reinterpret_cast<HWND>(wp));return 0;
         case kWarmup:Warmup();return 0;
         case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
-        case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
+        case kAccentChanged:case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
         case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:desktopCache.clear();if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
         case WM_QUERYENDSESSION:return TRUE;
         case WM_ENDSESSION:if(wp)SetEvent(g_stopEvent);return 0;
         case WM_ERASEBKGND:return 1;
         case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);if(!building&&d3d&&FAILED(d3d->GetDeviceRemovedReason())){End(false,false);ReleaseDevice();PostMessage(controller,kWarmup,0,0);}return 0;}
-        case WM_MOUSEMOVE:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT p;GetCursorPos(&p);if(p.x!=lastPointer.x||p.y!=lastPointer.y){lastPointer=p;int i=Hit(*v,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});HWND hover=i>=0?v->items[i].source:nullptr;if(selectedSource!=hover)Select(hover);}TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
-        case WM_MOUSELEAVE:if(v&&v->selected>=0)Select(nullptr);return 0;
-        case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){int i=Hit(*v,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});Close(i<0?nullptr:v->items[i].source);}return 0;
+        case WM_MOUSEMOVE:if(!gestureToken&&v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)},screen=point;ClientToScreen(hwnd,&screen);lastPointer=screen;
+            int i=Hit(*v,point);HWND hover=i>=0?v->items[i].source:nullptr;if(selectedSource!=hover)Select(hover);
+            if(phase!=Phase::Hidden)HoverClose(*v,i,point);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
+        case WM_MOUSELEAVE:if(!gestureToken&&v&&v->selected>=0)Select(nullptr);return 0;
+        case WM_LBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
+            if(IsCloseHit(*v,i,point)){pressedClose=v->items[i].source;SetCapture(hwnd);}}return 0;
+        case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
+            HWND pressed=std::exchange(pressedClose,nullptr);if(GetCapture()==hwnd)ReleaseCapture();
+            if(pressed){if(i>=0&&v->items[i].source==pressed&&IsCloseHit(*v,i,point))RequestClose(v->items[i]);}
+            else Close(i<0?nullptr:v->items[i].source);}return 0;
+        case WM_CAPTURECHANGED:pressedClose=nullptr;return 0;
         case WM_RBUTTONUP:Close(nullptr);return 0;
         case WM_SYSKEYDOWN:case WM_KEYDOWN:
             if(wp==VK_ESCAPE){Close(nullptr);return 0;}
@@ -1153,6 +1361,161 @@ static bool Start(){
 static void Stop(){if(g_stopEvent)SetEvent(g_stopEvent);if(g_thread){WaitForSingleObject(g_thread,INFINITE);CloseHandle(g_thread);g_thread=nullptr;}if(g_readyEvent){CloseHandle(g_readyEvent);g_readyEvent=nullptr;}if(g_stopEvent){CloseHandle(g_stopEvent);g_stopEvent=nullptr;}}
 } // namespace scatter
 
+// Explorer recognizes the input. Win+Tab and precision-touchpad Task View use
+// different request paths; redirect both before native view creation.
+namespace scatter::shell {
+constexpr wchar_t kBridgeProperty[]=L"WindowScatter.NativeBridge.v4";
+using ToggleRequest=HRESULT(WINAPI*)(void*,HMONITOR,int);
+static ToggleRequest originalToggle=nullptr;
+using GestureRequest=HRESULT(WINAPI*)(void*,int,HWND const*);
+static GestureRequest originalGesture=nullptr;
+static std::atomic<bool> stopping{false};
+using SwipeStart=HRESULT(WINAPI*)(void*,int,int,UINT,ULONGLONG);
+using SwipeMove=HRESULT(WINAPI*)(void*,int,int,int,int,UINT);
+using SwipeCancel=HRESULT(WINAPI*)(void*);
+static SwipeStart originalStart=nullptr;
+static SwipeMove originalContinue=nullptr,originalFinish=nullptr;
+static SwipeCancel originalCancel=nullptr;
+struct Swipe {
+    HWND target=nullptr;UINT token=0;int mode=0;bool finishing=false;
+    double x=0,y=0,width=10000,height=6000;
+};
+static std::mutex swipeMutex;
+static std::map<void*,Swipe> swipes;
+static std::atomic<UINT> nextToken{0};
+static thread_local Swipe* activeSwipe=nullptr;
+struct SwipeScope {Swipe*previous;explicit SwipeScope(Swipe&s):previous(std::exchange(activeSwipe,&s)){}~SwipeScope(){activeSwipe=previous;}};
+static bool TakeSwipe(void*self,Swipe&value,bool remove=false){std::lock_guard lock(swipeMutex);auto i=swipes.find(self);if(i==swipes.end())return false;value=i->second;if(remove)swipes.erase(i);return true;}
+static void SaveSwipe(void*self,const Swipe&value){std::lock_guard lock(swipeMutex);swipes[self]=value;}
+static void EndSwipe(Swipe&s,bool commit){if(s.mode==1&&s.target)PostMessage(s.target,kGestureEnd,s.token,commit);s.mode=2;}
+static void ReadSwipeDimensions(Swipe&s,UINT pointer){
+    POINTER_INFO info{};RECT device{},display{};
+    if(GetPointerInfo(pointer,&info)&&GetPointerDeviceRects(info.sourceDevice,&device,&display)){
+        if(device.right>device.left&&device.bottom>device.top){s.width=double(device.right)-device.left;s.height=double(device.bottom)-device.top;}
+    }
+}
+static LPARAM SwipePosition(const Swipe&s){
+    int x=int(std::clamp(std::round(s.x/s.width*16384.),-32768.,32767.));
+    int y=int(std::clamp(std::round(s.y/s.height*16384.),-32768.,32767.));
+    return MAKELPARAM(short(x),short(y));
+}
+static HRESULT WINAPI StartHook(void*self,int x,int y,UINT pointer,ULONGLONG context){
+    Swipe previous;if(TakeSwipe(self,previous,true))EndSwipe(previous,false);
+    Swipe s;ReadSwipeDimensions(s,pointer);SwipeScope scope(s);
+    HRESULT hr=originalStart(self,x,y,pointer,context);
+    if(SUCCEEDED(hr))SaveSwipe(self,s);else EndSwipe(s,false);
+    return hr;
+}
+static HRESULT WINAPI ContinueHook(void*self,int x,int y,int vx,int vy,UINT pointer){
+    Swipe s;if(!TakeSwipe(self,s))return originalContinue(self,x,y,vx,vy,pointer);
+    bool selecting=s.mode==1;SwipeScope scope(s);HRESULT hr=originalContinue(self,x,y,vx,vy,pointer);
+    if(FAILED(hr))EndSwipe(s,false);
+    else if(selecting&&s.mode==1){s.x+=x;s.y+=y;if(!PostMessage(s.target,kGestureUpdate,s.token,SwipePosition(s)))EndSwipe(s,false);}
+    SaveSwipe(self,s);return hr;
+}
+static HRESULT WINAPI FinishHook(void*self,int x,int y,int vx,int vy,UINT pointer){
+    Swipe s;if(!TakeSwipe(self,s,true))return originalFinish(self,x,y,vx,vy,pointer);
+    s.finishing=true;SwipeScope scope(s);HRESULT hr=originalFinish(self,x,y,vx,vy,pointer);
+    EndSwipe(s,SUCCEEDED(hr)&&!stopping.load()&&g_winTab.load());return hr;
+}
+static HRESULT WINAPI CancelHook(void*self){
+    Swipe s;if(!TakeSwipe(self,s,true))return originalCancel(self);
+    s.finishing=true;SwipeScope scope(s);HRESULT hr=originalCancel(self);EndSwipe(s,false);return hr;
+}
+static HWND RequestTarget(){
+    if(stopping.load()||!g_winTab.load())return nullptr;
+    HWND target=FindWindow(kController,L"Window Scatter Controller");
+    if(!target||reinterpret_cast<ULONG_PTR>(GetProp(target,kShellReadyProperty))!=kShellAck)return nullptr;
+    ULONG_PTR until=reinterpret_cast<ULONG_PTR>(GetProp(target,kNativeBypassProperty));
+    if(until&&LONG(DWORD(until)-GetTickCount())>0){PostMessage(target,kNativeConsumed,until,0);return nullptr;}
+    return target;
+}
+static bool QueueRequest(HWND target,bool showOnly){
+    DWORD process=0;GetWindowThreadProcessId(target,&process);if(process)AllowSetForegroundWindow(process);
+    return PostMessage(target,kShellTaskView,showOnly,0)!=FALSE;
+}
+static HRESULT WINAPI ToggleHook(void*self,HMONITOR monitor,int flags){
+    if(HWND target=RequestTarget();target&&QueueRequest(target,false))return S_OK;
+    return originalToggle(self,monitor,flags);
+}
+static HRESULT WINAPI GestureHook(void*self,int action,HWND const*window){
+    // GestureAction 1 requests Task View; 0 performs normal gesture bookkeeping
+    // without scheduling a native view. Preserve that cleanup through the original
+    // method. In particular, never skip TaskViewHost::Show after its view exists.
+    if(activeSwipe&&activeSwipe->mode)return originalGesture(self,0,window);
+    if(action>=1&&action<=5){
+        if(HWND target=RequestTarget()){
+            bool visible=reinterpret_cast<ULONG_PTR>(GetProp(target,kOverviewProperty))==kShellAck;
+            bool cancel=(action==2||action==3)&&visible;
+            bool select=action==1||((action==4||action==5)&&visible&&activeSwipe);
+            if(!select&&!cancel)return originalGesture(self,action,window);
+            HRESULT cleanup=originalGesture(self,0,window);
+            if(FAILED(cleanup))return cleanup;
+            if(cancel){
+                if(PostMessage(target,kGestureCancel,0,0)){if(activeSwipe){activeSwipe->target=target;activeSwipe->mode=2;}return S_OK;}
+            }else if(activeSwipe&&!activeSwipe->finishing){
+                UINT token=++nextToken;if(!token)token=++nextToken;
+                DWORD process=0;GetWindowThreadProcessId(target,&process);if(process)AllowSetForegroundWindow(process);
+                if(PostMessage(target,kGestureBegin,token,visible)){activeSwipe->target=target;activeSwipe->token=token;activeSwipe->mode=1;return S_OK;}
+            }else if(QueueRequest(target,true))return S_OK;
+        }
+    }
+    return originalGesture(self,action,window);
+}
+#ifndef SCATTER_STANDALONE
+static HWND taskbar=nullptr;
+static bool Initialize(){
+#ifndef _WIN64
+    return false;
+#else
+    stopping=false;DWORD process=0;taskbar=FindWindow(L"Shell_TrayWnd",nullptr);
+    if(!taskbar||!GetWindowThreadProcessId(taskbar,&process)||process!=GetCurrentProcessId())return false;
+    HMODULE module=GetModuleHandle(L"twinui.pcshell.dll");
+    if(!module)module=LoadLibraryEx(L"twinui.pcshell.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if(!module)return false;
+    void*target=nullptr;void*gesture=nullptr;void*determine=nullptr;void*start=nullptr;void*update=nullptr;void*finish=nullptr;void*cancel=nullptr;
+    constexpr wchar_t request[]=L"?ToggleAllUpView@CAllUpViewService@@UEAAJPEAUHMONITOR__@@W4ALL_UP_VIEW_FLAGS@@@Z";
+    constexpr wchar_t gestureRequest[]=L"?ActivateGestureAction@MultitaskingViewGestureHandler@@AEAAJW4GestureAction@MultitaskingViewGestureHandlerHelpers@@PEBQEAUHWND__@@@Z";
+    constexpr wchar_t determineRequest[]=L"?DetermineTouchpadGestureAction@MultitaskingViewGestureHandlerHelpers@@YA?AW4GestureAction@1@W4GestureDirection@1@_NW4MULTITASKING_VIEW_TYPES@@@Z";
+    constexpr wchar_t startRequest[]=L"?StartSwipe@MultitaskingViewGestureHandler@@UEAAJHHIUTOUCHPAD_GESTURE_CONTEXT@@@Z";
+    constexpr wchar_t updateRequest[]=L"?ContinueSwipe@MultitaskingViewGestureHandler@@UEAAJHHHHI@Z";
+    constexpr wchar_t finishRequest[]=L"?FinishSwipe@MultitaskingViewGestureHandler@@UEAAJHHHHI@Z";
+    constexpr wchar_t cancelRequest[]=L"?CancelSwipe@MultitaskingViewGestureHandler@@UEAAJXZ";
+    WH_FIND_SYMBOL_OPTIONS options{sizeof(options),nullptr,TRUE};WH_FIND_SYMBOL symbol{};
+    HANDLE search=Wh_FindFirstSymbol(module,&options,&symbol);if(!search)return false;
+    do{
+        if(!symbol.symbolDecorated)continue;
+        if(!wcscmp(symbol.symbolDecorated,request))target=symbol.address;
+        if(!wcscmp(symbol.symbolDecorated,gestureRequest))gesture=symbol.address;
+        if(!wcscmp(symbol.symbolDecorated,determineRequest))determine=symbol.address;
+        if(!wcscmp(symbol.symbolDecorated,startRequest))start=symbol.address;
+        if(!wcscmp(symbol.symbolDecorated,updateRequest))update=symbol.address;
+        if(!wcscmp(symbol.symbolDecorated,finishRequest))finish=symbol.address;
+        if(!wcscmp(symbol.symbolDecorated,cancelRequest))cancel=symbol.address;
+        if(target&&gesture&&determine&&start&&update&&finish&&cancel)break;
+    }while(Wh_FindNextSymbol(search,&symbol));
+    Wh_FindCloseSymbol(search);
+    if(!target){Wh_Log(L"Native Task View toggle symbol unavailable");return false;}
+    using Determine=int(WINAPI*)(int,bool,int);
+    auto action=reinterpret_cast<Determine>(determine);
+    if(gesture&&action&&action(1,false,0)==1&&action(1,true,0)==4){
+        if(!start||!update||!finish||!cancel){Wh_Log(L"Native swipe lifecycle symbols unavailable");return false;}
+        if(!Wh_SetFunctionHook(start,reinterpret_cast<void*>(StartHook),reinterpret_cast<void**>(&originalStart))||
+           !Wh_SetFunctionHook(update,reinterpret_cast<void*>(ContinueHook),reinterpret_cast<void**>(&originalContinue))||
+           !Wh_SetFunctionHook(finish,reinterpret_cast<void*>(FinishHook),reinterpret_cast<void**>(&originalFinish))||
+           !Wh_SetFunctionHook(cancel,reinterpret_cast<void*>(CancelHook),reinterpret_cast<void**>(&originalCancel)))return false;
+        if(!Wh_SetFunctionHook(gesture,reinterpret_cast<void*>(GestureHook),reinterpret_cast<void**>(&originalGesture)))return false;
+    }else Wh_Log(L"Native Task View gesture symbols or action mapping unavailable; preserving native gestures");
+    return Wh_SetFunctionHook(target,reinterpret_cast<void*>(ToggleHook),reinterpret_cast<void**>(&originalToggle));
+#endif
+}
+static void AfterInit(){if(taskbar)SetProp(taskbar,kBridgeProperty,reinterpret_cast<HANDLE>(kShellAck));}
+static void BeforeUninit(){stopping=true;std::lock_guard lock(swipeMutex);for(auto&[self,swipe]:swipes)EndSwipe(swipe,false);}
+static void Uninit(){if(taskbar)RemoveProp(taskbar,kBridgeProperty);taskbar=nullptr;std::lock_guard lock(swipeMutex);swipes.clear();}
+#endif
+} // namespace scatter::shell
+
+
 #ifndef SCATTER_STANDALONE
 static void ReadSettings(){
     scatter::g_winTab=Wh_GetIntSetting(L"replaceWinTab")!=0;scatter::g_duration=Wh_GetIntSetting(L"durationMs");scatter::g_radius=Wh_GetIntSetting(L"cornerRadius");
@@ -1163,6 +1526,12 @@ static void ReadSettings(){
 BOOL WhTool_ModInit(){GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&WhTool_ModInit),&scatter::g_instance);ReadSettings();if(!scatter::Start()){scatter::Stop();return FALSE;}return TRUE;}
 void WhTool_ModSettingsChanged(){ReadSettings();if(auto hwnd=scatter::g_controller.load())PostMessage(hwnd,scatter::kSettings,0,0);}
 void WhTool_ModUninit(){scatter::Stop();}
+// Keep the official launcher for windhawk.exe; explorer.exe only hosts the
+// native Task View bridge, with no renderer or extra keyboard listener.
+#define Wh_ModInit ToolLauncher_ModInit
+#define Wh_ModAfterInit ToolLauncher_ModAfterInit
+#define Wh_ModSettingsChanged ToolLauncher_ModSettingsChanged
+#define Wh_ModUninit ToolLauncher_ModUninit
 ////////////////////////////////////////////////////////////////////////////////
 // Windhawk tool mod implementation for mods which don't need to inject to other
 // processes or hook other functions. Context:
@@ -1342,6 +1711,22 @@ void Wh_ModUninit() {
     ExitProcess(0);
 }
 
+#undef Wh_ModInit
+#undef Wh_ModAfterInit
+#undef Wh_ModSettingsChanged
+#undef Wh_ModUninit
+static bool g_shellProcess=false;
+BOOL Wh_ModInit(){
+    wchar_t path[MAX_PATH]{};GetModuleFileName(nullptr,path,ARRAYSIZE(path));
+    const wchar_t*name=wcsrchr(path,L'\\');name=name?name+1:path;
+    g_shellProcess=_wcsicmp(name,L"explorer.exe")==0;
+    if(g_shellProcess){ReadSettings();return scatter::shell::Initialize();}
+    return ToolLauncher_ModInit();
+}
+void Wh_ModAfterInit(){if(g_shellProcess)scatter::shell::AfterInit();else ToolLauncher_ModAfterInit();}
+void Wh_ModSettingsChanged(){if(g_shellProcess)ReadSettings();else ToolLauncher_ModSettingsChanged();}
+void Wh_ModBeforeUninit(){if(g_shellProcess)scatter::shell::BeforeUninit();}
+void Wh_ModUninit(){if(g_shellProcess)scatter::shell::Uninit();else ToolLauncher_ModUninit();}
 #elif !defined(SCATTER_TEST)
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     int argc=0;LPWSTR*argv=CommandLineToArgvW(GetCommandLine(),&argc);bool open=true;
