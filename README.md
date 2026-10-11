@@ -1,6 +1,29 @@
 # Window Scatter
 
-为 Windows 11 提供类似 macOS Exposé 的窗口总览。Windhawk 模组，当前版本 **0.4.5**。
+为 Windows 11 提供类似 macOS Exposé 的窗口总览。
+
+**独立版 0.5.0**：下载一个 EXE 即可运行，无需 Windhawk、.NET 或额外运行库。原有 **Windhawk 模组 0.4.5** 继续保留。
+
+## 独立版
+
+[下载 WindowScatter.exe](https://github.com/SinCircle/windhawk-window-scatter/releases/latest/download/WindowScatter.exe) · [Release 与校验值](https://github.com/SinCircle/windhawk-window-scatter/releases/latest)
+
+1. 将 EXE 放在准备长期使用的位置。若已启用 Windhawk 中的 Window Scatter，请先停用该模组。
+2. 第一次双击后在后台运行，不弹窗口，也不添加托盘图标。
+3. 运行期间再次双击，打开单页设置面板。开机启动、系统触发、内存模式、动画和圆角都在同一页，修改自动保存。
+4. 关闭面板后继续运行；点击面板底部的“退出程序”停止运行并恢复系统入口。
+
+独立版默认动画 **666 ms**，开机启动默认关闭。面板跟随系统浅色、深色与高对比度设置；正常运行时不显示状态提示，异常时才显示说明和重新连接按钮。控件使用 Win32 与 GDI+，保留键盘操作和原生下拉列表，没有 WebView 或浏览器运行时。
+
+![独立版设置面板](native/settings-preview.png)
+
+面向 **Windows 11 x64**。单文件是分发形式：运行时会将内置系统连接组件释放到本地应用数据目录，并自动管理。当前已验证系统可离线启动；其他 Windows 版本首次适配时可能从微软符号服务器下载匹配文件，之后使用本地缓存。接口不兼容时会在设置中提示，不接管系统任务视图。
+
+设置保存在当前用户的 `HKCU\Software\SinCircle\WindowScatter`；运行组件与符号缓存位于 `%LOCALAPPDATA%\WindowScatter`。开机启动仅注册当前用户的启动项；启用后若移动 EXE，请在新位置关闭并重新开启该选项。
+
+也支持 `WindowScatter.exe --settings` 直接打开设置，以及 `WindowScatter.exe --exit` 退出。独立版与 Windhawk 版不能同时接管系统入口，程序会检测并提示冲突。
+
+0.5.0 已在 Windows 11 x64、内部版本 26200.9457 上实际连接 Explorer，并由用户确认 Win+Tab、三指短上滑与持续选窗后松手切换正常。其他 Windows 版本尚未逐一验证。
 
 ## 功能
 
@@ -12,7 +35,7 @@
 - 选中框跟随 Windows 系统主题色，与预览之间保留 4 DIP 的透明间距。
 - 悬停预览显示关闭按钮，点击后请求应用正常关闭；应用仍可显示保存确认。窗口关闭后，其余预览重新排列。
 - DirectComposition 执行动画，显示器刷新率由 DWM 驱动；任务栏保持可见。
-- 默认动画时长 320 ms，可调整时长和圆角。
+- 独立版默认动画时长 666 ms，Windhawk 版默认 320 ms；均可调整时长和圆角。
 - 支持自动、常驻和省内存三种模式，默认自动。
 
 ## 0.4.5 更新
@@ -32,7 +55,7 @@
 
 ## 内存模式
 
-在 **Windhawk → Window Scatter → 设置 → 内存模式** 中选择：
+独立版在设置面板直接选择；模组版在 **Windhawk → Window Scatter → 设置 → 内存模式** 中选择：
 
 | 模式 | 行为 |
 | --- | --- |
@@ -70,7 +93,7 @@
 
 已通过 32/64 位编译、合成器探测和共 48 次切换收尾回归测试，并检查透明与半透明窗口的显示。
 
-## 安装
+## Windhawk 版安装
 
 1. 安装 [Windhawk](https://windhawk.net/)。本版本使用 Windhawk 1.7.3 验证。
 2. 打开本仓库的 [window-scatter.wh.cpp](window-scatter.wh.cpp)，复制完整源码。
@@ -79,6 +102,20 @@
 关闭模组可恢复原生 Win+Tab 和触摸板任务视图。需要 Windows 11；当前实现不展示已最小化窗口，也不管理虚拟桌面。它使用未公开的 DWM 接口和 Explorer 内部任务视图符号，系统更新可能需要适配；受保护内容可能无法预览。系统入口已在 Windows 11 x64、内部版本 26200.9457 上验证，其他版本需实机确认。
 
 ## 本地编译
+
+独立版使用 LLVM-MinGW 的 `clang++.exe` 和 Windows SDK 的 `rc.exe` 编译：
+
+```powershell
+.\build-native.ps1 -Compiler 'C:\path\to\llvm-mingw\bin\clang++.exe'
+```
+
+生成的 `build/native/WindowScatter.exe` 可单独分发。脚本会将连接组件、图标和第三方许可嵌入 EXE，并静态链接 C/C++ 运行库；构建时需要编译器，最终用户无需安装它们。可以通过 `-ResourceCompiler` 显式指定 `rc.exe`，通过 `-OutputDirectory` 更改输出位置。
+
+内置自检使用临时配置项检查保存、默认值、开机启动命令和组件校验，不更改用户的实际开机启动项：
+
+```powershell
+.\build\native\WindowScatter.exe --self-test --report "$PWD\self-test.txt"
+```
 
 在仓库目录运行 PowerShell，按实际安装位置指定 Windhawk：
 
@@ -92,3 +129,5 @@
 ## 来源
 
 作者：SinCircle。共享窗口画面实现参考 [ADeltaX 的 DWM 接口研究](https://gist.github.com/ADeltaX/aea6aac248604d0cb7d423a61b06e247)。独立进程启动代码来自 [Ramen Software 的官方示例](https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process)，源码保留相应署名与链接。原始模组未指定整体许可证，本仓库暂未另行指定。
+
+独立版系统连接组件静态链接 [MinHook 1.3.4](https://github.com/TsudaKageyu/minhook/tree/c3fcafdc10146beb5919319d0683e44e3c30d537)，许可保留在 `native/vendor/minhook/LICENSE.txt`，也可在独立版设置中打开“开源许可”查看。独立版复用窗口总览和手势实现，不依赖 Windhawk 引擎。
