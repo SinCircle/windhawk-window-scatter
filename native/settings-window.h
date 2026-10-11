@@ -31,7 +31,7 @@ private:
     float scale=1;
     bool dark=false,highContrast=false,loading=false,arranging=false;
     UINT taskbarMessage=0;
-    HWND startup=nullptr,enabled=nullptr,memory=nullptr,duration=nullptr,radius=nullptr,exitButton=nullptr,retry=nullptr,github=nullptr,notices=nullptr;
+    HWND startup=nullptr,enabled=nullptr,memory=nullptr,duration=nullptr,exitButton=nullptr,retry=nullptr,github=nullptr,notices=nullptr;
     struct Palette{COLORREF background,text,secondary,line,accent,selection,danger;}colors{};
     std::mutex statusMutex;
     int status=0;

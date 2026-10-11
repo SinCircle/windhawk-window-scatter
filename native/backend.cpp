@@ -98,7 +98,7 @@ static bool BundledSymbols(const ModuleIdentity&id,SymbolTable&table){
 }
 struct InternetHandle{HINTERNET h=nullptr;~InternetHandle(){if(h)WinHttpCloseHandle(h);}};
 static bool DownloadPdb(const std::wstring&id,const std::filesystem::path&path,HANDLE stop,std::wstring&error){
-    InternetHandle session{WinHttpOpen(L"WindowScatter/0.5.0",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
+    InternetHandle session{WinHttpOpen(L"WindowScatter/0.5.1",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
     if(!session.h){error=ErrorText(GetLastError());return false;}
     WinHttpSetTimeouts(session.h,5000,5000,5000,5000);
     InternetHandle connection{WinHttpConnect(session.h,L"msdl.microsoft.com",INTERNET_DEFAULT_HTTPS_PORT,0)};
@@ -217,13 +217,12 @@ Preferences LoadPreferences(const wchar_t*path){
     Preferences prefs;HKEY key=nullptr;if(RegOpenKeyEx(HKEY_CURRENT_USER,path,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)return prefs;
     prefs.enabled=ReadDword(key,L"Enabled",1)!=0;
     prefs.duration=std::clamp<int>(ReadDword(key,L"AnimationDuration",666),0,900);
-    prefs.radius=std::clamp<int>(ReadDword(key,L"CornerRadius",12),0,32);
     prefs.memory=std::clamp<int>(ReadDword(key,L"MemoryMode",0),0,2);RegCloseKey(key);return prefs;
 }
 bool SavePreferences(const Preferences&prefs,const wchar_t*path){
     HKEY key=nullptr;if(RegCreateKeyEx(HKEY_CURRENT_USER,path,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS)return false;
     auto write=[&](const wchar_t*name,DWORD value){return RegSetValueEx(key,name,0,REG_DWORD,reinterpret_cast<const BYTE*>(&value),sizeof(value))==ERROR_SUCCESS;};
-    bool success=write(L"Enabled",prefs.enabled)&&write(L"AnimationDuration",std::clamp(prefs.duration,0,900))&&write(L"CornerRadius",std::clamp(prefs.radius,0,32))&&write(L"MemoryMode",std::clamp(prefs.memory,0,2));RegCloseKey(key);return success;
+    bool success=write(L"Enabled",prefs.enabled)&&write(L"AnimationDuration",std::clamp(prefs.duration,0,900))&&write(L"MemoryMode",std::clamp(prefs.memory,0,2));RegCloseKey(key);return success;
 }
 bool StartupEnabled(std::wstring*registeredPath,const wchar_t*key,const wchar_t*value){
     wchar_t command[32768]{};DWORD bytes=sizeof(command);

@@ -55,7 +55,7 @@ private:
     std::atomic<DWORD> bridgeFailure{0};
     bool rendererStarted=false;
     void ApplyValues(const Preferences&values){
-        preferences=values;scatter::g_winTab=values.enabled;scatter::g_duration=values.duration;scatter::g_radius=values.radius;scatter::g_memoryMode=values.memory;
+        preferences=values;scatter::g_winTab=values.enabled;scatter::g_duration=values.duration;scatter::g_memoryMode=values.memory;
         if(HWND controller=scatter::g_controller.load())PostMessage(controller,scatter::kSettings,0,0);
         if(HWND bridge=endpoint.load())PostMessage(bridge,kBridgeEnable,values.enabled,0);
     }
@@ -122,10 +122,10 @@ int SelfTest(const std::wstring&report){
     auto check=[&](bool ok,const char*text){if(output)output<<(ok?"PASS ":"FAIL ")<<text<<"\n";return ok;};
     std::wstring key=std::wstring(kRegistry)+L"\\SelfTest-"+std::to_wstring(GetCurrentProcessId());
     auto defaults=LoadPreferences(key.c_str());
-    bool success=check(defaults.duration==666&&defaults.radius==12&&defaults.memory==0&&defaults.enabled,"fresh defaults use 666 ms, automatic memory and system gestures");
-    Preferences prefs;prefs.enabled=false;prefs.duration=840;prefs.radius=31;prefs.memory=2;
+    bool success=check(defaults.duration==666&&defaults.memory==0&&defaults.enabled,"fresh defaults use 666 ms, automatic memory and system gestures");
+    Preferences prefs;prefs.enabled=false;prefs.duration=840;prefs.memory=2;
     bool saved=SavePreferences(prefs,key.c_str());auto loaded=LoadPreferences(key.c_str());
-    success=check(saved&&loaded.enabled==prefs.enabled&&loaded.duration==prefs.duration&&loaded.radius==prefs.radius&&loaded.memory==prefs.memory,"preferences persist and reload")&&success;
+    success=check(saved&&loaded.enabled==prefs.enabled&&loaded.duration==prefs.duration&&loaded.memory==prefs.memory,"preferences persist and reload")&&success;
     std::wstring run=key+L"\\Run";
     success=check(SetStartup(true,run.c_str(),L"Entry")&&StartupEnabled(nullptr,run.c_str(),L"Entry"),"autostart command uses quoted EXE path and --startup")&&success;
     success=check(SetStartup(false,run.c_str(),L"Entry")&&!StartupEnabled(nullptr,run.c_str(),L"Entry"),"autostart can be disabled without changing other values")&&success;

@@ -10,7 +10,7 @@
 namespace native {
 using namespace Gdiplus;
 namespace {
-enum {Startup=1010,Enabled,Memory,Duration,Radius,Exit,Retry,GitHub,Notices};
+enum {Startup=1010,Enabled,Memory,Duration,Exit=1015,Retry,GitHub,Notices};
 constexpr UINT kRefresh=WM_APP+104;
 Color C(COLORREF c,BYTE alpha=255){return Color(alpha,GetRValue(c),GetGValue(c),GetBValue(c));}
 std::unique_ptr<GraphicsPath> Rounded(float x,float y,float width,float height,float radius){
@@ -61,14 +61,12 @@ bool SettingsWindow::Create(HINSTANCE handle,const Preferences&values,WindowCall
     COMBOBOXINFO combo{sizeof(combo)};
     if(GetComboBoxInfo(memory,&combo)&&combo.hwndList)SetWindowSubclass(combo.hwndList,MenuProcedure,1,reinterpret_cast<DWORD_PTR>(this));
     duration=CreateWindowEx(0,TRACKBAR_CLASS,L"动画时长（毫秒）",WS_CHILD|WS_TABSTOP|TBS_HORZ|TBS_NOTICKS,0,0,100,30,hwnd,reinterpret_cast<HMENU>(Duration),instance,nullptr);
-    radius=CreateWindowEx(0,TRACKBAR_CLASS,L"圆角大小",WS_CHILD|WS_TABSTOP|TBS_HORZ|TBS_NOTICKS,0,0,100,30,hwnd,reinterpret_cast<HMENU>(Radius),instance,nullptr);
     SendMessage(duration,TBM_SETRANGE,TRUE,MAKELPARAM(0,900));SendMessage(duration,TBM_SETPAGESIZE,0,50);SendMessage(duration,TBM_SETLINESIZE,0,10);
-    SendMessage(radius,TBM_SETRANGE,TRUE,MAKELPARAM(0,32));SendMessage(radius,TBM_SETPAGESIZE,0,4);
     exitButton=Button(L"退出程序",Exit);retry=Button(L"重新连接",Retry);github=Button(L"GitHub 仓库",GitHub);notices=Button(L"开源许可",Notices);
-    AccessibleName(memory,L"内存模式");AccessibleName(duration,L"动画时长，单位毫秒");AccessibleName(radius,L"圆角大小，单位 DIP");
+    AccessibleName(memory,L"内存模式");AccessibleName(duration,L"动画时长，单位毫秒");
     loading=true;SendMessage(startup,BM_SETCHECK,StartupEnabled()?BST_CHECKED:BST_UNCHECKED,0);
     SendMessage(enabled,BM_SETCHECK,preferences.enabled?BST_CHECKED:BST_UNCHECKED,0);SendMessage(memory,CB_SETCURSEL,preferences.memory,0);
-    SendMessage(duration,TBM_SETPOS,TRUE,preferences.duration);SendMessage(radius,TBM_SETPOS,TRUE,preferences.radius);loading=false;
+    SendMessage(duration,TBM_SETPOS,TRUE,preferences.duration);loading=false;
     Theme();Layout();return true;
 }
 HWND SettingsWindow::Button(const wchar_t*label,int id,DWORD style){
@@ -83,7 +81,7 @@ void SettingsWindow::Theme(){
     if(backgroundBrush)DeleteObject(backgroundBrush);
     backgroundBrush=CreateSolidBrush(colors.background);
     BOOL immersive=dark&&!highContrast;DwmSetWindowAttribute(hwnd,20,&immersive,sizeof(immersive));
-    for(HWND control:{memory,duration,radius})if(control)SetWindowTheme(control,dark?L"DarkMode_Explorer":L"Explorer",nullptr);
+    for(HWND control:{memory,duration})if(control)SetWindowTheme(control,dark?L"DarkMode_Explorer":L"Explorer",nullptr);
     if(hwnd)RedrawWindow(hwnd,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
 }
 void SettingsWindow::Layout(){
@@ -104,7 +102,7 @@ void SettingsWindow::Layout(){
     float left=32,right=width-32;
     place(startup,right-44,120,44,26,true);place(enabled,right-44,194,44,26,true);
     place(memory,right-160,268,160,180,true);SendMessage(memory,CB_SETITEMHEIGHT,WPARAM(-1),Px(24));SendMessage(memory,CB_SETITEMHEIGHT,0,Px(28));
-    place(duration,right-282,338,218,30,true);place(radius,right-282,402,218,30,true);
+    place(duration,right-282,338,218,30,true);
     place(exitButton,right-84,height-45,84,30,true);
     place(github,left-8,height-45,100,30,true);place(notices,left+100,height-45,88,30,true);
     place(retry,right-90,490,90,30,current==3);
@@ -156,8 +154,8 @@ void SettingsWindow::Paint(HDC dc){
     Text(g,L"设为 0 可关闭动画",colors.secondary,12,{left,370,content,22});
     Text(g,(std::to_wstring(preferences.duration)+L" ms").c_str(),colors.secondary,12,{right-60,344,60,23},false,StringAlignmentFar);
     Text(g,L"窗口圆角",colors.text,14,{left,406,200,25});
-    Text(g,L"选中框跟随系统强调色",colors.secondary,12,{left,434,content,22});
-    Text(g,(std::to_wstring(preferences.radius)+L" DIP").c_str(),colors.secondary,12,{right-60,408,60,23},false,StringAlignmentFar);
+    Text(g,L"总览内统一圆角",colors.secondary,12,{left,434,content,22});
+    Text(g,L"系统样式",colors.secondary,12,{right-120,408,120,23},false,StringAlignmentFar);
     int current;std::wstring label,detail;{std::lock_guard lock(statusMutex);current=status;label=statusText;detail=statusDetail;}
     if(current==3){
         g.DrawLine(&divider,left,465.f,right,465.f);
@@ -276,7 +274,6 @@ LRESULT SettingsWindow::Message(UINT message,WPARAM wp,LPARAM lp){
     case WM_CTLCOLORSTATIC:case WM_CTLCOLORBTN:case WM_CTLCOLORLISTBOX:{HDC dc=reinterpret_cast<HDC>(wp);SetTextColor(dc,colors.text);SetBkColor(dc,colors.background);return reinterpret_cast<LRESULT>(backgroundBrush);}
     case WM_HSCROLL:
         if(reinterpret_cast<HWND>(lp)==duration)preferences.duration=int(SendMessage(duration,TBM_GETPOS,0,0));
-        if(reinterpret_cast<HWND>(lp)==radius)preferences.radius=int(SendMessage(radius,TBM_GETPOS,0,0));
         Save();return 0;
     case WM_COMMAND:{
         int id=LOWORD(wp),notification=HIWORD(wp);
