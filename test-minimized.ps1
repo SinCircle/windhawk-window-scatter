@@ -10,7 +10,7 @@ $output=Join-Path $build "minimized-windows-test-$Architecture.exe"
 $source=Join-Path $PSScriptRoot 'tests\minimized-windows.cpp'
 $flags=@('-std=c++23','-target',"$Architecture-w64-mingw32",'-O2','-static','-municode','-DUNICODE','-D_UNICODE',
     '-DWINVER=0x0A00','-D_WIN32_WINNT=0x0A00','-DNTDDI_VERSION=0x0A000008','-D__USE_MINGW_ANSI_STDIO=0')
-$libraries=@('-ld3d11','-ldxgi','-ldcomp','-ldwmapi','-ld2d1','-ldwrite','-lwindowscodecs','-lole32','-lshell32','-lgdi32','-luser32','-luuid','-lruntimeobject')
+$libraries=@('-ld3d11','-ldxgi','-ldcomp','-ldwmapi','-ld2d1','-ldwrite','-lwindowscodecs','-lole32','-loleaut32','-lshell32','-lgdi32','-luser32','-luuid','-lruntimeobject')
 & $Compiler @flags $source @libraries -o $output
 if($LASTEXITCODE -ne 0){throw 'Minimized-window test compilation failed'}
 $log=Join-Path $build "minimized-windows-test-$Architecture.log"

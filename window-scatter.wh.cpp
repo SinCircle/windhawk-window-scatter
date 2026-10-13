@@ -2,11 +2,11 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.8
+// @version         0.4.9
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
-// @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -lshell32 -lgdi32 -luser32 -luuid -lruntimeobject
+// @compilerOptions -ld3d11 -ldxgi -ldcomp -ldwmapi -ld2d1 -ldwrite -lwindowscodecs -lole32 -loleaut32 -lshell32 -lgdi32 -luser32 -luuid -lruntimeobject
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -29,8 +29,10 @@ selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
 Ordinary windows use one common scale per monitor, preserving their relative dimensions.
-The layout compares compact horizontal and vertical stacks, centers each smaller
-window inside its actual group, and centers the entire arrangement. Minimized
+The initial layout compares compact stacks with mixed horizontal/vertical
+subgroups and centers the complete footprint within each monitor. Later changes
+reuse grouping and close nearby gaps; a substantially better screen fit can
+replace the grouping when existing previews retain separated motion paths. Minimized
 previews have a separate bottom-center shelf and slide from below the display
 with a subtle 94%-100% scale change, retaining their colors and opacity.
 Size, compactness, visual balance and the original left/right
@@ -126,6 +128,9 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <wrl/client.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <propkey.h>
+#include <uiautomation.h>
+#include <appmodel.h>
 #include <roapi.h>
 #include <winstring.h>
 #include <windows.ui.viewmanagement.h>
@@ -148,7 +153,7 @@ constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
 constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8,kShellTaskView=WM_APP+10,kAccentChanged=WM_APP+11,kWindowGone=WM_APP+12,kNativeConsumed=WM_APP+13,kShow=WM_APP+14;
 constexpr UINT kGestureBegin=WM_APP+15,kGestureUpdate=WM_APP+16,kGestureEnd=WM_APP+17,kGestureCancel=WM_APP+18;
-constexpr UINT kWindowStateChanged=WM_APP+19;
+constexpr UINT kWindowStateChanged=WM_APP+19,kTaskbarOrder=WM_APP+20,kSceneChanged=WM_APP+21;
 constexpr ULONG_PTR kInputMarker=0x57534354;
 constexpr wchar_t kShellReadyProperty[]=L"WindowScatter.ShellReady.v4";
 constexpr wchar_t kNativeBypassProperty[]=L"WindowScatter.NativeTaskView.v4";
@@ -164,10 +169,36 @@ static bool Overlap(const Box&a,const Box&b){return a.x<b.right()-.01&&a.right()
 static bool Contains(const Box&a,const Box&b){return b.x>=a.x-.01&&b.y>=a.y-.01&&b.right()<=a.right()+.01&&b.bottom()<=a.bottom()+.01;}
 static Box Mix(const Box&a,const Box&b,double t){return {a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.w+(b.w-a.w)*t,a.h+(b.h-a.h)*t};}
 
+// Packing candidates establish a feasible common size. Final positions are
+// optimized independently; history stores CPU geometry, never grid membership.
+using LayoutStacks=std::vector<std::vector<int>>;
+struct LayoutSlot {int group=-1,order=0,count=0;bool columns=false;double offset=0;Box original,area;bool mixed=false;std::string path;};
+static double SourceRelationCost(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double scale);
+static double LayoutQuality(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double caption){
+    if(boxes.empty())return -1e100;
+    double left=1e100,top=1e100,right=-1e100,bottom=-1e100,occupied=0,movement=0,spread=0,scale=.85;int count=0;
+    for(size_t i=0;i<boxes.size();++i){auto b=boxes[i];if(b.w<=0)continue;++count;scale=std::min(scale,b.w/src[i].w);
+        left=std::min(left,b.x);right=std::max(right,b.right());top=std::min(top,b.y);bottom=std::max(bottom,b.bottom()+caption);occupied+=b.w*(b.h+caption);
+        double dx=(b.cx()-std::clamp(src[i].cx(),area.x,area.right()))/area.w,dy=(b.cy()-std::clamp(src[i].cy(),area.y,area.bottom()))/area.h;movement+=dx*dx+dy*dy;
+        double cx=(b.cx()-area.cx())/area.w,cy=(b.cy()+caption*.5-area.cy())/area.h;spread+=b.w*(b.h+caption)*(cx*cx+cy*cy);}
+    if(!count||scale<=0)return -1e100;
+    double waste=1-occupied/std::max(1.,(right-left)*(bottom-top));
+    return std::log(scale)-.18*waste-.5*spread/occupied-.06*movement/count-1.4*SourceRelationCost(src,boxes,area,scale);
+}
+static std::vector<LayoutSlot> SaveSlots(const std::vector<Box>&src,const std::vector<Box>&boxes,const LayoutStacks&stacks,bool columns,Box area){
+    std::vector<LayoutSlot> slots(src.size());
+    for(size_t g=0;g<stacks.size();++g){double low=1e100,high=-1e100;
+        for(int id:stacks[g]){low=std::min(low,columns?boxes[id].x:boxes[id].y);high=std::max(high,columns?boxes[id].right():boxes[id].bottom());}
+        for(size_t n=0;n<stacks[g].size();++n){int id=stacks[g][n];auto b=boxes[id];double slack=high-low-(columns?b.w:b.h);
+            double offset=slack>1e-6?((columns?b.cx():b.cy())-(low+high)*.5)/slack:0;
+            slots[id]={int(g),int(n),int(src.size()),columns,offset,src[id],area};}
+    }
+    return slots;
+}
 // Compare compact, centered stacks in both orientations. Each stack sizes itself
 // to its actual windows; there are no fixed cells or per-window scale changes.
 // Closed-form fit avoids binary-searching a greedy packing feasibility test.
-static std::vector<Box> Layout(const std::vector<Box>&src,Box area,double gap,double caption=0) {
+static std::vector<Box> StackLayout(const std::vector<Box>&src,Box area,double gap,double caption=0,std::vector<LayoutSlot>*slots=nullptr) {
     if(src.empty()||area.w<=0||area.h<=0)return {};
     const int count=int(src.size());
     for(const auto&b:src)if(b.w<=0||b.h<=0)return {};
@@ -179,7 +210,7 @@ static std::vector<Box> Layout(const std::vector<Box>&src,Box area,double gap,do
         if(x.w!=y.w)return x.w>y.w;return x.h>y.h;
     });
     std::vector<int> rank(count);for(int n=0;n<count;++n)rank[canonical[n]]=n;
-    double bestScore=-std::numeric_limits<double>::infinity();std::vector<Box> best;
+    double bestScore=-std::numeric_limits<double>::infinity();std::vector<Box> best;LayoutStacks bestStacks;bool bestColumns=false;
     int limit=std::min(count,std::max(12,int(std::ceil(std::sqrt(double(count))*2))));
     for(bool columns:{true,false})for(int groups=1;groups<=limit;++groups)for(int strategy=0;strategy<3;++strategy){
         std::vector<int> order=canonical;
@@ -260,32 +291,308 @@ static std::vector<Box> Layout(const std::vector<Box>&src,Box area,double gap,do
             }
             cursor+=(columns?f.w:f.h)+gap;
         }
-        // Preserve clear pairwise directions without pinning windows to absolute
-        // screen corners. Ambiguous nearly coincident centers have little weight.
-        double occupied=0,mx=0,my=0,movement=0;
-        for(int i=0;i<count;++i){auto&b=attempt[i];double a=b.w*(b.h+caption);occupied+=a;mx+=a*b.cx();my+=a*(b.cy()+caption*.5);
-            double dx=(b.cx()-std::clamp(src[i].cx(),area.x,area.right()))/area.w,dy=(b.cy()-std::clamp(src[i].cy(),area.y,area.bottom()))/area.h;movement+=dx*dx+dy*dy;}
-        double dx=(mx/occupied-area.cx())/area.w,dy=(my/occupied-area.cy())/area.h;
-        double waste=1-occupied/(width*height);
-        double relation=0,weights=0;
-        for(int a=0;a<count;++a)for(int b=a+1;b<count;++b){
-            double ox=(src[a].cx()-src[b].cx())/area.w,oy=(src[a].cy()-src[b].cy())/area.h;
-            double nx=(attempt[a].cx()-attempt[b].cx())/area.w,ny=(attempt[a].cy()-attempt[b].cy())/area.h;
-            auto axis=[&](double before,double after){
-                double weight=std::clamp((std::abs(before)-.025)/.25,0.,1.);
-                if(weight<=0)return;
-                weights+=weight;double signedAfter=before>0?after:-after;
-                // Collapsing a clear top/bottom relation into one row is also
-                // a loss of orientation, even if it does not strictly reverse it.
-                double separation=std::min(.12,std::abs(before)*scale*.5);
-                relation+=weight*std::clamp((separation-signedAfter)/std::max(.001,separation),0.,2.);
-            };
-            axis(ox,nx);axis(oy,ny);
+        double score=LayoutQuality(src,attempt,area,caption);
+        if(score>bestScore+1e-10){bestScore=score;bestStacks=stack;bestColumns=columns;best=std::move(attempt);}
+    }
+    if(!best.empty()&&slots)*slots=SaveSlots(src,best,bestStacks,bestColumns,area);
+    return best;
+}
+
+struct StackPacking{std::vector<Box> boxes;double scale=0,waste=1;};
+static StackPacking PackStacks(const std::vector<Box>&src,const LayoutStacks&stacks,bool columns,const std::vector<LayoutSlot>&slots,Box area,double gap,double caption){
+    if(src.empty()||stacks.empty())return {};
+    double scale=.85,totalCross=0;std::vector<double> along,cross;
+    for(const auto&group:stacks){
+        if(group.empty())return {};double length=0,width=0;
+        for(int id:group){if(src[id].w<=0||src[id].h<=0)return {};length+=columns?src[id].h:src[id].w;width=std::max(width,columns?src[id].w:src[id].h);}
+        scale=std::min(scale,((columns?area.h:area.w)-gap*(group.size()-1)-(columns?caption*group.size():0))/length);
+        along.push_back(length);cross.push_back(width);totalCross+=width;
+    }
+    scale=std::min(scale,((columns?area.w:area.h)-gap*(stacks.size()-1)-(columns?0:caption*stacks.size()))/totalCross);
+    if(scale<=0)return {};
+    double across=totalCross*scale+gap*(stacks.size()-1)+(columns?0:caption*stacks.size()),longest=0,occupied=0;
+    double cursor=(columns?area.cx():area.cy())-across*.5;StackPacking result;result.scale=scale;result.boxes.resize(src.size());
+    for(size_t g=0;g<stacks.size();++g){
+        double length=along[g]*scale+gap*(stacks[g].size()-1)+(columns?caption*stacks[g].size():0);
+        double width=cross[g]*scale+(columns?0:caption),next=(columns?area.cy():area.cx())-length*.5;longest=std::max(longest,length);
+        for(int id:stacks[g]){double w=src[id].w*scale,h=src[id].h*scale;
+            double slack=columns?width-w:width-h-caption,offset=id<int(slots.size())?slots[id].offset:0;
+            result.boxes[id]={columns?cursor+slack*(.5+offset):next,columns?next:cursor+slack*(.5+offset),w,h};
+            next+=(columns?h+caption:w)+gap;occupied+=w*(h+caption);
         }
-        double score=std::log(scale)-.18*waste-.5*(dx*dx+dy*dy)-.08*movement/count-1.2*relation/std::max(1.,weights);
-        if(score>bestScore+1e-10){bestScore=score;best=std::move(attempt);}
+        cursor+=width+gap;
+    }
+    result.waste=1-occupied/std::max(1.,across*longest);return result;
+}
+// If a pair keeps one separating direction at both endpoints, linear motion
+// keeps it separated for the entire animation, not only at sampled frames.
+static bool ClearReflow(const std::vector<Box>&before,const std::vector<Box>&after,double caption){
+    for(size_t a=0;a<before.size();++a)if(before[a].w>0)for(size_t b=0;b<a;++b)if(before[b].w>0){
+        auto separated=[&](const Box&x,const Box&y,const Box&u,const Box&v){
+            return (x.right()<=y.x+.01&&u.right()<=v.x+.01)||(x.bottom()+caption<=y.y+.01&&u.bottom()+caption<=v.y+.01);};
+        if(!separated(before[a],before[b],after[a],after[b])&&!separated(before[b],before[a],after[b],after[a]))return false;
+    }
+    return true;
+}
+static double SourceRelationCost(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double scale){
+    double cost=0,weights=0;
+    for(size_t a=0;a<src.size();++a)if(boxes[a].w>0)for(size_t b=0;b<a;++b)if(boxes[b].w>0){
+        double ox=(src[a].cx()-src[b].cx())/area.w,oy=(src[a].cy()-src[b].cy())/area.h;
+        auto axis=[&](double before,double after,double other){
+            double weight=std::clamp((std::abs(before)-.025)/.25,0.,1.);if(weight<=0)return;
+            // A small secondary offset must not force another row or column.
+            // The dominant direction remains the strongest spatial constraint.
+            if(std::abs(before)*1.25<std::abs(other)){if(std::abs(before)<.08)return;weight*=.15;}
+            double separation=std::min(.12,std::abs(before)*scale*.5),signedAfter=before>0?after:-after;
+            cost+=weight*std::clamp((separation-signedAfter)/std::max(.001,separation),0.,2.);weights+=weight;
+        };
+        axis(ox,(boxes[a].cx()-boxes[b].cx())/area.w,oy);
+        axis(oy,(boxes[a].cy()-boxes[b].cy())/area.h,ox);
+    }
+    return cost/std::max(1.,weights);
+}
+struct LayoutTree;
+using Tree=std::shared_ptr<const LayoutTree>;
+struct LayoutTree {int item=-1;bool across=false;Tree first,second;};
+static Tree Leaf(int item){return std::make_shared<LayoutTree>(LayoutTree{item});}
+static Tree Join(bool across,Tree first,Tree second){
+    if(!first)return second;if(!second)return first;
+    return std::make_shared<LayoutTree>(LayoutTree{-1,across,std::move(first),std::move(second)});
+}
+static Box TreeSize(const Tree&t,const std::vector<Box>&src,double scale,double gap,double caption){
+    if(t->item>=0){auto b=src[t->item];return {0,0,b.w*scale,b.h*scale+caption};}
+    auto a=TreeSize(t->first,src,scale,gap,caption),b=TreeSize(t->second,src,scale,gap,caption);
+    return {0,0,t->across?a.w+b.w+gap:std::max(a.w,b.w),t->across?std::max(a.h,b.h):a.h+b.h+gap};
+}
+static void PlaceTree(const Tree&t,const std::vector<Box>&src,double scale,double gap,double caption,double x,double y,std::vector<Box>&boxes){
+    if(t->item>=0){auto b=src[t->item];boxes[t->item]={x,y,b.w*scale,b.h*scale};return;}
+    auto a=TreeSize(t->first,src,scale,gap,caption),b=TreeSize(t->second,src,scale,gap,caption);
+    if(t->across){double h=std::max(a.h,b.h);PlaceTree(t->first,src,scale,gap,caption,x,y+(h-a.h)*.5,boxes);PlaceTree(t->second,src,scale,gap,caption,x+a.w+gap,y+(h-b.h)*.5,boxes);}
+    else{double w=std::max(a.w,b.w);PlaceTree(t->first,src,scale,gap,caption,x+(w-a.w)*.5,y,boxes);PlaceTree(t->second,src,scale,gap,caption,x+(w-b.w)*.5,y+a.h+gap,boxes);}
+}
+static StackPacking PackTree(const Tree&t,const std::vector<Box>&src,Box area,double gap,double caption){
+    if(!t)return {};double low=0,high=.85;
+    for(int step=0;step<28;++step){double scale=(low+high)*.5;auto size=TreeSize(t,src,scale,gap,caption);if(size.w<=area.w&&size.h<=area.h)low=scale;else high=scale;}
+    if(low<=1e-8)return {};auto size=TreeSize(t,src,low,gap,caption);
+    StackPacking pack;pack.scale=low;pack.boxes.resize(src.size());
+    // Center the completed footprint once. No preview is attracted to a
+    // screen-wide center line independently of the rest of its group.
+    PlaceTree(t,src,low,gap,caption,area.cx()-size.w*.5,area.cy()-size.h*.5,pack.boxes);
+    double occupied=0;for(auto b:pack.boxes)occupied+=b.w*(b.h+caption);pack.waste=1-occupied/std::max(1.,size.w*size.h);return pack;
+}
+static void SaveTreePaths(const Tree&t,std::string path,std::vector<LayoutSlot>&slots){
+    if(t->item>=0){slots[t->item].path=std::move(path);return;}
+    SaveTreePaths(t->first,path+(t->across?'l':'t'),slots);SaveTreePaths(t->second,path+(t->across?'r':'b'),slots);
+}
+static std::vector<LayoutSlot> SaveTree(const Tree&t,const std::vector<Box>&src,Box area){
+    std::vector<LayoutSlot> slots(src.size());for(size_t i=0;i<src.size();++i)slots[i]={0,int(i),int(src.size()),false,0,src[i],area,true,{}};
+    SaveTreePaths(t,{},slots);return slots;
+}
+// Bounded spatial beam search. Every subgroup can split on either axis, and
+// candidates with distinct footprints survive for use in larger subgroups.
+// Large scenes retain the O(n)-storage stack solver rather than an exponential
+// subset search. This code runs only after a scene change, never per frame.
+static std::vector<Tree> MixedCandidates(const std::vector<Box>&src,Box area,double gap,double caption){
+    if(src.empty()||src.size()>10)return {};
+    struct Candidate{Tree tree;Box size;std::vector<Box> boxes;double score=0;};
+    const int count=int(src.size());std::map<unsigned,std::vector<Candidate>> memo;
+    double sourceArea=0;for(auto b:src)sourceArea+=b.w*b.h;
+    const double scale=std::min(.85,std::sqrt(area.w*area.h/sourceArea)*.7);
+    auto search=[&](auto&&self,unsigned mask)->const std::vector<Candidate>&{
+        if(auto found=memo.find(mask);found!=memo.end())return found->second;
+        std::vector<int> ids;for(int i=0;i<count;++i)if(mask&(1u<<i))ids.push_back(i);
+        std::vector<Candidate> all;
+        if(ids.size()==1){int i=ids[0];Candidate c{Leaf(i),{0,0,src[i].w*scale,src[i].h*scale+caption},std::vector<Box>(count)};c.boxes[i]={0,0,c.size.w,c.size.h-caption};all.push_back(std::move(c));}
+        else for(bool across:{true,false}){
+            auto order=ids;std::stable_sort(order.begin(),order.end(),[&](int a,int b){double x=across?src[a].cx():src[a].cy(),y=across?src[b].cx():src[b].cy();
+                if(x!=y)return x<y;double u=across?src[a].cy():src[a].cx(),v=across?src[b].cy():src[b].cx();if(u!=v)return u<v;
+                if(src[a].w!=src[b].w)return src[a].w>src[b].w;if(src[a].h!=src[b].h)return src[a].h>src[b].h;return a<b;});
+            unsigned left=0;for(size_t split=1;split<order.size();++split){left|=1u<<order[split-1];unsigned right=mask^left;
+                const auto&first=self(self,left);const auto&second=self(self,right);
+                for(const auto&a:first)for(const auto&b:second){
+                    Candidate c{Join(across,a.tree,b.tree),{0,0,across?a.size.w+b.size.w+gap:std::max(a.size.w,b.size.w),across?std::max(a.size.h,b.size.h):a.size.h+b.size.h+gap},std::vector<Box>(count)};
+                    double occupied=0,spread=0;for(int i:ids){bool inLeft=(left&(1u<<i))!=0;auto box=inLeft?a.boxes[i]:b.boxes[i];auto own=inLeft?a.size:b.size;
+                        box.x+=across?(inLeft?0:a.size.w+gap):(c.size.w-own.w)*.5;box.y+=across?(c.size.h-own.h)*.5:(inLeft?0:a.size.h+gap);c.boxes[i]=box;occupied+=box.w*(box.h+caption);}
+                    for(int i:ids){auto b=c.boxes[i];double dx=(b.cx()-c.size.w*.5)/area.w,dy=(b.cy()+caption*.5-c.size.h*.5)/area.h;spread+=b.w*(b.h+caption)*(dx*dx+dy*dy);}
+                    double fit=std::min(area.w/c.size.w,area.h/c.size.h),waste=1-occupied/(c.size.w*c.size.h);
+                    c.score=std::log(fit)-.18*waste-.5*spread/occupied-1.4*SourceRelationCost(src,c.boxes,area,scale);all.push_back(std::move(c));
+                }
+            }
+        }
+        std::stable_sort(all.begin(),all.end(),[](const Candidate&a,const Candidate&b){return a.score>b.score;});
+        std::vector<Candidate> kept;std::vector<std::pair<int,int>> shapes;
+        for(auto&c:all){auto shape=std::pair{int(c.size.w/std::max(1.,area.w*.012)),int(c.size.h/std::max(1.,area.h*.012))};
+            if(std::find(shapes.begin(),shapes.end(),shape)!=shapes.end())continue;shapes.push_back(shape);kept.push_back(std::move(c));if(kept.size()>=size_t(count<=6?32:count<=8?6:3))break;}
+        return memo.emplace(mask,std::move(kept)).first->second;
+    };
+    std::vector<Tree> result;for(const auto&c:search(search,(1u<<count)-1))result.push_back(c.tree);return result;
+}
+static std::vector<Box> PackedLayout(const std::vector<Box>&src,Box area,double gap,double caption=0,std::vector<LayoutSlot>*slots=nullptr){
+    auto best=StackLayout(src,area,gap,caption,slots);if(best.empty())return best;
+    gap=std::min(gap,std::sqrt(area.w*area.h/src.size())*.10);
+    double bestScore=LayoutQuality(src,best,area,caption);Tree winner;
+    for(const auto&t:MixedCandidates(src,area,gap,caption)){auto candidate=PackTree(t,src,area,gap,caption);double score=LayoutQuality(src,candidate.boxes,area,caption);
+        if(score>bestScore+1e-8){bestScore=score;best=std::move(candidate.boxes);winner=t;}}
+    if(winner&&slots)*slots=SaveTree(winner,src,area);return best;
+}
+// For a fixed common scale, a separation chooses which side of another window
+// to use, not a row or column. The remaining coordinates solve a weighted
+// convex projection. Window area is its resistance to leaving the real center.
+struct PositionEdge {int first,second;double distance;};
+struct PositionSeparation {int first,second;bool vertical;};
+struct PositionFit {std::vector<Box> boxes;double cost=1e100;};
+static bool ProjectPositions(const std::vector<double>&target,const std::vector<double>&weight,
+        std::vector<double> low,std::vector<double> high,const std::vector<PositionEdge>&edges,std::vector<double>&position){
+    const int count=int(target.size());
+    // Propagate earliest/latest positions first. Positive cycles and overfull
+    // chains are rejected without spending time on the quadratic solver.
+    for(int pass=0;pass<count;++pass){bool changed=false;
+        for(const auto&e:edges){double a=low[e.first]+e.distance,b=high[e.second]-e.distance;
+            if(a>low[e.second]+1e-8){low[e.second]=a;changed=true;}
+            if(b<high[e.first]-1e-8){high[e.first]=b;changed=true;}}
+        for(int i=0;i<count;++i)if(low[i]>high[i]+1e-6)return false;
+        if(!changed)break;if(pass==count-1)return false;
+    }
+    position=target;std::vector<double> inverse(count),lower(count),upper(count),dual(edges.size());
+    for(int i=0;i<count;++i)inverse[i]=1/std::max(1e-6,weight[i]);
+    // Hildreth dual coordinate projection, including bounds as constraints.
+    // All corrections use inverse area, so small windows yield more readily.
+    bool settled=false;
+    for(int pass=0;pass<512;++pass){double movement=0;
+        for(int i=0;i<count;++i){
+            double next=std::max(0.,lower[i]+(low[i]-position[i])/inverse[i]),delta=next-lower[i];lower[i]=next;position[i]+=delta*inverse[i];movement=std::max(movement,std::abs(delta*inverse[i]));
+            next=std::max(0.,upper[i]+(position[i]-high[i])/inverse[i]);delta=next-upper[i];upper[i]=next;position[i]-=delta*inverse[i];movement=std::max(movement,std::abs(delta*inverse[i]));
+        }
+        for(size_t k=0;k<edges.size();++k){const auto&e=edges[k];double next=std::max(0.,dual[k]+(position[e.first]+e.distance-position[e.second])/(inverse[e.first]+inverse[e.second]));
+            double delta=next-dual[k];dual[k]=next;position[e.first]-=delta*inverse[e.first];position[e.second]+=delta*inverse[e.second];
+            movement=std::max(movement,std::abs(delta)*std::max(inverse[e.first],inverse[e.second]));}
+        if(movement<.00001){settled=true;break;}
+    }
+    if(!settled)return false;
+    for(int i=0;i<count;++i)if(position[i]<low[i]-.001||position[i]>high[i]+.001)return false;
+    for(const auto&e:edges)if(position[e.second]<position[e.first]+e.distance-.001)return false;
+    return true;
+}
+static unsigned SeparationDirections(const Box&a,const Box&b,double gap,double caption){
+    unsigned result=0;
+    if(a.right()+gap<=b.x+.001)result|=1;
+    if(b.right()+gap<=a.x+.001)result|=2;
+    if(a.bottom()+caption+gap<=b.y+.001)result|=4;
+    if(b.bottom()+caption+gap<=a.y+.001)result|=8;
+    return result;
+}
+static PositionFit FreePositions(const std::vector<Box>&src,const std::vector<Box>&seed,Box area,double gap,double caption,
+        double scale,const std::vector<Box>&anchors={},double history=0){
+    const int count=int(src.size());if(!count||seed.size()!=src.size()||scale<=0)return {};
+    std::vector<double> weight(count),tx(count),ty(count),lx(count),ly(count),hx(count),hy(count);
+    double largest=0;for(auto b:src)largest=std::max(largest,b.w*b.h);
+    for(int i=0;i<count;++i){double mass=std::max(.005,src[i].w*src[i].h/largest);
+        bool retained=anchors.size()==src.size()&&anchors[i].w>0;
+        // A maximized (or larger) source covers the available work area. Its
+        // previous preview still preserves separating motion paths below,
+        // but an obsolete offset must not pull it away from its real center.
+        bool fullArea=retained&&Contains(src[i],area);
+        double past=retained&&!fullArea?history:0;
+        // The tiny seed term breaks ties between identical maximized windows;
+        // it does not constrain the independently solved coordinates.
+        double tie=fullArea?0:.002;weight[i]=mass*(1+past)+tie;
+        tx[i]=(mass*src[i].cx()+mass*past*(past?anchors[i].cx():0)+tie*seed[i].cx())/weight[i];
+        ty[i]=(mass*src[i].cy()+mass*past*(past?anchors[i].cy():0)+tie*seed[i].cy())/weight[i];
+        lx[i]=area.x+src[i].w*scale*.5;hx[i]=area.right()-src[i].w*scale*.5;
+        ly[i]=area.y+src[i].h*scale*.5;hy[i]=area.bottom()-caption-src[i].h*scale*.5;
+        if(lx[i]>hx[i]||ly[i]>hy[i])return {};
+    }
+    struct Pair {int first,second;unsigned allowed;};std::vector<Pair> pairs;
+    std::vector<PositionEdge> sourceX,sourceY;
+    for(int i=0;i<count;++i)for(int j=i+1;j<count;++j){
+        bool retained=anchors.size()==src.size()&&anchors[i].w>0&&anchors[j].w>0;
+        unsigned allowed=retained?SeparationDirections(anchors[i],anchors[j],0,caption):15u;
+        if(!allowed)return {};pairs.push_back({i,j,allowed});
+        // Preserve a clearly dominant physical direction without imposing an
+        // alignment or requiring separation along that particular axis.
+        double dx=(src[j].cx()-src[i].cx())/area.w,dy=(src[j].cy()-src[i].cy())/area.h;
+        if(!retained){
+            if(std::abs(dx)>.08&&std::abs(dx)>1.25*std::abs(dy))sourceX.push_back({dx>0?i:j,dx>0?j:i,.001});
+            else if(std::abs(dy)>.08&&std::abs(dy)>1.25*std::abs(dx))sourceY.push_back({dy>0?i:j,dy>0?j:i,.001});
+        }
+    }
+    auto project=[&](const std::vector<PositionSeparation>&separations){
+        auto ex=sourceX,ey=sourceY;
+        for(auto s:separations){double distance=(s.vertical?(src[s.first].h+src[s.second].h)*scale*.5+caption:(src[s.first].w+src[s.second].w)*scale*.5)+gap;
+            (s.vertical?ey:ex).push_back({s.first,s.second,distance});}
+        std::vector<double> x,y;PositionFit fit;
+        if(!ProjectPositions(tx,weight,lx,hx,ex,x)||!ProjectPositions(ty,weight,ly,hy,ey,y))return fit;
+        fit.cost=0;for(int i=0;i<count;++i){fit.boxes.push_back({x[i]-src[i].w*scale*.5,y[i]-src[i].h*scale*.5,src[i].w*scale,src[i].h*scale});
+            fit.cost+=weight[i]*((x[i]-tx[i])*(x[i]-tx[i])+(y[i]-ty[i])*(y[i]-ty[i]));}
+        return fit;
+    };
+    auto separation=[](const Pair&p,int direction){return PositionSeparation{direction%2?p.second:p.first,direction%2?p.first:p.second,direction>=2};};
+    PositionFit best;
+    // Start with a complete feasible candidate when available. Optimizing all
+    // its positions already removes group-center and cross-axis alignment.
+    std::vector<PositionSeparation> complete;
+    for(const auto&p:pairs){unsigned directions=SeparationDirections(seed[p.first],seed[p.second],gap,caption)&p.allowed;
+        if(!directions){complete.clear();break;}
+        int direction=0;while(!(directions&(1u<<direction)))++direction;complete.push_back(separation(p,direction));}
+    if(complete.size()==pairs.size())best=project(complete);
+    struct Node {std::vector<PositionSeparation> separations;PositionFit fit;};
+    std::vector<Node> pending;auto root=project({});if(!root.boxes.empty())pending.push_back({{},std::move(root)});
+    // Branch only on an actual conflict. The budget is deterministic, so many
+    // windows cannot turn this into an unbounded combinatorial search.
+    const int budget=count<=4?256:count<=10?96:count<=24?32:8;
+    for(int step=0;step<budget&&!pending.empty();++step){
+        auto chosen=std::min_element(pending.begin(),pending.end(),[](const Node&a,const Node&b){return a.fit.cost<b.fit.cost;});
+        Node node=std::move(*chosen);pending.erase(chosen);if(node.fit.cost>=best.cost-1e-6)continue;
+        int conflict=-1;double worst=-1;
+        for(size_t k=0;k<pairs.size();++k){const auto&p=pairs[k];auto a=node.fit.boxes[p.first],b=node.fit.boxes[p.second];
+            if(SeparationDirections(a,b,gap,caption)&p.allowed)continue;
+            double distance=1e100;double shifts[]{a.right()+gap-b.x,b.right()+gap-a.x,a.bottom()+caption+gap-b.y,b.bottom()+caption+gap-a.y};
+            for(int d=0;d<4;++d)if(p.allowed&(1u<<d))distance=std::min(distance,std::max(0.,shifts[d]));
+            double cost=distance*distance/(1/weight[p.first]+1/weight[p.second]);if(cost>worst){worst=cost;conflict=int(k);}
+        }
+        if(conflict<0){best=std::move(node.fit);continue;}
+        const auto&p=pairs[conflict];
+        for(int direction=0;direction<4;++direction)if(p.allowed&(1u<<direction)){
+            auto edges=node.separations;edges.push_back(separation(p,direction));auto fit=project(edges);
+            if(!fit.boxes.empty()&&fit.cost<best.cost-1e-6)pending.push_back({std::move(edges),std::move(fit)});
+        }
     }
     return best;
+}
+static std::vector<LayoutSlot> SavePositions(const std::vector<Box>&src,Box area){
+    std::vector<LayoutSlot> slots(src.size());for(size_t i=0;i<src.size();++i)slots[i]={0,int(i),int(src.size()),false,0,src[i],area};return slots;
+}
+static std::vector<Box> Layout(const std::vector<Box>&src,Box area,double gap,double caption=0,std::vector<LayoutSlot>*slots=nullptr){
+    auto seed=PackedLayout(src,area,gap,caption);if(seed.empty())return seed;
+    gap=std::min(gap,std::sqrt(area.w*area.h/src.size())*.10);
+    auto fit=FreePositions(src,seed,area,gap,caption,seed[0].w/src[0].w);
+    if(slots)*slots=SavePositions(src,area);
+    return fit.boxes.empty()?seed:fit.boxes;
+}
+static std::vector<Box> StableLayout(const std::vector<Box>&src,const std::vector<Box>&anchors,Box area,double gap,double caption,
+        const std::vector<LayoutSlot>&previous={},std::vector<LayoutSlot>*next=nullptr){
+    if(src.empty()||area.w<=0||area.h<=0)return {};
+    if(anchors.size()!=src.size()||previous.size()!=src.size())return Layout(src,area,gap,caption,next);
+    bool unchanged=true,removed=false;int known=0;
+    for(size_t i=0;i<src.size();++i){auto p=previous[i];if(anchors[i].w<=0||p.group<0){unchanged=false;continue;}++known;
+        if(std::abs(p.original.x-src[i].x)>.5||std::abs(p.original.y-src[i].y)>.5||p.area.x!=area.x||p.area.y!=area.y||p.area.w!=area.w||p.area.h!=area.h)
+            return Layout(src,area,gap,caption,next);
+        removed|=p.count>int(src.size());unchanged&=p.count==int(src.size())&&std::abs(p.original.w-src[i].w)<.01&&std::abs(p.original.h-src[i].h)<.01;
+    }
+    if(!known)return Layout(src,area,gap,caption,next);
+    if(unchanged){if(next)*next=previous;return anchors;}
+    auto seed=PackedLayout(src,area,gap,caption);if(seed.empty())return seed;
+    gap=std::min(gap,std::sqrt(area.w*area.h/src.size())*.10);
+    double scale=seed[0].w/src[0].w;PositionFit fit;
+    // Old previews must retain a separating direction during linear reflow.
+    // This constrains paths, not permanent grouping. A crowded insertion can
+    // use a slightly smaller shared scale rather than swap existing windows.
+    for(int attempt=0;attempt<8;++attempt){
+        fit=FreePositions(src,seed,area,gap,caption,scale,anchors,removed?.75:3);
+        if(!fit.boxes.empty())break;scale*=.9;
+    }
+    if(next)*next=SavePositions(src,area);
+    return fit.boxes.empty()?Layout(src,area,gap,caption,next):fit.boxes;
 }
 
 static double Curve(double t) {
@@ -295,6 +602,65 @@ static double Curve(double t) {
 static double CurveDerivative(double t){return 81*t*std::exp(-9*t)/(1-10*std::exp(-9.0));}
 
 enum class MemoryMode{Automatic,Resident,Saver};
+static std::wstring WindowGroupKey(HWND window){
+    ComPtr<IPropertyStore> properties;PROPVARIANT value{};std::wstring key;
+    if(SUCCEEDED(SHGetPropertyStoreForWindow(window,IID_PPV_ARGS(&properties)))&&SUCCEEDED(properties->GetValue(PKEY_AppUserModel_ID,&value))&&value.vt==VT_LPWSTR&&value.pwszVal)key=L"app:"+std::wstring(value.pwszVal);
+    PropVariantClear(&value);if(!key.empty())return key;
+    DWORD pid=0;GetWindowThreadProcessId(window,&pid);HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+    if(process){wchar_t name[32768];UINT32 length=ARRAYSIZE(name);
+        if(GetApplicationUserModelId(process,&length,name)==ERROR_SUCCESS)key=L"app:"+std::wstring(name);
+        else{DWORD size=ARRAYSIZE(name);if(QueryFullProcessImageName(process,0,name,&size)){CharLowerBuff(name,size);key=L"exe:"+std::wstring(name,size);}}
+        CloseHandle(process);}
+    return key.empty()?L"pid:"+std::to_wstring(pid):key;
+}
+struct TaskbarEntry{HWND window;HMONITOR monitor;std::wstring group;double x,y;};
+// UI Automation can take a shell round trip. Keep all of it on an event-driven
+// worker: the renderer only copies a small completed snapshot under a mutex.
+class TaskbarOrder {
+    HANDLE request=nullptr,stop=nullptr,thread=nullptr;HWND notify=nullptr;
+    std::mutex mutex;std::vector<TaskbarEntry> snapshot;
+    static DWORD WINAPI Worker(void*parameter){static_cast<TaskbarOrder*>(parameter)->Run();return 0;}
+    static BOOL CALLBACK CollectTaskbars(HWND w,LPARAM p){wchar_t cls[64];GetClassName(w,cls,64);if(!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd"))reinterpret_cast<std::vector<HWND>*>(p)->push_back(w);return TRUE;}
+    void Run(){
+        CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+        {ComPtr<IUIAutomation> automation;CoCreateInstance(CLSID_CUIAutomation8,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation));
+        if(automation){ComPtr<IUIAutomation2> timed;if(SUCCEEDED(automation.As(&timed))){timed->put_ConnectionTimeout(200);timed->put_TransactionTimeout(200);}
+            HANDLE events[]{stop,request};while(WaitForMultipleObjects(2,events,FALSE,INFINITE)==WAIT_OBJECT_0+1){
+                std::vector<TaskbarEntry> result;std::vector<HWND> bars;
+                EnumWindows(CollectTaskbars,reinterpret_cast<LPARAM>(&bars));
+                bool valid=false;
+                for(HWND bar:bars){
+                    ComPtr<IUIAutomationElement> root;ComPtr<IUIAutomationCondition> condition;ComPtr<IUIAutomationCacheRequest> cache;ComPtr<IUIAutomationElementArray> buttons;
+                    VARIANT cls{};cls.vt=VT_BSTR;cls.bstrVal=SysAllocString(L"Taskbar.TaskListButtonAutomationPeer");
+                    HRESULT hr=automation->ElementFromHandle(bar,&root);
+                    if(SUCCEEDED(hr))hr=automation->CreatePropertyCondition(UIA_ClassNamePropertyId,cls,&condition);VariantClear(&cls);
+                    if(SUCCEEDED(hr))hr=automation->CreateCacheRequest(&cache);
+                    if(SUCCEEDED(hr))hr=cache->AddProperty(UIA_AutomationIdPropertyId);
+                    if(SUCCEEDED(hr))hr=cache->AddProperty(UIA_BoundingRectanglePropertyId);
+                    if(SUCCEEDED(hr))hr=root->FindAllBuildCache(TreeScope_Descendants,condition.Get(),cache.Get(),&buttons);
+                    if(FAILED(hr))continue;valid=true;int count=0;buttons->get_Length(&count);HMONITOR monitor=MonitorFromWindow(bar,MONITOR_DEFAULTTONEAREST);
+                    for(int n=0;n<count;++n){ComPtr<IUIAutomationElement> button;BSTR id=nullptr;RECT bounds{};
+                        if(FAILED(buttons->GetElement(n,&button)))continue;
+                        button->get_CachedAutomationId(&id);button->get_CachedBoundingRectangle(&bounds);
+                        if(id&&wcsncmp(id,L"Window: ",8)==0){HWND source=reinterpret_cast<HWND>(static_cast<UINT_PTR>(wcstoull(id+8,nullptr,0)));
+                            if(IsWindow(source))result.push_back({source,monitor,WindowGroupKey(source),double(bounds.left),double(bounds.top)});}
+                        SysFreeString(id);
+                    }
+                }
+                if(valid){std::stable_sort(result.begin(),result.end(),[](const auto&a,const auto&b){if(a.monitor!=b.monitor)return reinterpret_cast<UINT_PTR>(a.monitor)<reinterpret_cast<UINT_PTR>(b.monitor);return a.y!=b.y?a.y<b.y:a.x<b.x;});
+                    {std::lock_guard<std::mutex> lock(mutex);snapshot=std::move(result);}PostMessage(notify,kTaskbarOrder,0,0);}
+            }
+        }}CoUninitialize();
+    }
+public:
+    void Start(HWND hwnd){if(thread)return;notify=hwnd;request=CreateEvent(nullptr,FALSE,FALSE,nullptr);stop=CreateEvent(nullptr,TRUE,FALSE,nullptr);
+        if(request&&stop)thread=CreateThread(nullptr,0,Worker,this,0,nullptr);if(!thread){Stop();return;}Refresh();}
+    void Refresh(){if(request)SetEvent(request);}
+    std::vector<TaskbarEntry> Read(){std::lock_guard<std::mutex> lock(mutex);return snapshot;}
+    void Stop(){if(stop)SetEvent(stop);if(thread){WaitForSingleObject(thread,INFINITE);CloseHandle(thread);thread=nullptr;}
+        if(request){CloseHandle(request);request=nullptr;}if(stop){CloseHandle(stop);stop=nullptr;}}
+    ~TaskbarOrder(){Stop();}
+};
 struct Settings{bool winTab=true;int duration=320;MemoryMode memoryMode=MemoryMode::Automatic;};
 static std::atomic<bool> g_winTab{true};
 static std::atomic<int> g_duration{320};
@@ -352,11 +718,14 @@ struct Item {
         return *this;
     }
     HWND source=nullptr;DWORD sourceProcess=0;
+    std::wstring groupKey;int taskbarRank=INT_MAX;
     bool minimized=false,canMinimize=false,iconQueried=false;
     ComPtr<IWICBitmap> iconBitmap;
     Box original,target,minimizedOrigin;
+    Box layoutAnchor;bool anchorMinimized=false;LayoutSlot anchorSlot,layoutSlot;
     Box motionFrom,motionTo;
     float radiusFrom=0,radiusTo=0;
+    double labelFrom=0,labelTo=0,labelSeconds=0;
     SIZE pixels{};
     RECT restoredSample{};
     bool restoredSampleValid=false;
@@ -395,7 +764,7 @@ public:
     HWND controller=nullptr;HANDLE timer=nullptr,lowMemoryEvent=nullptr;
     ComPtr<ABI::Windows::UI::ViewManagement::IUISettings3> uiSettings;
     EventRegistrationToken accentToken{};bool accentSubscribed=false;
-    HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr,restoreHook=nullptr,windowStateHook=nullptr;
+    HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr,restoreHook=nullptr,windowStateHook=nullptr,geometryHook=nullptr;
     ComPtr<IVirtualDesktopManager> desktops;
     ComPtr<ID3D11Device> d3d;
     ComPtr<IDXGIDevice> dxgi;
@@ -408,6 +777,9 @@ public:
     ComPtr<IDWriteFactory> textFactory;
     ComPtr<IWICImagingFactory> imageFactory;
     std::vector<DesktopCache> desktopCache;
+    struct LayoutMemory{HWND source;DWORD process;HMONITOR monitor;RECT bounds;float dpi;bool minimized;Box target;LayoutSlot slot;};
+    std::vector<LayoutMemory> layoutMemory;
+    TaskbarOrder taskbarOrder;
     PrivateDwm api;
     std::vector<std::unique_ptr<View>> views;
     Settings settings;Phase phase=Phase::Hidden;
@@ -421,21 +793,24 @@ public:
     double gestureBaseX=0,gestureBaseY=0,gestureLastX=0,gestureLastY=0,gestureMinY=0,gestureReadyX=0,gestureReadyY=0;
     struct GestureMessage {UINT message;WPARAM token;LPARAM data;};
     std::vector<GestureMessage> deferredGestures;
-    bool idleTimer=false,building=false,deferredWindowState=false;
+    bool idleTimer=false,building=false,deferredWindowState=false,deferredTaskbar=false;
     bool memoryPressure=false;
     UINT deferredCommand=0;
     std::vector<HWND> deferredRemovals;
+    std::vector<HWND> deferredSceneChanges;
     struct BuildGuard {
         App&a;bool wasBuilding;explicit BuildGuard(App&app):a(app),wasBuilding(app.building){a.building=true;}
         ~BuildGuard(){a.building=wasBuilding;if(!wasBuilding){if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);
             if(std::exchange(a.deferredWindowState,false))PostMessage(a.controller,kWindowStateChanged,0,0);
+            if(std::exchange(a.deferredTaskbar,false))PostMessage(a.controller,kTaskbarOrder,0,0);
+            for(HWND source:a.deferredSceneChanges)PostMessage(a.controller,kSceneChanged,reinterpret_cast<WPARAM>(source),0);a.deferredSceneChanges.clear();
             for(HWND source:a.deferredRemovals)PostMessage(a.controller,kWindowGone,reinterpret_cast<WPARAM>(source),0);a.deferredRemovals.clear();
             for(auto event:a.deferredGestures)PostMessage(a.controller,event.message,event.token,event.data);a.deferredGestures.clear();}}
     };
     LARGE_INTEGER frequency{};
     double start=0,seconds=0,from=0,to=1,progress=0;
     LONGLONG animationStart=0;
-    struct AnimationEntry {double a,b;ComPtr<IDCompositionAnimation> animation;};
+    struct AnimationEntry {double a,b,duration;ComPtr<IDCompositionAnimation> animation;};
     std::vector<AnimationEntry> animations;
     double frameSeconds=1./60;
 
@@ -453,7 +828,7 @@ public:
     void ReleaseInactiveGraphics(){
         if(building||phase!=Phase::Hidden||!ShouldReleaseGraphics())return;
         BuildGuard guard(*this);if(timer)CancelWaitableTimer(timer);idleTimer=false;
-        ReleaseDevice();desktops.Reset();memoryPressure=false;
+        ReleaseDevice();desktops.Reset();taskbarOrder.Stop();memoryPressure=false;
         CoFreeUnusedLibrariesEx(0,0);
         HEAP_OPTIMIZE_RESOURCES_INFORMATION info{HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,0};
         HeapSetInformation(nullptr,HeapOptimizeResources,&info,sizeof(info));
@@ -476,6 +851,7 @@ public:
     static void CALLBACK Event(HWINEVENTHOOK,DWORD event,HWND hwnd,LONG object,LONG child,DWORD,DWORD){
         App*a=instance;if(!a||a->phase==Phase::Hidden)return;
         if(event==EVENT_SYSTEM_FOREGROUND)PostMessage(a->controller,a->phase==Phase::Closing?kSyncOrder:kDismiss,0,0);
+        else if(event==EVENT_OBJECT_SHOW&&object==OBJID_WINDOW&&child==0&&GetAncestor(hwnd,GA_ROOT)==hwnd)PostMessage(a->controller,kSceneChanged,reinterpret_cast<WPARAM>(hwnd),0);
         else if((event==EVENT_OBJECT_DESTROY||event==EVENT_OBJECT_HIDE)&&object==OBJID_WINDOW&&child==0)
             for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){
                 if(event==EVENT_OBJECT_HIDE&&IsWindowVisible(hwnd)&&IsIconic(hwnd))PostMessage(a->controller,kWindowStateChanged,0,0);
@@ -487,8 +863,8 @@ public:
         App*a=instance;if(!a||a->phase==Phase::Hidden)return;
         bool stateEvent=event==EVENT_SYSTEM_MINIMIZESTART||event==EVENT_SYSTEM_MINIMIZEEND;
         if(!stateEvent&&(object!=OBJID_WINDOW||child!=0))return;
-        for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd&&(stateEvent||i.minimized)){
-            PostMessage(a->controller,kWindowStateChanged,0,0);return;
+        for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){
+            PostMessage(a->controller,stateEvent||i.minimized?kWindowStateChanged:kSceneChanged,stateEvent||i.minimized?0:reinterpret_cast<WPARAM>(hwnd),0);return;
         }
     }
     bool IsOurWindow(HWND hwnd)const{if(hwnd==controller)return true;for(auto&v:views)if(v->hwnd==hwnd)return true;return false;}
@@ -510,6 +886,7 @@ public:
         ChangeWindowMessageFilterEx(controller,kNativeConsumed,MSGFLT_ALLOW,nullptr);
         for(UINT message:{kGestureBegin,kGestureUpdate,kGestureEnd,kGestureCancel})ChangeWindowMessageFilterEx(controller,message,MSGFLT_ALLOW,nullptr);
         SetProp(controller,kShellReadyProperty,reinterpret_cast<HANDLE>(kShellAck));
+        taskbarOrder.Start(controller);
         PostMessage(controller,kWarmup,0,0);
         return true;
     }
@@ -874,9 +1251,10 @@ public:
             }
         }
         if(!remaining){End(true);return;}
-        FollowNativeZOrder();progress=1;Animate(1,true,true);
+        RememberLayout();FollowNativeZOrder();progress=1;Animate(1,true,true);
     }
     void Cleanup(){
+        taskbarOrder.Stop();
         if(controller){RemoveProp(controller,kShellReadyProperty);RemoveProp(controller,kNativeBypassProperty);}
         if(uiSettings&&accentSubscribed)uiSettings->remove_ColorValuesChanged(accentToken);
         accentSubscribed=false;uiSettings.Reset();
@@ -916,11 +1294,72 @@ public:
             OffsetRect(&r,monitor.rcWork.left-monitor.rcMonitor.left,monitor.rcWork.top-monitor.rcMonitor.top);
         return r.right>r.left&&r.bottom>r.top;
     }
-    static std::vector<Box> Arrange(const View&v){
+    void RecallLayout(View&v){
+        for(auto&i:v.items)for(const auto&m:layoutMemory)if(m.source==i.source&&m.process==i.sourceProcess&&m.monitor==v.monitor&&EqualRect(&m.bounds,&v.bounds)&&m.dpi==v.dpi){i.layoutAnchor=m.target;i.anchorMinimized=m.minimized;i.anchorSlot=m.slot;break;}
+    }
+    static void AssignTaskbarOrder(View&v,const std::vector<TaskbarEntry>&order){
+        for(auto&i:v.items){i.taskbarRank=INT_MAX;
+            // Prefer the taskbar on this monitor, then the main taskbar if it
+            // shows all monitors. Group rank keeps sibling windows together.
+            for(size_t n=0;n<order.size();++n)if(order[n].group==i.groupKey)
+                i.taskbarRank=std::min(i.taskbarRank,int(n)+(order[n].monitor==v.monitor?0:10000));
+        }
+    }
+    void ApplyTaskbarOrder(View&v){AssignTaskbarOrder(v,taskbarOrder.Read());}
+    void TaskbarChanged(){
+        if(phase!=Phase::Opening&&phase!=Phase::Settled)return;
+        bool changed=false;for(auto&v:views){ApplyTaskbarOrder(*v);auto layout=Arrange(*v);
+            for(size_t n=0;n<layout.size();++n)if(std::abs(layout[n].x-v->items[n].target.x)>.1||std::abs(layout[n].y-v->items[n].target.y)>.1)changed=true;}
+        if(changed)Relayout();
+    }
+    void Relayout(){
+        progress=CurrentProgress();CaptureMotion();ClearSelection();BuildGuard guard(*this);
+        for(auto&v:views){auto layout=Arrange(*v);if(layout.size()!=v->items.size()){End(false);return;}
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();if(!CreateTitle(*v,i)){End(false);return;}}}
+        RememberLayout();FollowNativeZOrder();Animate(1,true,true);
+    }
+    void SceneChanged(HWND source){
+        if(phase!=Phase::Opening&&phase!=Phase::Settled)return;
+        for(auto&v:views)for(auto&i:v->items)if(i.source==source){
+            if(i.minimized!=(IsIconic(source)!=FALSE)){ReconcileWindowStates();return;}
+            RECT r{};if(i.minimized||!Bounds(source,r))return;
+            Box actual{double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+            bool resize=std::abs(actual.w-i.original.w)>.5||std::abs(actual.h-i.original.h)>.5;
+            bool moved=std::abs(actual.x-i.original.x)>.5||std::abs(actual.y-i.original.y)>.5;
+            i.original=actual;i.nativeRadius=SystemCornerRadius(source,v->dpi);
+            if(resize)RebindRestoredSample(*v,i,r);
+            if(resize||moved)Relayout();return;
+        }
+        if(!IsWindowVisible(source)||GetAncestor(source,GA_ROOT)!=source)return;
+        BuildGuard guard(*this);std::vector<size_t> counts;for(auto&v:views)counts.push_back(v->items.size());AddWindow(source,reinterpret_cast<LPARAM>(this));
+        bool added=false;
+        for(size_t n=0;n<views.size();++n){auto&v=*views[n];if(v.items.size()==counts[n])continue;
+            if(!v.hwnd){if(!CreateView(v)||!CreateDesktop(v)){End(false);return;}}
+            auto&i=v.items.back();if(!CreateItem(v,i)){v.items.pop_back();continue;}
+            ApplyTaskbarOrder(v);auto layout=Arrange(v);if(layout.size()!=v.items.size()){End(false);return;}
+            i.target=layout.back();if(!CreateTitle(v,i)){End(false);return;}
+            i.motionFrom=HiddenPose(i);i.radiusFrom=i.radiusTo=HiddenRadius(v,i);i.labelFrom=i.labelTo=0;i.labelSeconds=0;
+            // CaptureMotion reads motion endpoints for the newly attached item.
+            i.motionTo=i.motionFrom;i.target=i.motionFrom;added=true;
+        }
+        if(added){taskbarOrder.Refresh();Relayout();if(phase!=Phase::Hidden){device->WaitForCommitCompletion();for(auto&v:views)if(v->hwnd&&!IsWindowVisible(v->hwnd))ShowWindow(v->hwnd,SW_SHOWNOACTIVATE);}}
+    }
+    void RememberLayout(){
+        layoutMemory.clear();
+        for(auto&v:views)for(auto&i:v->items){i.layoutAnchor=i.target;i.anchorMinimized=i.minimized;i.anchorSlot=i.layoutSlot;
+            layoutMemory.push_back({i.source,i.sourceProcess,v->monitor,v->bounds,v->dpi,i.minimized,i.target,i.layoutSlot});}
+    }
+    static std::vector<Box> Arrange(View&v){
         double pad=28*v.dpi,gap=12*v.dpi,caption=26*v.dpi;
         Box area{pad,pad,std::max(1.,double(v.bounds.right-v.bounds.left)-2*pad),std::max(1.,double(v.bounds.bottom-v.bounds.top)-2*pad)};
-        std::vector<int> normal,small;std::vector<Box> sources,result(v.items.size());
+        std::vector<int> normal,small;std::vector<Box> sources,anchors,result(v.items.size());
         for(size_t n=0;n<v.items.size();++n)(v.items[n].minimized?small:normal).push_back(int(n));
+        std::stable_sort(small.begin(),small.end(),[&](int a,int b){
+            const auto&x=v.items[a];const auto&y=v.items[b];bool oldX=x.anchorMinimized&&x.layoutAnchor.w>0,oldY=y.anchorMinimized&&y.layoutAnchor.w>0;
+            if(x.taskbarRank!=y.taskbarRank)return x.taskbarRank<y.taskbarRank;
+            if(x.groupKey!=y.groupKey)return x.groupKey<y.groupKey;
+            if(oldX!=oldY)return oldX;return oldX&&x.layoutAnchor.x<y.layoutAnchor.x;
+        });
         if(!small.empty()){
             // Keep the shelf in one shallow row. Crowding reduces horizontal
             // gaps first, then uniformly scales tiles; it never adds rows.
@@ -938,9 +1377,10 @@ public:
             double shelfTop=bottom-rowHeight;
             area.h=std::max(1.,shelfTop-area.y-24*v.dpi);
         }
-        for(int id:normal)sources.push_back(v.items[id].original);
-        auto layout=Layout(sources,area,22*v.dpi,caption);if(layout.size()!=normal.size())return {};
-        for(size_t n=0;n<normal.size();++n)result[normal[n]]=layout[n];
+        std::vector<LayoutSlot> previous,next;
+        for(int id:normal){sources.push_back(v.items[id].original);anchors.push_back(v.items[id].anchorMinimized?Box{}:v.items[id].layoutAnchor);previous.push_back(v.items[id].anchorSlot);}
+        auto layout=StableLayout(sources,anchors,area,22*v.dpi,caption,previous,&next);if(layout.size()!=normal.size())return {};
+        for(size_t n=0;n<normal.size();++n){result[normal[n]]=layout[n];v.items[normal[n]].layoutSlot=next[n];}
         return result;
     }
     static Box HiddenPose(const Item&i){return i.minimized?i.minimizedOrigin:i.original;}
@@ -1024,6 +1464,7 @@ public:
     }
     bool CreateItem(View&v,Item&i){
         GetWindowThreadProcessId(i.source,&i.sourceProcess);
+        i.groupKey=WindowGroupKey(i.source);
         i.minimized=IsIconic(i.source)!=FALSE;
         HRESULT hr=api.querySize(i.source,FALSE,&i.pixels);
         bool validSize=SUCCEEDED(hr)&&i.pixels.cx>0&&i.pixels.cy>0;
@@ -1081,7 +1522,7 @@ public:
     bool Begin(){
         if(phase!=Phase::Hidden||building)return false;
         CancelWaitableTimer(timer);idleTimer=false;
-        previous=GetForegroundWindow();chosen=nullptr;progress=0;BuildGuard guard(*this);RefreshAccent();
+        previous=GetForegroundWindow();chosen=nullptr;progress=0;BuildGuard guard(*this);RefreshAccent();taskbarOrder.Start(controller);taskbarOrder.Refresh();
         memoryPressure=settings.memoryMode==MemoryMode::Automatic&&LowMemory();
         if(!EnsureDevice()){building=false;return false;}
         if(!desktops)CoCreateInstance(CLSID_VirtualDesktopManager,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&desktops));
@@ -1098,12 +1539,13 @@ public:
                 if(a.original.h!=b.original.h)return a.original.h>b.original.h;
                 return reinterpret_cast<ULONG_PTR>(a.source)<reinterpret_cast<ULONG_PTR>(b.source);
             });
-            auto layout=Arrange(*v);
+            RecallLayout(*v);ApplyTaskbarOrder(*v);auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){building=false;End(false);return false;}
             for(size_t j=0;j<layout.size();++j){v->items[j].target=layout[j];if(!CreateTitle(*v,v->items[j])){building=false;End(false);return false;}}
             count+=v->items.size();
         }
         if(!count){building=false;End(false);return false;}
+        RememberLayout();
         FollowNativeZOrder();
         selectedSource=nullptr; // Mouse hover/click chooses; no keyboard candidate.
         GetCursorPos(&lastPointer);
@@ -1118,24 +1560,26 @@ public:
         foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT);
         destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         windowStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+        geometryHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         building=false;Animate(1);return true;
     }
-    template<class Setter> void Property(double a,double b,Setter setter){
-        if(seconds<=0||std::abs(b-a)<.00001){setter(float(b));return;}
-        for(auto&e:animations)if(e.a==a&&e.b==b){setter(e.animation.Get());return;}
+    template<class Setter> void Property(double a,double b,Setter setter,double duration=-1){
+        if(duration<0)duration=seconds;
+        if(duration<=0||std::abs(b-a)<.00001){setter(float(b));return;}
+        for(auto&e:animations)if(e.a==a&&e.b==b&&e.duration==duration){setter(e.animation.Get());return;}
         ComPtr<IDCompositionAnimation> animation;
         if(FAILED(device->CreateAnimation(&animation))){setter(float(b));return;}
         // Twelve Hermite cubics approximate critically damped motion. All share
         // an absolute QPC start so position, scale and rectangular bounds stay in sync.
-        constexpr int parts=12;double dt=seconds/parts,delta=b-a;
+        constexpr int parts=12;double dt=duration/parts,delta=b-a;
         for(int j=0;j<parts;++j){
             double u=double(j)/parts,v=double(j+1)/parts;
             double f0=a+delta*Curve(u),f1=a+delta*Curve(v);
-            double m0=delta*CurveDerivative(u)/seconds,m1=delta*CurveDerivative(v)/seconds;
+            double m0=delta*CurveDerivative(u)/duration,m1=delta*CurveDerivative(v)/duration;
             double c2=(3*(f1-f0)/dt-2*m0-m1)/dt,c3=(2*(f0-f1)/dt+m0+m1)/(dt*dt);
             animation->AddCubic(j*dt,float(f0),float(m0),float(c2),float(c3));
         }
-        animation->End(seconds,float(b));setter(animation.Get());animations.push_back({a,b,std::move(animation)});
+        animation->End(duration,float(b));setter(animation.Get());animations.push_back({a,b,duration,std::move(animation)});
     }
     void StaticPose(double p){
         for(auto&v:views)for(auto&i:v->items){
@@ -1145,11 +1589,15 @@ public:
             i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight);
             if(i.buttons)i.buttons->SetOffsetX(float(b.w)-ButtonsWidth(*v,i)-CloseInset(*v));
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h-v->dpi));i.labelEffect->SetOpacity(float(p));}
+            i.labelFrom=i.labelTo=p;i.labelSeconds=0;
             float radius=float(ExitRadius(*v,i)+(OverviewRadius(*v,i.target)-ExitRadius(*v,i))*p);
             SetCorners(i,radius);i.radiusFrom=i.radiusTo=radius;i.motionFrom=i.motionTo=b;
         }
     }
     double MotionFraction()const{return Curve(seconds<=0?1:(Now()-start)/seconds);}
+    double CurrentLabelOpacity(const Item&i)const{
+        return i.labelFrom+(i.labelTo-i.labelFrom)*Curve(i.labelSeconds<=0?1:(Now()-start)/i.labelSeconds);
+    }
     Box CurrentBox(const Item&i)const{
         if(phase==Phase::Hidden)return HiddenPose(i);if(phase==Phase::Settled)return i.target;
         return Mix(i.motionFrom,i.motionTo,MotionFraction());
@@ -1158,7 +1606,7 @@ public:
         double t=MotionFraction();
         for(auto&v:views)for(auto&i:v->items){
             i.radiusFrom=phase==Phase::Hidden?HiddenRadius(*v,i):phase==Phase::Settled?OverviewRadius(*v,i.target):float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*t);
-            i.motionFrom=CurrentBox(i);
+            i.motionFrom=CurrentBox(i);i.labelFrom=CurrentLabelOpacity(i);
         }
     }
     double CurrentProgress(){
@@ -1175,6 +1623,7 @@ public:
         for(auto&v:views)for(auto&i:v->items){
             Box a=i.motionFrom,b=destination==1?i.target:ExitPose(i);i.motionTo=b;
             i.radiusTo=destination==1?OverviewRadius(*v,i.target):ExitRadius(*v,i);
+            i.labelTo=destination;i.labelSeconds=(seconds+std::min(.12,seconds*.28))*.5;
             Property(a.x,b.x,[&](auto value){i.position->SetOffsetX(value);});
             Property(a.y,b.y,[&](auto value){i.position->SetOffsetY(value);});
             Property(a.w/i.pixels.cx,b.w/i.pixels.cx,[&](auto value){i.scale->SetScaleX(value);});
@@ -1188,7 +1637,7 @@ public:
             if(i.label){
                 Property((a.w-i.target.w)*.5,(b.w-i.target.w)*.5,[&](auto value){i.label->SetOffsetX(value);});
                 Property(a.h-v->dpi,b.h-v->dpi,[&](auto value){i.label->SetOffsetY(value);});
-                Property(from,to,[&](auto value){i.labelEffect->SetOpacity(value);});
+                Property(i.labelFrom,i.labelTo,[&](auto value){i.labelEffect->SetOpacity(value);},i.labelSeconds);
             }
         }
         // Set one start AFTER building the batch. Expensive submission must not
@@ -1288,7 +1737,7 @@ public:
                 if(!CreateTitle(*v,i)){End(false);return true;}
             }
         }
-        FollowNativeZOrder();Animate(1,true,true);return true;
+        RememberLayout();FollowNativeZOrder();Animate(1,true,true);return true;
     }
     void RefreshRestoredGeometry(bool animate=true){
         if(phase==Phase::Opening||phase==Phase::Settled){ReconcileWindowStates();return;}
@@ -1351,6 +1800,7 @@ public:
         if(destroyHook){UnhookWinEvent(destroyHook);destroyHook=nullptr;}
         if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}
         if(windowStateHook){UnhookWinEvent(windowStateHook);windowStateHook=nullptr;}restoreSource=nullptr;
+        if(geometryHook){UnhookWinEvent(geometryHook);geometryHook=nullptr;}
         HWND target=chosen?chosen:previous;
         if(restore)ActivateWindow(target,chosen!=nullptr);
         if(visible&&device){
@@ -1496,6 +1946,8 @@ public:
         auto v=reinterpret_cast<View*>(GetWindowLongPtr(hwnd,GWLP_USERDATA));
         if(building){
             if(msg==kWindowStateChanged){deferredWindowState=true;return 0;}
+            if(msg==kTaskbarOrder){deferredTaskbar=true;return 0;}
+            if(msg==kSceneChanged){HWND source=reinterpret_cast<HWND>(wp);if(std::find(deferredSceneChanges.begin(),deferredSceneChanges.end(),source)==deferredSceneChanges.end())deferredSceneChanges.push_back(source);return 0;}
             if(msg>=kGestureBegin&&msg<=kGestureCancel){
                 if(msg==kGestureUpdate&&!deferredGestures.empty()&&deferredGestures.back().message==msg&&deferredGestures.back().token==wp)deferredGestures.back().data=lp;
                 else if(deferredGestures.size()<32)deferredGestures.push_back({msg,wp,lp});
@@ -1529,6 +1981,8 @@ public:
         case kWindowGone:RemoveWindowFromOverview(reinterpret_cast<HWND>(wp));return 0;
         case kWarmup:Warmup();return 0;
         case kWindowStateChanged:RefreshRestoredGeometry();return 0;
+        case kTaskbarOrder:TaskbarChanged();return 0;
+        case kSceneChanged:SceneChanged(reinterpret_cast<HWND>(wp));return 0;
         case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){RefreshRestoredGeometry();FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
         case kAccentChanged:case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;

@@ -50,8 +50,8 @@ $rc = @"
 201 RCDATA "$(ResourcePath $payload)"
 202 RCDATA "$(ResourcePath $noticePath)"
 1 VERSIONINFO
-FILEVERSION 0,5,3,0
-PRODUCTVERSION 0,5,3,0
+FILEVERSION 0,5,4,0
+PRODUCTVERSION 0,5,4,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -64,11 +64,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "SinCircle\0"
       VALUE "FileDescription", "Window Scatter\0"
-      VALUE "FileVersion", "0.5.3.0\0"
+      VALUE "FileVersion", "0.5.4.0\0"
       VALUE "InternalName", "WindowScatter\0"
       VALUE "OriginalFilename", "WindowScatter.exe\0"
       VALUE "ProductName", "Window Scatter\0"
-      VALUE "ProductVersion", "0.5.3\0"
+      VALUE "ProductVersion", "0.5.4\0"
     END
   END
   BLOCK "VarFileInfo"
@@ -82,7 +82,7 @@ $resPath = Join-Path $build 'app.res'
 [IO.File]::WriteAllText($rcPath,$rc,$utf8)
 & $ResourceCompiler /nologo /fo $resPath $rcPath
 if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
-$libraries = @('-ld3d11','-ldxgi','-ldcomp','-ldwmapi','-ld2d1','-ldwrite','-lwindowscodecs','-lole32','-lshell32',
+$libraries = @('-ld3d11','-ldxgi','-ldcomp','-ldwmapi','-ld2d1','-ldwrite','-lwindowscodecs','-lole32','-loleaut32','-lshell32',
     '-lgdi32','-luser32','-luuid','-lruntimeobject','-lcomctl32','-lgdiplus','-luxtheme','-loleacc','-ldbghelp','-lwinhttp','-lbcrypt')
 $output = Join-Path $build 'WindowScatter.exe'
 & $Compiler @common -municode -mwindows (Join-Path $native 'app.cpp') (Join-Path $native 'backend.cpp') (Join-Path $native 'settings-window.cpp') $resPath @libraries '-o' $output

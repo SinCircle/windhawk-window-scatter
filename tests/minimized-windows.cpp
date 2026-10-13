@@ -166,12 +166,17 @@ int wmain(int argc,wchar_t**argv){
     Check(reinterpret_cast<UINT_PTR>(GetProp(child.Window(0),L"CloseRequests"))==1&&IsIconic(child.Window(0)),"the adjacent close button still sends exactly one native close request");
     ShowWindowAsync(child.Window(0),SW_RESTORE);Pump(400);app.FinishTransition();app.ClearSelection();
     Check(!ordinary.minimized&&App::HasMinimizeButton(ordinary),"restoring a window returns it to the main area with the minimize control available again");ordinary.original=savedOriginal;
-    app.phase=Phase::Hidden;app.progress=0;app.previous=child.Window(0);app.settings.duration=700;app.StaticPose(0);app.Animate(1);Sleep(160);
+    app.phase=Phase::Hidden;app.progress=0;app.previous=child.Window(0);app.settings.duration=700;app.StaticPose(0);app.Animate(1);
+    Check(v.items[0].labelSeconds==v.items[1].labelSeconds&&std::abs(v.items[0].labelSeconds-(app.seconds+std::min(.12,app.seconds*.28))*.5)<1e-6,"both caption types enter together at the mean of the two previous durations");Sleep(160);
     Box opening=app.CurrentBox(v.items[1]);
     Check(opening.w>hidden.w&&opening.w<v.items[1].target.w&&opening.y>v.items[1].target.y&&opening.y<hidden.y,"opening slides upwards with only subtle scaling");
     app.Close(nullptr);
     Check(v.items[1].motionFrom.w>=opening.w&&v.items[1].motionFrom.w<v.items[1].target.w,"closing continues from the in-flight opening pose");
-    Sleep(70);Box closing=app.CurrentBox(v.items[1]);app.Reopen();
+    Check(std::abs(v.items[1].labelSeconds-(app.seconds+std::min(.12,app.seconds*.28))*.5)<1e-6,"caption fade uses the mean of the two previous durations");
+    Check(v.items[0].labelSeconds==v.items[1].labelSeconds,"ordinary and minimized captions share the same closing duration");
+    Sleep(DWORD(v.items[1].labelSeconds*1000)+20);Check(app.CurrentLabelOpacity(v.items[1])<.0001&&app.MotionFraction()<1,"captions are fully gone while the closing window is still moving");
+    Box closing=app.CurrentBox(v.items[1]);app.Reopen();
+    Check(v.items[1].labelFrom<.0001&&v.items[1].labelTo==1,"reopening resumes the actual faded opacity without flashing the label back on");
     Check(v.items[1].motionFrom.w>=hidden.w&&v.items[1].motionFrom.w<=closing.w+1,"reopening continues from the in-flight closing pose without resetting");
     Check(IsIconic(child.Window(1)),"interrupting and reversing overview animations never restores minimized sources");
     // Reproduce a stale iconic crop: a tiny source region is scaled into the
@@ -229,6 +234,22 @@ int wmain(int argc,wchar_t**argv){
     Check(!app.restoreHook&&!app.restoreSource,"completed restore tracking releases its temporary location hook");
     PostMessage(child.Window(1),WM_APP+2,0,0);Pump(150);v.items[1].minimized=true;
     app.phase=Phase::Settled;app.StaticPose(1);
+    app.RememberLayout();app.settings.duration=300;
+    app.destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,App::Event,child.process.dwProcessId,0,WINEVENT_OUTOFCONTEXT);
+    app.geometryHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,App::WindowStateEvent,child.process.dwProcessId,0,WINEVENT_OUTOFCONTEXT);
+    SetWindowPos(child.Window(4),nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);Pump(180);
+    Check(v.items.size()==5&&v.items.back().source==child.Window(4)&&app.phase!=Phase::Hidden,"a newly shown native window joins the open overview through its show event");
+    if(v.items.size()!=5)return 9;
+    app.SceneChanged(child.Window(4));Check(v.items.size()==5,"duplicate show notifications cannot duplicate a preview");
+    SetWindowPos(child.Window(4),nullptr,120,110,710,390,SWP_NOZORDER|SWP_NOACTIVATE);Pump(180);
+    RECT resized{};App::Bounds(child.Window(4),resized);
+    Check(v.items.back().original.w==resized.right-resized.left&&v.items.back().restoredSampleValid,"native size events update live source sampling and the stable layout");
+    Box beforeMove=v.items.back().target;bool moveRight=beforeMove.cx()<=v.items[0].target.cx();
+    SetWindowPos(child.Window(4),nullptr,moveRight?1250:-450,110,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);Pump(180);
+    RECT movedBounds{};App::Bounds(child.Window(4),movedBounds);
+    Check(v.items.back().original.x==movedBounds.left-v.bounds.left&&(moveRight?v.items.back().target.cx()>v.items[0].target.cx():v.items.back().target.cx()<v.items[0].target.cx())&&std::abs(v.items.back().target.cx()-beforeMove.cx())>5,
+        "a move-only native event updates overview position without requiring a resize");
+    ShowWindow(child.Window(4),SW_HIDE);Pump(180);Check(v.items.size()==4&&app.phase!=Phase::Hidden,"hiding the added window removes it and keeps the overview open");
     app.phase=Phase::Settled;app.progress=1;app.previous=child.Window(0);app.settings.duration=0;app.Close(nullptr);Pump(150);
     Check(IsIconic(child.Window(1))&&IsIconic(child.Window(2))&&IsIconic(child.Window(3)),"canceling overview leaves every minimized window minimized");
     // Zero-duration closing takes End() directly and must restore a chosen tile.
