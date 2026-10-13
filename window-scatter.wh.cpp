@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.7
+// @version         0.4.8
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -60,9 +60,10 @@ share one compositor animation per distinct radius transition, submitted once.
 The outline follows the same circular corners at a constant 4 DIP gap and tracks
 the Windows accent color.
 Minimized windows remain selectable using DWM's retained surface at full source
-opacity, in smaller tiles with a minimized label. They expand from the taskbar edge;
-selecting one restores
-its previous normal/maximized state. Opening or canceling never restores them.
+opacity, in smaller tiles with attached application titles and icons. They expand
+from below the display; selecting one restores its previous normal/maximized state.
+The minimize button beside close moves a supported window to the bottom row while
+keeping overview open. Opening or canceling never restores minimized windows.
 If no retained surface is available, one small shared placeholder supplies a card.
 Only a hovered window allocates an outline; inactive outlines are detached.
 Explorer's Task View request is redirected to the dedicated renderer. The system
@@ -147,7 +148,7 @@ constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
 constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8,kShellTaskView=WM_APP+10,kAccentChanged=WM_APP+11,kWindowGone=WM_APP+12,kNativeConsumed=WM_APP+13,kShow=WM_APP+14;
 constexpr UINT kGestureBegin=WM_APP+15,kGestureUpdate=WM_APP+16,kGestureEnd=WM_APP+17,kGestureCancel=WM_APP+18;
-constexpr UINT kRestoreGeometry=WM_APP+19;
+constexpr UINT kWindowStateChanged=WM_APP+19;
 constexpr ULONG_PTR kInputMarker=0x57534354;
 constexpr wchar_t kShellReadyProperty[]=L"WindowScatter.ShellReady.v4";
 constexpr wchar_t kNativeBypassProperty[]=L"WindowScatter.NativeTaskView.v4";
@@ -340,6 +341,7 @@ struct PrivateDwm {
         return createThumb&&querySize;
     }
 };
+enum class WindowButton{None,Minimize,Close};
 struct Item {
     Item()=default;
     Item(const Item&)=delete;
@@ -350,7 +352,7 @@ struct Item {
         return *this;
     }
     HWND source=nullptr;DWORD sourceProcess=0;
-    bool minimized=false,iconQueried=false;
+    bool minimized=false,canMinimize=false,iconQueried=false;
     ComPtr<IWICBitmap> iconBitmap;
     Box original,target,minimizedOrigin;
     Box motionFrom,motionTo;
@@ -360,12 +362,13 @@ struct Item {
     bool restoredSampleValid=false;
     float nativeRadius=0;
     HTHUMBNAIL thumbnail=nullptr;
-    ComPtr<IDCompositionVisual2> surface,position,content,border,borderFill,label,closeButton;
+    ComPtr<IDCompositionVisual2> surface,position,content,border,borderFill,label,buttons;
     ComPtr<IDCompositionScaleTransform> scale,borderScale;
     ComPtr<IDCompositionRectangleClip> clip;
     ComPtr<IDCompositionEffectGroup> borderEffect,labelEffect;
     ComPtr<IDCompositionSurface> labelSurface,borderSurface;
-    UINT32 borderColor=0;bool borderAttached=false,closeAttached=false,closeHot=false;
+    UINT32 borderColor=0;bool borderAttached=false,buttonsAttached=false;
+    WindowButton hotButton=WindowButton::None;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
     float titleLeft=0,titleRight=0,titleHeight=0;
     float Outset()const{return stroke+gap;}
@@ -377,7 +380,7 @@ struct View {
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual2> root,windows,desktop;
     ComPtr<IDCompositionSurface> wallpaperSurface;
-    ComPtr<IDCompositionSurface> closeNormal,closeHot;
+    ComPtr<IDCompositionSurface> buttonSurfaces[2][3];
 };
 struct DesktopCache {
     HMONITOR monitor=nullptr;RECT bounds{},display{};std::wstring path;
@@ -392,7 +395,7 @@ public:
     HWND controller=nullptr;HANDLE timer=nullptr,lowMemoryEvent=nullptr;
     ComPtr<ABI::Windows::UI::ViewManagement::IUISettings3> uiSettings;
     EventRegistrationToken accentToken{};bool accentSubscribed=false;
-    HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr,restoreHook=nullptr,restoreStateHook=nullptr;
+    HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr,restoreHook=nullptr,windowStateHook=nullptr;
     ComPtr<IVirtualDesktopManager> desktops;
     ComPtr<ID3D11Device> d3d;
     ComPtr<IDXGIDevice> dxgi;
@@ -408,7 +411,8 @@ public:
     PrivateDwm api;
     std::vector<std::unique_ptr<View>> views;
     Settings settings;Phase phase=Phase::Hidden;
-    HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedClose=nullptr,restoreSource=nullptr;
+    HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedButtonSource=nullptr,restoreSource=nullptr;
+    WindowButton pressedButton=WindowButton::None;
     POINT lastPointer{};
     UINT gestureToken=0;
     double gestureOriginX=0,gestureOriginY=0,gestureWidth=1,gestureHeight=1;
@@ -417,13 +421,14 @@ public:
     double gestureBaseX=0,gestureBaseY=0,gestureLastX=0,gestureLastY=0,gestureMinY=0,gestureReadyX=0,gestureReadyY=0;
     struct GestureMessage {UINT message;WPARAM token;LPARAM data;};
     std::vector<GestureMessage> deferredGestures;
-    bool idleTimer=false,building=false;
+    bool idleTimer=false,building=false,deferredWindowState=false;
     bool memoryPressure=false;
     UINT deferredCommand=0;
     std::vector<HWND> deferredRemovals;
     struct BuildGuard {
         App&a;bool wasBuilding;explicit BuildGuard(App&app):a(app),wasBuilding(app.building){a.building=true;}
         ~BuildGuard(){a.building=wasBuilding;if(!wasBuilding){if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);
+            if(std::exchange(a.deferredWindowState,false))PostMessage(a.controller,kWindowStateChanged,0,0);
             for(HWND source:a.deferredRemovals)PostMessage(a.controller,kWindowGone,reinterpret_cast<WPARAM>(source),0);a.deferredRemovals.clear();
             for(auto event:a.deferredGestures)PostMessage(a.controller,event.message,event.token,event.data);a.deferredGestures.clear();}}
     };
@@ -472,13 +477,18 @@ public:
         App*a=instance;if(!a||a->phase==Phase::Hidden)return;
         if(event==EVENT_SYSTEM_FOREGROUND)PostMessage(a->controller,a->phase==Phase::Closing?kSyncOrder:kDismiss,0,0);
         else if((event==EVENT_OBJECT_DESTROY||event==EVENT_OBJECT_HIDE)&&object==OBJID_WINDOW&&child==0)
-            for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){PostMessage(a->controller,kWindowGone,reinterpret_cast<WPARAM>(hwnd),0);return;}
+            for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){
+                if(event==EVENT_OBJECT_HIDE&&IsWindowVisible(hwnd)&&IsIconic(hwnd))PostMessage(a->controller,kWindowStateChanged,0,0);
+                else PostMessage(a->controller,kWindowGone,reinterpret_cast<WPARAM>(hwnd),0);
+                return;
+            }
     }
-    static void CALLBACK RestoreEvent(HWINEVENTHOOK,DWORD event,HWND hwnd,LONG object,LONG child,DWORD,DWORD){
+    static void CALLBACK WindowStateEvent(HWINEVENTHOOK,DWORD event,HWND hwnd,LONG object,LONG child,DWORD,DWORD){
         App*a=instance;if(!a||a->phase==Phase::Hidden)return;
-        if(event!=EVENT_SYSTEM_MINIMIZEEND&&(object!=OBJID_WINDOW||child!=0))return;
-        for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd&&i.minimized){
-            PostMessage(a->controller,kRestoreGeometry,0,0);return;
+        bool stateEvent=event==EVENT_SYSTEM_MINIMIZESTART||event==EVENT_SYSTEM_MINIMIZEEND;
+        if(!stateEvent&&(object!=OBJID_WINDOW||child!=0))return;
+        for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd&&(stateEvent||i.minimized)){
+            PostMessage(a->controller,kWindowStateChanged,0,0);return;
         }
     }
     bool IsOurWindow(HWND hwnd)const{if(hwnd==controller)return true;for(auto&v:views)if(v->hwnd==hwnd)return true;return false;}
@@ -789,34 +799,46 @@ public:
         double side=CloseSize(v),inset=CloseInset(v);
         return {window.right()-side-inset,window.y+inset,side,side};
     }
-    bool PrepareCloseButton(View&v,Item&i){
-        for(int hot=0;hot<2;++hot){
-            auto&surface=hot?v.closeHot:v.closeNormal;if(surface)continue;
-            UINT size=UINT(std::ceil(CloseSize(v)));HRESULT drawResult=S_OK;
-            HRESULT hr=Paint(surface,size,size,false,[&](ID2D1DeviceContext*ctx){
+    static bool HasMinimizeButton(const Item&i){return i.canMinimize&&!i.minimized;}
+    static float ButtonsWidth(const View&v,const Item&i){return CloseSize(v)+(HasMinimizeButton(i)?CloseSize(v)+6*v.dpi:0);}
+    static Box MinimizeBox(const View&v,const Box&window){auto b=CloseBox(v,window);b.x-=CloseSize(v)+6*v.dpi;return b;}
+    bool PrepareButtons(View&v,Item&i){
+        bool minimize=HasMinimizeButton(i);float width=ButtonsWidth(v,i);
+        // Both controls share the existing visual and cached small surfaces.
+        // No additional per-preview visual or animation layer is needed.
+        for(auto hot:{WindowButton::None,WindowButton::Minimize,WindowButton::Close}){
+            if(!minimize&&hot==WindowButton::Minimize)continue;
+            auto&surface=v.buttonSurfaces[minimize][int(hot)];if(surface)continue;
+            HRESULT drawResult=S_OK;
+            HRESULT hr=Paint(surface,UINT(std::ceil(width)),UINT(std::ceil(CloseSize(v))),false,[&](ID2D1DeviceContext*ctx){
                 ComPtr<ID2D1SolidColorBrush> background,mark;
-                drawResult=ctx->CreateSolidColorBrush(D2D1::ColorF(hot?0xC42B1C:0x292C32,.98f),&background);if(FAILED(drawResult))return;
+                drawResult=ctx->CreateSolidColorBrush(D2D1::ColorF(0x292C32,.98f),&background);if(FAILED(drawResult))return;
                 drawResult=ctx->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF),&mark);if(FAILED(drawResult))return;
                 float mid=CloseSize(v)*.5f,d=4*v.dpi;
                 ctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                ctx->FillEllipse(D2D1::Ellipse(D2D1::Point2F(mid,mid),mid-.5f*v.dpi,mid-.5f*v.dpi),background.Get());
-                ctx->DrawLine(D2D1::Point2F(mid-d,mid-d),D2D1::Point2F(mid+d,mid+d),mark.Get(),1.7f*v.dpi);
-                ctx->DrawLine(D2D1::Point2F(mid-d,mid+d),D2D1::Point2F(mid+d,mid-d),mark.Get(),1.7f*v.dpi);
+                auto circle=[&](float x,UINT32 color){background->SetColor(D2D1::ColorF(color,.98f));ctx->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x,mid),mid-.5f*v.dpi,mid-.5f*v.dpi),background.Get());};
+                float closeX=width-mid;circle(closeX,hot==WindowButton::Close?0xC42B1C:0x292C32);
+                ctx->DrawLine(D2D1::Point2F(closeX-d,mid-d),D2D1::Point2F(closeX+d,mid+d),mark.Get(),1.7f*v.dpi);
+                ctx->DrawLine(D2D1::Point2F(closeX-d,mid+d),D2D1::Point2F(closeX+d,mid-d),mark.Get(),1.7f*v.dpi);
+                if(minimize){circle(mid,hot==WindowButton::Minimize?0x454A54:0x292C32);ctx->DrawLine(D2D1::Point2F(mid-d,mid),D2D1::Point2F(mid+d,mid),mark.Get(),1.7f*v.dpi);}
             });
             if(FAILED(hr)||FAILED(drawResult)){surface.Reset();return false;}
         }
-        i.closeHot=false;return SUCCEEDED(i.closeButton->SetContent(v.closeNormal.Get()));
+        i.hotButton=WindowButton::None;return SUCCEEDED(i.buttons->SetContent(v.buttonSurfaces[minimize][0].Get()));
     }
-    bool IsCloseHit(const View&v,int index,POINT point)const{
-        if(index<0||index>=int(v.items.size()))return false;
-        const auto&i=v.items[index];if(!i.closeAttached||i.source!=selectedSource)return false;
-        Box b=CloseBox(v,CurrentBox(i));return point.x>=b.x&&point.x<b.right()&&point.y>=b.y&&point.y<b.bottom();
+    WindowButton ButtonAt(const View&v,int index,POINT point)const{
+        if(index<0||index>=int(v.items.size()))return WindowButton::None;
+        const auto&i=v.items[index];if(!i.buttonsAttached||i.source!=selectedSource)return WindowButton::None;
+        auto contains=[&](const Box&b){return point.x>=b.x&&point.x<b.right()&&point.y>=b.y&&point.y<b.bottom();};
+        Box window=CurrentBox(i);if(contains(CloseBox(v,window)))return WindowButton::Close;
+        if(HasMinimizeButton(i)&&contains(MinimizeBox(v,window)))return WindowButton::Minimize;
+        return WindowButton::None;
     }
-    void HoverClose(View&v,int index,POINT point){
+    void HoverButtons(View&v,int index,POINT point){
         bool changed=false,hand=false;
-        for(size_t n=0;n<v.items.size();++n){auto&i=v.items[n];bool hot=int(n)==index&&IsCloseHit(v,int(n),point);
-            if(hot)hand=true;if(i.closeHot==hot)continue;i.closeHot=hot;
-            if(i.closeButton)i.closeButton->SetContent(hot?v.closeHot.Get():v.closeNormal.Get());changed=true;
+        for(size_t n=0;n<v.items.size();++n){auto&i=v.items[n];auto hot=int(n)==index?ButtonAt(v,int(n),point):WindowButton::None;
+            if(hot!=WindowButton::None)hand=true;if(i.hotButton==hot)continue;i.hotButton=hot;
+            if(i.buttons)i.buttons->SetContent(v.buttonSurfaces[HasMinimizeButton(i)][int(hot)].Get());changed=true;
         }
         SetCursor(LoadCursor(nullptr,hand?IDC_HAND:IDC_ARROW));if(changed)device->Commit();
     }
@@ -826,13 +848,20 @@ public:
         // Let the application handle save prompts and cancellation. Never kill it.
         return PostMessage(i.source,WM_SYSCOMMAND,SC_CLOSE,0)!=FALSE;
     }
+    static bool RequestMinimize(const Item&i){
+        DWORD process=0;GetWindowThreadProcessId(i.source,&process);
+        if(!HasMinimizeButton(i)||!IsWindow(i.source)||IsIconic(i.source)||(i.sourceProcess&&process!=i.sourceProcess))return false;
+        // The source application handles the request; its native state event
+        // moves the retained preview to the shelf after minimization succeeds.
+        return PostMessage(i.source,WM_SYSCOMMAND,SC_MINIMIZE,0)!=FALSE;
+    }
     void RemoveWindowFromOverview(HWND source){
         if(building){if(std::find(deferredRemovals.begin(),deferredRemovals.end(),source)==deferredRemovals.end())deferredRemovals.push_back(source);return;}
         if(phase==Phase::Hidden)return;
         if(phase==Phase::Closing){End(false);return;}
         bool found=false;for(auto&v:views)for(auto&i:v->items)if(i.source==source)found=true;
         if(!found)return;
-        CaptureMotion();ClearSelection();if(pressedClose==source)pressedClose=nullptr;
+        CaptureMotion();ClearSelection();if(pressedButtonSource==source){pressedButtonSource=nullptr;pressedButton=WindowButton::None;}
         BuildGuard guard(*this);size_t remaining=0;
         for(auto&v:views){
             for(auto&i:v->items)if(i.source==source)v->windows->RemoveVisual(i.position.Get());
@@ -920,6 +949,7 @@ public:
     float ExitRadius(const View&v,const Item&i)const{return i.minimized&&i.source!=chosen?HiddenRadius(v,i):i.nativeRadius;}
     static void ActivateWindow(HWND target,bool restoreMinimized){
         if(!IsWindow(target))return;
+        if(!restoreMinimized&&IsIconic(target))return;
         if(restoreMinimized&&IsIconic(target)){
             WINDOWPLACEMENT placement{sizeof(placement)};int show=SW_RESTORE;
             if(GetWindowPlacement(target,&placement)&&(placement.flags&WPF_RESTORETOMAXIMIZED))show=SW_SHOWMAXIMIZED;
@@ -1029,7 +1059,7 @@ public:
         if(SUCCEEDED(hr))hr=device->CreateRectangleClip(&i.clip);
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.border);
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.borderFill);
-        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.closeButton);
+        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.buttons);
         if(SUCCEEDED(hr))hr=device->CreateScaleTransform(&i.borderScale);
         if(SUCCEEDED(hr))hr=device->CreateEffectGroup(&i.borderEffect);
         if(SUCCEEDED(hr))hr=i.content->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
@@ -1043,7 +1073,7 @@ public:
         i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);
         i.border->SetOffsetX(-i.Outset());i.border->SetOffsetY(-i.Outset());
         i.borderEffect->SetOpacity(0.f);i.border->SetEffect(i.borderEffect.Get());
-        i.closeButton->SetOffsetY(CloseInset(v));
+        i.buttons->SetOffsetY(CloseInset(v));i.canMinimize=(GetWindowLongPtr(i.source,GWL_STYLE)&WS_MINIMIZEBOX)!=0;
         i.nativeRadius=SystemCornerRadius(i.source,v.dpi);
         i.clip->SetLeft(0.f);i.clip->SetTop(0.f);
         return true;
@@ -1087,7 +1117,7 @@ public:
         if(focus){SetForegroundWindow(focus);SetFocus(focus);}
         foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT);
         destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
-        restoreStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND,EVENT_SYSTEM_MINIMIZEEND,nullptr,RestoreEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+        windowStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         building=false;Animate(1);return true;
     }
     template<class Setter> void Property(double a,double b,Setter setter){
@@ -1113,7 +1143,7 @@ public:
             i.scale->SetScaleX(float(b.w/i.pixels.cx));i.scale->SetScaleY(float(b.h/i.pixels.cy));
             i.clip->SetRight(float(b.w));i.clip->SetBottom(float(b.h));
             i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight);
-            if(i.closeButton)i.closeButton->SetOffsetX(float(b.w)-CloseSize(*v)-CloseInset(*v));
+            if(i.buttons)i.buttons->SetOffsetX(float(b.w)-ButtonsWidth(*v,i)-CloseInset(*v));
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h-v->dpi));i.labelEffect->SetOpacity(float(p));}
             float radius=float(ExitRadius(*v,i)+(OverviewRadius(*v,i.target)-ExitRadius(*v,i))*p);
             SetCorners(i,radius);i.radiusFrom=i.radiusTo=radius;i.motionFrom=i.motionTo=b;
@@ -1154,7 +1184,7 @@ public:
             Property(i.radiusFrom,i.radiusTo,[&](auto value){SetCorners(i,value);});
             Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
             Property((a.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
-            if(i.closeButton)Property(a.w-CloseSize(*v)-CloseInset(*v),b.w-CloseSize(*v)-CloseInset(*v),[&](auto value){i.closeButton->SetOffsetX(value);});
+            if(i.buttons)Property(a.w-ButtonsWidth(*v,i)-CloseInset(*v),b.w-ButtonsWidth(*v,i)-CloseInset(*v),[&](auto value){i.buttons->SetOffsetX(value);});
             if(i.label){
                 Property((a.w-i.target.w)*.5,(b.w-i.target.w)*.5,[&](auto value){i.label->SetOffsetX(value);});
                 Property(a.h-v->dpi,b.h-v->dpi,[&](auto value){i.label->SetOffsetY(value);});
@@ -1232,14 +1262,19 @@ public:
         }
         return rebound;
     }
-    bool ReconcileRestoredWindows(bool captured=false){
+    bool ReconcileWindowStates(bool captured=false){
         bool changed=false;
-        for(auto&v:views)for(auto&i:v->items)if(i.minimized&&IsWindow(i.source)&&!IsIconic(i.source)){
+        for(auto&v:views)for(auto&i:v->items)if(IsWindow(i.source)&&i.minimized!=(IsIconic(i.source)!=FALSE)){
+            bool minimized=IsIconic(i.source)!=FALSE;
             RECT r{};if(!Bounds(i.source,r))continue;
             if(!changed&&!captured){progress=CurrentProgress();CaptureMotion();}
-            changed=true;RebindRestoredSample(*v,i,r);
-            i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
-            i.nativeRadius=SystemCornerRadius(i.source,v->dpi);i.minimized=false;
+            changed=true;
+            if(!minimized){
+                RebindRestoredSample(*v,i,r);
+                i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+                i.nativeRadius=SystemCornerRadius(i.source,v->dpi);
+            }else i.restoredSampleValid=false;
+            i.minimized=minimized;
         }
         if(!changed)return false;
         if(restoreSource&&!IsIconic(restoreSource)){
@@ -1256,7 +1291,7 @@ public:
         FollowNativeZOrder();Animate(1,true,true);return true;
     }
     void RefreshRestoredGeometry(bool animate=true){
-        if(phase==Phase::Opening||phase==Phase::Settled){ReconcileRestoredWindows();return;}
+        if(phase==Phase::Opening||phase==Phase::Settled){ReconcileWindowStates();return;}
         if(phase!=Phase::Closing||!chosen||IsIconic(chosen))return;
         for(auto&v:views)for(auto&i:v->items)if(i.source==chosen&&i.minimized){
             RECT r{};if(!Bounds(i.source,r))return;
@@ -1286,7 +1321,7 @@ public:
                 i.nativeRadius=GetWindowPlacement(i.source,&placement)&&(placement.flags&WPF_RESTORETOMAXIMIZED)?0.f:SystemCornerRadius(i.source,v->dpi);
                 DWORD pid=0,tid=GetWindowThreadProcessId(i.source,&pid);
                 restoreSource=i.source;
-                restoreHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,RestoreEvent,pid,tid,WINEVENT_OUTOFCONTEXT);
+                restoreHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,WindowStateEvent,pid,tid,WINEVENT_OUTOFCONTEXT);
             }
         }
         ClearSelection();
@@ -1304,7 +1339,7 @@ public:
         // Native focus transfer can take time. Sample geometry and progress
         // together afterwards, then continue from that pose without resetting it.
         progress=CurrentProgress();CaptureMotion();
-        if(!ReconcileRestoredWindows(true))Animate(1,true);
+        if(!ReconcileWindowStates(true))Animate(1,true);
     }
     void End(bool restore,bool idle=true){
         ResetGesture();RemoveProp(controller,kOverviewProperty);
@@ -1315,7 +1350,7 @@ public:
         if(foregroundHook){UnhookWinEvent(foregroundHook);foregroundHook=nullptr;}
         if(destroyHook){UnhookWinEvent(destroyHook);destroyHook=nullptr;}
         if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}
-        if(restoreStateHook){UnhookWinEvent(restoreStateHook);restoreStateHook=nullptr;}restoreSource=nullptr;
+        if(windowStateHook){UnhookWinEvent(windowStateHook);windowStateHook=nullptr;}restoreSource=nullptr;
         HWND target=chosen?chosen:previous;
         if(restore)ActivateWindow(target,chosen!=nullptr);
         if(visible&&device){
@@ -1335,7 +1370,7 @@ public:
         // Shared visuals own their private thumbnail references. Release visual
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
-        views.clear();previous=chosen=selectedSource=pressedClose=nullptr;progress=0;
+        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;progress=0;
         if(device)device->Commit(); // Submit the filter-input detachments from Item destruction.
         if(idle&&timer&&device){
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
@@ -1420,7 +1455,7 @@ public:
     void ClearSelection(){
         selectedSource=nullptr;for(auto&v:views){v->selected=-1;for(auto&i:v->items){
             if(i.borderAttached){i.position->RemoveVisual(i.border.Get());i.borderAttached=false;i.borderEffect->SetOpacity(0.f);}
-            if(i.closeAttached){i.position->RemoveVisual(i.closeButton.Get());i.closeAttached=false;i.closeHot=false;}
+            if(i.buttonsAttached){i.position->RemoveVisual(i.buttons.Get());i.buttonsAttached=false;i.hotButton=WindowButton::None;}
         }}
     }
     void Select(HWND source){
@@ -1429,9 +1464,9 @@ public:
         selectedSource=source;
         for(auto&v:views)for(size_t n=0;n<v->items.size();++n){auto&i=v->items[n];if(i.source!=source)continue;
             if((!i.borderSurface||i.borderColor!=accentColor)&&!CreateOutline(*v,i)){End(false);return;}
-            if(!PrepareCloseButton(*v,i)){End(false);return;}
+            if(!PrepareButtons(*v,i)){End(false);return;}
             i.position->AddVisual(i.border.Get(),FALSE,i.label?i.label.Get():i.content.Get());i.borderAttached=true;i.borderEffect->SetOpacity(1.f);v->selected=int(n);
-            i.position->AddVisual(i.closeButton.Get(),FALSE,nullptr);i.closeAttached=true;
+            i.position->AddVisual(i.buttons.Get(),FALSE,nullptr);i.buttonsAttached=true;
         }
         device->Commit();
     }
@@ -1460,6 +1495,7 @@ public:
         if(msg==WM_NCCREATE){auto cs=reinterpret_cast<CREATESTRUCT*>(lp);if(cs->lpCreateParams)SetWindowLongPtr(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(cs->lpCreateParams));}
         auto v=reinterpret_cast<View*>(GetWindowLongPtr(hwnd,GWLP_USERDATA));
         if(building){
+            if(msg==kWindowStateChanged){deferredWindowState=true;return 0;}
             if(msg>=kGestureBegin&&msg<=kGestureCancel){
                 if(msg==kGestureUpdate&&!deferredGestures.empty()&&deferredGestures.back().message==msg&&deferredGestures.back().token==wp)deferredGestures.back().data=lp;
                 else if(deferredGestures.size()<32)deferredGestures.push_back({msg,wp,lp});
@@ -1492,7 +1528,7 @@ public:
         case kReleaseInactive:ReleaseInactiveGraphics();return 0;
         case kWindowGone:RemoveWindowFromOverview(reinterpret_cast<HWND>(wp));return 0;
         case kWarmup:Warmup();return 0;
-        case kRestoreGeometry:RefreshRestoredGeometry();return 0;
+        case kWindowStateChanged:RefreshRestoredGeometry();return 0;
         case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){RefreshRestoredGeometry();FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
         case kAccentChanged:case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
@@ -1503,15 +1539,15 @@ public:
         case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);if(!building&&d3d&&FAILED(d3d->GetDeviceRemovedReason())){End(false,false);ReleaseDevice();PostMessage(controller,kWarmup,0,0);}return 0;}
         case WM_MOUSEMOVE:if(!gestureToken&&v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)},screen=point;ClientToScreen(hwnd,&screen);lastPointer=screen;
             int i=Hit(*v,point);HWND hover=i>=0?v->items[i].source:nullptr;if(selectedSource!=hover)Select(hover);
-            if(phase!=Phase::Hidden)HoverClose(*v,i,point);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
+            if(phase!=Phase::Hidden)HoverButtons(*v,i,point);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
         case WM_MOUSELEAVE:if(!gestureToken&&v&&v->selected>=0)Select(nullptr);return 0;
         case WM_LBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
-            if(IsCloseHit(*v,i,point)){pressedClose=v->items[i].source;SetCapture(hwnd);}}return 0;
+            auto button=ButtonAt(*v,i,point);if(button!=WindowButton::None){pressedButtonSource=v->items[i].source;pressedButton=button;SetCapture(hwnd);}}return 0;
         case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
-            HWND pressed=std::exchange(pressedClose,nullptr);if(GetCapture()==hwnd)ReleaseCapture();
-            if(pressed){if(i>=0&&v->items[i].source==pressed&&IsCloseHit(*v,i,point))RequestClose(v->items[i]);}
-            else Close(i<0?nullptr:v->items[i].source);}return 0;
-        case WM_CAPTURECHANGED:pressedClose=nullptr;return 0;
+            HWND pressed=std::exchange(pressedButtonSource,nullptr);auto button=std::exchange(pressedButton,WindowButton::None);if(GetCapture()==hwnd)ReleaseCapture();
+            if(pressed){if(i>=0&&v->items[i].source==pressed&&ButtonAt(*v,i,point)==button){if(button==WindowButton::Close)RequestClose(v->items[i]);else if(button==WindowButton::Minimize)RequestMinimize(v->items[i]);}}
+            else if(ButtonAt(*v,i,point)==WindowButton::None)Close(i<0?nullptr:v->items[i].source);}return 0;
+        case WM_CAPTURECHANGED:pressedButtonSource=nullptr;pressedButton=WindowButton::None;return 0;
         case WM_RBUTTONUP:Close(nullptr);return 0;
         case WM_SYSKEYDOWN:case WM_KEYDOWN:
             if(wp==VK_ESCAPE){Close(nullptr);return 0;}

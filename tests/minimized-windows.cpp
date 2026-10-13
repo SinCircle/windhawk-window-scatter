@@ -9,6 +9,8 @@ HWND fixtures[6]{};
 std::wstring FixtureTitle(DWORD id,int n){return L"Window Scatter fixture "+std::to_wstring(id)+L" / "+std::to_wstring(n);}
 LRESULT CALLBACK FixtureProc(HWND w,UINT m,WPARAM p,LPARAM l){
     if(m==WM_GETICON)SetProp(w,L"IconQueries",reinterpret_cast<HANDLE>(reinterpret_cast<UINT_PTR>(GetProp(w,L"IconQueries"))+1));
+    if(m==WM_SYSCOMMAND&&(p&0xFFF0)==SC_CLOSE){SetProp(w,L"CloseRequests",reinterpret_cast<HANDLE>(reinterpret_cast<UINT_PTR>(GetProp(w,L"CloseRequests"))+1));return 0;}
+    if(m==WM_SYSCOMMAND&&(p&0xFFF0)==SC_MINIMIZE&&GetProp(w,L"RejectMinimize"))return 0;
     if(m==WM_PAINT){
         PAINTSTRUCT ps;HDC dc=BeginPaint(w,&ps);RECT r;GetClientRect(w,&r);FillRect(dc,&r,(HBRUSH)GetStockObject(WHITE_BRUSH));
         HBRUSH red=CreateSolidBrush(RGB(255,0,0)),blue=CreateSolidBrush(RGB(0,0,255));RECT left=r,right=r;left.right=left.left+24;right.left=right.right-24;
@@ -89,7 +91,7 @@ int wmain(int argc,wchar_t**argv){
     Check(v.items[1].original.w==800&&v.items[1].original.h==450&&std::abs(v.items[1].original.x)<2000,"layout uses saved restore bounds instead of iconic coordinates");
     RECT maximized{};App::Bounds(child.Window(2),maximized);Check(EqualRect(&maximized,&monitor.rcWork),"maximized-before-minimize uses the monitor work area");
     if(!app.CreateView(v))return 4;
-    app.restoreStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND,EVENT_SYSTEM_MINIMIZEEND,nullptr,App::RestoreEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+    app.windowStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND,nullptr,App::WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
     ComPtr<IDCompositionSurface> bg;ComPtr<IDCompositionVisual2> bgv;app.Paint(bg,960,740,true,[](ID2D1DeviceContext*c){c->Clear(D2D1::ColorF(0x202329));});app.device->CreateVisual(&bgv);bgv->SetContent(bg.Get());v.root->AddVisual(bgv.Get(),FALSE,v.windows.Get());
     // Exercise both failure paths with known child windows, without screen capture.
     failSize=child.Window(3);failThumb=child.Window(2);
@@ -141,6 +143,29 @@ int wmain(int argc,wchar_t**argv){
         app.device->Commit();app.device->WaitForCommitCompletion();DwmFlush();Sleep(120);
         Capture(v,(std::wstring(argv[2])+L".selected.bmp").c_str());app.ClearSelection();
     }
+    // Exercise the actual press/release handlers and native state notifications.
+    auto&ordinary=v.items[0];Box savedOriginal=ordinary.original;app.settings.duration=300;app.Select(child.Window(0));
+    Box minimizeBox=App::MinimizeBox(v,ordinary.target),closeBox=App::CloseBox(v,ordinary.target);
+    POINT minimizePoint{LONG(minimizeBox.cx()),LONG(minimizeBox.cy())},closePoint{LONG(closeBox.cx()),LONG(closeBox.cy())};
+    auto mouse=[&](UINT message,POINT p){app.Message(v.hwnd,message,0,MAKELPARAM(p.x,p.y));};
+    Check(app.ButtonAt(v,0,minimizePoint)==WindowButton::Minimize&&app.ButtonAt(v,0,closePoint)==WindowButton::Close&&minimizeBox.right()<closeBox.x,"minimize is a separate button directly left of close");
+    app.HoverButtons(v,0,minimizePoint);Check(ordinary.hotButton==WindowButton::Minimize,"minimize has its own hover state");
+    if(argc>2&&!wcscmp(argv[1],L"--capture")){app.device->Commit();app.device->WaitForCommitCompletion();DwmFlush();Sleep(120);Capture(v,(std::wstring(argv[2])+L".buttons.bmp").c_str());}
+    mouse(WM_LBUTTONDOWN,minimizePoint);mouse(WM_LBUTTONUP,closePoint);Pump(60);
+    Check(!IsIconic(child.Window(0))&&!GetProp(child.Window(0),L"CloseRequests")&&app.phase==Phase::Settled,"dragging from minimize onto close cancels both actions and keeps overview open");
+    SetProp(child.Window(0),L"RejectMinimize",reinterpret_cast<HANDLE>(1));mouse(WM_LBUTTONDOWN,minimizePoint);mouse(WM_LBUTTONUP,minimizePoint);Pump(80);
+    Check(!ordinary.minimized&&!IsIconic(child.Window(0))&&app.phase==Phase::Settled,"an application that ignores minimize remains in the main layout");RemoveProp(child.Window(0),L"RejectMinimize");
+    Box beforeMinimize=ordinary.target;mouse(WM_LBUTTONDOWN,minimizePoint);mouse(WM_LBUTTONUP,minimizePoint);Pump(100);
+    Check(IsIconic(child.Window(0))&&ordinary.minimized&&app.phase==Phase::Opening&&!app.chosen,"clicking minimize changes native state and keeps overview open");
+    Check(std::abs(ordinary.motionFrom.x-beforeMinimize.x)<.1&&std::abs(ordinary.motionFrom.y-beforeMinimize.y)<.1&&ordinary.target.y>beforeMinimize.y&&ordinary.target.h<=90*v.dpi,"the minimized preview animates continuously from the main area into the bottom row");
+    Pump(350);app.FinishTransition();app.device->WaitForCommitCompletion();DwmFlush();Sleep(100);
+    COLORREF minimizedLeft=Pixel(v,LONG(ordinary.target.x)+2,LONG(ordinary.target.cy())),minimizedRight=Pixel(v,LONG(ordinary.target.right())-3,LONG(ordinary.target.cy()));
+    Check(GetBValue(minimizedLeft)>GetRValue(minimizedLeft)+70&&GetRValue(minimizedRight)>GetBValue(minimizedRight)+70,"minimizing a live preview retains both complete colored edges");
+    app.Select(child.Window(0));Check(!App::HasMinimizeButton(ordinary)&&!App::RequestMinimize(ordinary),"already-minimized previews do not expose or repeat the minimize action");
+    closeBox=App::CloseBox(v,ordinary.target);closePoint={LONG(closeBox.cx()),LONG(closeBox.cy())};mouse(WM_LBUTTONDOWN,closePoint);mouse(WM_LBUTTONUP,closePoint);Pump(60);
+    Check(reinterpret_cast<UINT_PTR>(GetProp(child.Window(0),L"CloseRequests"))==1&&IsIconic(child.Window(0)),"the adjacent close button still sends exactly one native close request");
+    ShowWindowAsync(child.Window(0),SW_RESTORE);Pump(400);app.FinishTransition();app.ClearSelection();
+    Check(!ordinary.minimized&&App::HasMinimizeButton(ordinary),"restoring a window returns it to the main area with the minimize control available again");ordinary.original=savedOriginal;
     app.phase=Phase::Hidden;app.progress=0;app.previous=child.Window(0);app.settings.duration=700;app.StaticPose(0);app.Animate(1);Sleep(160);
     Box opening=app.CurrentBox(v.items[1]);
     Check(opening.w>hidden.w&&opening.w<v.items[1].target.w&&opening.y>v.items[1].target.y&&opening.y<hidden.y,"opening slides upwards with only subtle scaling");

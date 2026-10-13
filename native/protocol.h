@@ -7,7 +7,7 @@
 #include <cstdint>
 
 namespace native {
-inline constexpr wchar_t kVersion[]=L"0.5.2";
+inline constexpr wchar_t kVersion[]=L"0.5.3";
 inline constexpr wchar_t kManagerClass[]=L"WindowScatter.Settings.v1";
 inline constexpr wchar_t kInstanceMutex[]=L"Local\\WindowScatter.Standalone.v1";
 inline constexpr wchar_t kBridgeClass[]=L"WindowScatter.NativeHost.v1";
