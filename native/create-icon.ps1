@@ -22,12 +22,14 @@ foreach ($size in @(16,24,32,48,64,128,256)) {
     $background = New-RoundedPath 5 5 118 118 28
     $blue = [Drawing.Drawing2D.LinearGradientBrush]::new([Drawing.Point]::new(0,0),[Drawing.Point]::new(0,128),[Drawing.Color]::FromArgb(32,149,251),[Drawing.Color]::FromArgb(0,95,211))
     $graphics.FillPath($blue,$background)
-    $back = New-RoundedPath 24 30 57 45 7
+    # Both window shapes use equal dimensions. Including the rear stroke,
+    # their union is (26,32)-(102,96), exactly centered on the 128-DIP tile.
+    $back = New-RoundedPath 28 34 52 40 7
     $glass = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(40,255,255,255))
     $stroke = [Drawing.Pen]::new([Drawing.Color]::FromArgb(245,255,255,255),4)
     $graphics.FillPath($glass,$back)
     $graphics.DrawPath($stroke,$back)
-    $front = New-RoundedPath 47 51 53 43 7
+    $front = New-RoundedPath 50 56 52 40 7
     $white = [Drawing.SolidBrush]::new([Drawing.Color]::White)
     $graphics.FillPath($white,$front)
     $stream = [IO.MemoryStream]::new()

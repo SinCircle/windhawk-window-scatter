@@ -26,9 +26,10 @@ void Text(Graphics&g,const wchar_t*text,COLORREF color,float size,RectF rect,boo
 }
 void AppMark(Graphics&g,float x,float y,float size,COLORREF accent){
     FillRounded(g,accent,x,y,size,size,size*.25f);
-    Pen pen(Color(245,255,255,255),size*.042f);SolidBrush glass(Color(42,255,255,255));
-    auto back=Rounded(x+size*.19f,y+size*.23f,size*.47f,size*.38f,size*.06f);g.FillPath(&glass,back.get());g.DrawPath(&pen,back.get());
-    auto front=Rounded(x+size*.36f,y+size*.40f,size*.44f,size*.35f,size*.06f);SolidBrush fill(Color(255,255,255,255));g.FillPath(&fill,front.get());
+    float unit=size/118.f;
+    Pen pen(Color(245,255,255,255),4*unit);SolidBrush glass(Color(40,255,255,255));
+    auto back=Rounded(x+23*unit,y+29*unit,52*unit,40*unit,7*unit);g.FillPath(&glass,back.get());g.DrawPath(&pen,back.get());
+    auto front=Rounded(x+45*unit,y+51*unit,52*unit,40*unit,7*unit);SolidBrush fill(Color(255,255,255,255));g.FillPath(&fill,front.get());
 }
 void AccessibleName(HWND hwnd,const wchar_t*name){
     IAccPropServices*service=nullptr;
@@ -40,7 +41,9 @@ void AccessibleName(HWND hwnd,const wchar_t*name){
 bool SettingsWindow::Create(HINSTANCE handle,const Preferences&values,WindowCallbacks actions){
     instance=handle;preferences=values;callbacks=std::move(actions);
     WNDCLASSEX wc{sizeof(wc)};wc.hInstance=instance;wc.lpfnWndProc=Procedure;wc.lpszClassName=kManagerClass;
-    wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hIcon=LoadIcon(instance,MAKEINTRESOURCE(101));wc.hIconSm=wc.hIcon;
+    wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
+    wc.hIcon=reinterpret_cast<HICON>(LoadImage(instance,MAKEINTRESOURCE(101),IMAGE_ICON,GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON),LR_SHARED));
+    wc.hIconSm=reinterpret_cast<HICON>(LoadImage(instance,MAKEINTRESOURCE(101),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_SHARED));
     if(!RegisterClassEx(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return false;
     hwnd=CreateWindowEx(WS_EX_APPWINDOW,kManagerClass,L"Window Scatter 设置",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN,
                         CW_USEDEFAULT,CW_USEDEFAULT,780,620,nullptr,nullptr,instance,this);

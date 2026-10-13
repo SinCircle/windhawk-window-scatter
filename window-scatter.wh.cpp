@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.6
+// @version         0.4.7
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -28,10 +28,12 @@ No tray icon is created. Window titles are shown, with a system-accent
 selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
-Windows use one common scale per monitor, preserving their relative dimensions.
+Ordinary windows use one common scale per monitor, preserving their relative dimensions.
 The layout compares compact horizontal and vertical stacks, centers each smaller
-window inside its actual group, and centers the entire arrangement. All windows
-share one scale. Size, compactness, visual balance and the original left/right
+window inside its actual group, and centers the entire arrangement. Minimized
+previews have a separate bottom-center shelf and slide from below the display
+with a subtle 94%-100% scale change, retaining their colors and opacity.
+Size, compactness, visual balance and the original left/right
 and top/bottom relationships determine the arrangement. There are no equal-sized cells.
 
 DirectComposition renders complete live window surfaces with their native corners,
@@ -57,6 +59,11 @@ No corner texture or filter-effect graph is used. The eight clip radius properti
 share one compositor animation per distinct radius transition, submitted once.
 The outline follows the same circular corners at a constant 4 DIP gap and tracks
 the Windows accent color.
+Minimized windows remain selectable using DWM's retained surface at full source
+opacity, in smaller tiles with a minimized label. They expand from the taskbar edge;
+selecting one restores
+its previous normal/maximized state. Opening or canceling never restores them.
+If no retained surface is available, one small shared placeholder supplies a card.
 Only a hovered window allocates an outline; inactive outlines are detached.
 Explorer's Task View request is redirected to the dedicated renderer. The system
 recognizes Win+Tab and the configured three-finger upward swipe. There is no
@@ -78,7 +85,7 @@ native show/hide transitions disabled; DirectComposition owns the animation.
 Requires Windows 11 and the private DWM shared-visual entry points (147,162).
 They are checked at runtime; API failures abort the overview without changing
 source windows. Windows updates can require adaptation. Protected surfaces may
-be unavailable. Minimized windows and virtual-desktop management are out of scope.
+be unavailable. Virtual-desktop management is out of scope.
 
 Shared-visual API research: ADeltaX
 https://gist.github.com/ADeltaX/aea6aac248604d0cb7d423a61b06e247
@@ -140,6 +147,7 @@ constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
 constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8,kShellTaskView=WM_APP+10,kAccentChanged=WM_APP+11,kWindowGone=WM_APP+12,kNativeConsumed=WM_APP+13,kShow=WM_APP+14;
 constexpr UINT kGestureBegin=WM_APP+15,kGestureUpdate=WM_APP+16,kGestureEnd=WM_APP+17,kGestureCancel=WM_APP+18;
+constexpr UINT kRestoreGeometry=WM_APP+19;
 constexpr ULONG_PTR kInputMarker=0x57534354;
 constexpr wchar_t kShellReadyProperty[]=L"WindowScatter.ShellReady.v4";
 constexpr wchar_t kNativeBypassProperty[]=L"WindowScatter.NativeTaskView.v4";
@@ -342,10 +350,14 @@ struct Item {
         return *this;
     }
     HWND source=nullptr;DWORD sourceProcess=0;
-    Box original,target;
+    bool minimized=false,iconQueried=false;
+    ComPtr<IWICBitmap> iconBitmap;
+    Box original,target,minimizedOrigin;
     Box motionFrom,motionTo;
     float radiusFrom=0,radiusTo=0;
     SIZE pixels{};
+    RECT restoredSample{};
+    bool restoredSampleValid=false;
     float nativeRadius=0;
     HTHUMBNAIL thumbnail=nullptr;
     ComPtr<IDCompositionVisual2> surface,position,content,border,borderFill,label,closeButton;
@@ -355,6 +367,7 @@ struct Item {
     ComPtr<IDCompositionSurface> labelSurface,borderSurface;
     UINT32 borderColor=0;bool borderAttached=false,closeAttached=false,closeHot=false;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
+    float titleLeft=0,titleRight=0,titleHeight=0;
     float Outset()const{return stroke+gap;}
 };
 struct View {
@@ -379,7 +392,7 @@ public:
     HWND controller=nullptr;HANDLE timer=nullptr,lowMemoryEvent=nullptr;
     ComPtr<ABI::Windows::UI::ViewManagement::IUISettings3> uiSettings;
     EventRegistrationToken accentToken{};bool accentSubscribed=false;
-    HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr;
+    HWINEVENTHOOK foregroundHook=nullptr,destroyHook=nullptr,restoreHook=nullptr,restoreStateHook=nullptr;
     ComPtr<IVirtualDesktopManager> desktops;
     ComPtr<ID3D11Device> d3d;
     ComPtr<IDXGIDevice> dxgi;
@@ -387,6 +400,7 @@ public:
     ComPtr<ID2D1Factory1> d2dFactory;
     ComPtr<ID2D1Device> d2dDevice;
     ComPtr<IDCompositionSurfaceFactory> surfaceFactory;
+    ComPtr<IDCompositionSurface> minimizedPlaceholder;
     UINT32 accentColor=0x0078D4;bool accentValid=false;
     ComPtr<IDWriteFactory> textFactory;
     ComPtr<IWICImagingFactory> imageFactory;
@@ -394,7 +408,7 @@ public:
     PrivateDwm api;
     std::vector<std::unique_ptr<View>> views;
     Settings settings;Phase phase=Phase::Hidden;
-    HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedClose=nullptr;
+    HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedClose=nullptr,restoreSource=nullptr;
     POINT lastPointer{};
     UINT gestureToken=0;
     double gestureOriginX=0,gestureOriginY=0,gestureWidth=1,gestureHeight=1;
@@ -460,6 +474,13 @@ public:
         else if((event==EVENT_OBJECT_DESTROY||event==EVENT_OBJECT_HIDE)&&object==OBJID_WINDOW&&child==0)
             for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){PostMessage(a->controller,kWindowGone,reinterpret_cast<WPARAM>(hwnd),0);return;}
     }
+    static void CALLBACK RestoreEvent(HWINEVENTHOOK,DWORD event,HWND hwnd,LONG object,LONG child,DWORD,DWORD){
+        App*a=instance;if(!a||a->phase==Phase::Hidden)return;
+        if(event!=EVENT_SYSTEM_MINIMIZEEND&&(object!=OBJID_WINDOW||child!=0))return;
+        for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd&&i.minimized){
+            PostMessage(a->controller,kRestoreGeometry,0,0);return;
+        }
+    }
     bool IsOurWindow(HWND hwnd)const{if(hwnd==controller)return true;for(auto&v:views)if(v->hwnd==hwnd)return true;return false;}
     bool Initialize(){
         QueryPerformanceFrequency(&frequency);SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);LoadSettings();
@@ -497,7 +518,7 @@ public:
     }
     void ReleaseDevice(){
         BuildGuard guard(*this);
-        desktopCache.clear();animations.clear();imageFactory.Reset();textFactory.Reset();
+        desktopCache.clear();animations.clear();minimizedPlaceholder.Reset();imageFactory.Reset();textFactory.Reset();
         surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();
         if(device){HRESULT hr=device->Commit();if(SUCCEEDED(hr))device->WaitForCommitCompletion();}
         device.Reset();dxgi.Reset();d3d.Reset();
@@ -625,6 +646,30 @@ public:
         return (preference==DWMWCP_ROUNDSMALL?4.f:8.f)*dpi;
     }
     static float OverviewRadius(const View&v,const Box&b){return std::min({8.f*v.dpi,float(b.w*.5),float(b.h*.5)});}
+    static float TitleProtrusion(const View&v,const Item&i){return std::max(0.f,i.titleHeight-v.dpi);}
+    static float TitleShoulderRadius(const View&v,const Item&i){
+        float clearance=std::min(i.titleLeft,float(i.target.w)-i.titleRight)-OverviewRadius(v,i.target);
+        return std::max(0.f,std::min({8*v.dpi,clearance,(i.titleHeight-v.dpi)*.5f}));
+    }
+    HRESULT TitleGeometry(const View&v,const Item&i,float x,float y,ComPtr<ID2D1PathGeometry>&path){
+        HRESULT hr=d2dFactory->CreatePathGeometry(&path);ComPtr<ID2D1GeometrySink> sink;
+        if(SUCCEEDED(hr))hr=path->Open(&sink);if(FAILED(hr))return hr;
+        float left=x+i.titleLeft,right=x+i.titleRight,bottom=y+i.titleHeight;
+        float r=std::min({6*v.dpi,(right-left)*.5f,i.titleHeight*.5f});
+        float shoulder=TitleShoulderRadius(v,i),edge=y+v.dpi;
+        // The overlap is hidden behind the preview; the exposed shoulder starts
+        // exactly at its bottom edge and joins it with a tangent circular arc.
+        sink->BeginFigure(D2D1::Point2F(left-shoulder,y),D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(D2D1::Point2F(right+shoulder,y));sink->AddLine(D2D1::Point2F(right+shoulder,edge));
+        if(shoulder>0)sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(right,edge+shoulder),D2D1::SizeF(shoulder,shoulder),0,D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(right,bottom-r));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(right-r,bottom),D2D1::SizeF(r,r),0,D2D1_SWEEP_DIRECTION_CLOCKWISE,D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(left+r,bottom));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(left,bottom-r),D2D1::SizeF(r,r),0,D2D1_SWEEP_DIRECTION_CLOCKWISE,D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(left,edge+shoulder));
+        if(shoulder>0)sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(left-shoulder,edge),D2D1::SizeF(shoulder,shoulder),0,D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,D2D1_ARC_SIZE_SMALL));
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);return sink->Close();
+    }
     template<class Value> static void SetCorners(Item&i,Value radius){
         // Reuse the clip already needed for rectangular bounds. Native rounded
         // clipping needs no bitmap mask, filter inputs or per-frame CPU updates.
@@ -637,11 +682,20 @@ public:
     bool CreateOutline(View&v,Item&i){
         // A hollow premultiplied surface leaves the requested gap transparent.
         // Rasterize once at overview size, then animate its transform on the GPU.
-        i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
+        i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+TitleProtrusion(v,i)+2*i.Outset();
         float o=i.Outset(),w=float(i.target.w),h=float(i.target.h);
         float r=OverviewRadius(v,i.target);
-        ComPtr<ID2D1RoundedRectangleGeometry> path;
-        HRESULT hr=d2dFactory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(D2D1::RectF(o,o,o+w,o+h),r,r),&path);
+        ComPtr<ID2D1RoundedRectangleGeometry> body;ComPtr<ID2D1Geometry> path;
+        HRESULT hr=d2dFactory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(D2D1::RectF(o,o,o+w,o+h),r,r),&body);
+        if(SUCCEEDED(hr))path=body;
+        if(SUCCEEDED(hr)&&i.titleHeight>0&&i.titleRight>i.titleLeft){
+            ComPtr<ID2D1PathGeometry> title,combined;ComPtr<ID2D1GeometrySink> sink;
+            hr=TitleGeometry(v,i,o,o+h-v.dpi,title);
+            if(SUCCEEDED(hr))hr=d2dFactory->CreatePathGeometry(&combined);
+            if(SUCCEEDED(hr))hr=combined->Open(&sink);
+            if(SUCCEEDED(hr))hr=body->CombineWithGeometry(title.Get(),D2D1_COMBINE_MODE_UNION,nullptr,.1f,sink.Get());
+            if(SUCCEEDED(hr))hr=sink->Close();if(SUCCEEDED(hr))path=combined;
+        }
         if(FAILED(hr))return false;
         HRESULT drawResult=S_OK;
         hr=Paint(i.borderSurface,UINT(std::ceil(i.borderWidth)),UINT(std::ceil(i.borderHeight)),false,[&](ID2D1DeviceContext*ctx){
@@ -660,32 +714,73 @@ public:
         if(SUCCEEDED(hr))i.borderColor=accentColor;
         return SUCCEEDED(hr);
     }
+    void PrepareIcon(View&v,Item&i){
+        if(i.iconQueried)return;i.iconQueried=true;
+        // Read an application's icon once per scene, with a bounded wait for
+        // unresponsive windows. Reflow reuses the CPU bitmap, not another visual.
+        HICON icon=nullptr;DWORD_PTR result=0;
+        bool responsive=SendMessageTimeout(i.source,WM_GETICON,ICON_SMALL,LPARAM(std::lround(96*v.dpi)),
+            SMTO_ABORTIFHUNG|SMTO_BLOCK,12,&result)!=0;
+        if(responsive)icon=reinterpret_cast<HICON>(result);
+        if(!icon)icon=reinterpret_cast<HICON>(GetClassLongPtr(i.source,GCLP_HICONSM));
+        if(!icon)icon=reinterpret_cast<HICON>(GetClassLongPtr(i.source,GCLP_HICON));
+        if(!icon&&responsive&&SendMessageTimeout(i.source,WM_GETICON,ICON_BIG,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,12,&result))
+            icon=reinterpret_cast<HICON>(result);
+        if(!icon)return;
+        HICON owned=CopyIcon(icon);if(!owned)return;
+        ComPtr<IWICBitmap> bitmap;HRESULT hr=imageFactory->CreateBitmapFromHICON(owned,&bitmap);DestroyIcon(owned);
+        ComPtr<IWICFormatConverter> converter;
+        if(SUCCEEDED(hr))hr=imageFactory->CreateFormatConverter(&converter);
+        if(SUCCEEDED(hr))hr=converter->Initialize(bitmap.Get(),GUID_WICPixelFormat32bppPBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom);
+        if(SUCCEEDED(hr))imageFactory->CreateBitmapFromSource(converter.Get(),WICBitmapCacheOnLoad,&i.iconBitmap);
+    }
     bool CreateTitle(View&v,Item&i){
+        if(i.minimized){
+            // Slide the whole tile from below its display, with only a subtle
+            // uniform scale change. Keep the off-screen pose at a useful size.
+            constexpr double scale=.94;
+            double y=v.bounds.bottom-v.bounds.top;
+            MONITORINFO monitor{sizeof(monitor)};
+            if(GetMonitorInfo(v.monitor,&monitor))y=std::max(y,double(monitor.rcMonitor.bottom-v.bounds.top));
+            i.minimizedOrigin={i.target.cx()-i.target.w*scale*.5,y+12*v.dpi,i.target.w*scale,i.target.h*scale};
+        }
         // Only the selected preview needs a border surface. Avoid allocating
         // and rasterizing one full-size transparent bitmap for every window.
         i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
         if(i.label)i.position->RemoveVisual(i.label.Get());
-        wchar_t title[512]{};GetWindowText(i.source,title,512);if(!title[0])wcscpy_s(title,L"Window");
-        UINT width=UINT(std::max(1.,std::ceil(i.target.w))),height=UINT(std::ceil(25*v.dpi));
+        wchar_t title[512]{};GetWindowText(i.source,title,480);if(!title[0])wcscpy_s(title,L"Window");
+        PrepareIcon(v,i);
+        UINT width=UINT(std::max(1.,std::ceil(i.target.w))),height=UINT(std::ceil(24*v.dpi));
+        i.titleHeight=float(height);i.titleLeft=i.titleRight=0;
+        i.borderHeight=float(i.target.h)+TitleProtrusion(v,i)+2*i.Outset();
         HRESULT hr=Paint(i.labelSurface,width,height,false,[&](ID2D1DeviceContext*ctx){
             ComPtr<IDWriteTextFormat> format;ComPtr<IDWriteTextLayout> layout;
-            ComPtr<ID2D1SolidColorBrush> textBrush,bgBrush;
+            ComPtr<ID2D1SolidColorBrush> textBrush,bgBrush;ComPtr<ID2D1Bitmap1> icon;
+            if(i.iconBitmap&&width>=48*v.dpi)ctx->CreateBitmapFromWicBitmap(i.iconBitmap.Get(),nullptr,&icon);
+            float iconSize=icon?16*v.dpi:0,iconSpace=icon?iconSize+6*v.dpi:0,padding=8*v.dpi;
+            float inset=std::min(16*v.dpi,float(width)*.2f);
+            float available=std::max(1.f,float(width)-2*(padding+inset)-iconSpace);
             if(FAILED(textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*v.dpi,L"",&format)))return;
-            format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            if(FAILED(textFactory->CreateTextLayout(title,UINT32(wcslen(title)),format.Get(),std::max(1.f,float(width)-16*v.dpi),float(height),&layout)))return;
+            format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            if(FAILED(textFactory->CreateTextLayout(title,UINT32(wcslen(title)),format.Get(),available,float(height),&layout)))return;
             ComPtr<IDWriteInlineObject> ellipsis;textFactory->CreateEllipsisTrimmingSign(format.Get(),&ellipsis);DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};layout->SetTrimming(&trimming,ellipsis.Get());
-            ctx->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF),&textBrush);ctx->CreateSolidColorBrush(D2D1::ColorF(0x16191E,.88f),&bgBrush);
+            ctx->CreateSolidColorBrush(D2D1::ColorF(0x20252B),&textBrush);ctx->CreateSolidColorBrush(D2D1::ColorF(0xF2F4F7),&bgBrush);
             if(!textBrush||!bgBrush)return;
-            DWRITE_TEXT_METRICS metrics{};layout->GetMetrics(&metrics);float half=std::min(float(width)*.5f,metrics.width*.5f+10*v.dpi),mid=float(width)*.5f;
-            ctx->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(mid-half,0,mid+half,float(height)),6*v.dpi,6*v.dpi),bgBrush.Get());
-            ctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);ctx->DrawTextLayout(D2D1::Point2F(8*v.dpi,0),layout.Get(),textBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            DWRITE_TEXT_METRICS metrics{};layout->GetMetrics(&metrics);float groupWidth=std::min(available,metrics.width)+iconSpace;
+            float groupLeft=(float(width)-groupWidth)*.5f,half=std::min(float(width)*.5f-inset,groupWidth*.5f+padding),mid=float(width)*.5f;
+            i.titleLeft=mid-half;i.titleRight=mid+half;
+            ComPtr<ID2D1PathGeometry> titlePath;
+            if(FAILED(TitleGeometry(v,i,0,0,titlePath)))return;
+            ctx->FillGeometry(titlePath.Get(),bgBrush.Get());
+            if(icon){float top=(float(height)-iconSize)*.5f;ctx->DrawBitmap(icon.Get(),D2D1::RectF(groupLeft,top,groupLeft+iconSize,top+iconSize),1.f,D2D1_INTERPOLATION_MODE_LINEAR);}
+            ctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);ctx->DrawTextLayout(D2D1::Point2F(groupLeft+iconSpace,0),layout.Get(),textBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
         });
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.label);
         if(SUCCEEDED(hr))hr=device->CreateEffectGroup(&i.labelEffect);
         if(SUCCEEDED(hr))hr=i.label->SetContent(i.labelSurface.Get());
         if(SUCCEEDED(hr))hr=i.label->SetEffect(i.labelEffect.Get());
-        if(SUCCEEDED(hr))hr=i.position->AddVisual(i.label.Get(),TRUE,i.content.Get());
-        if(SUCCEEDED(hr)){i.label->SetOffsetY(float(i.target.h+i.Outset()+6*v.dpi));i.labelEffect->SetOpacity(0.f);}
+        if(SUCCEEDED(hr))hr=i.position->AddVisual(i.label.Get(),FALSE,i.content.Get());
+        if(SUCCEEDED(hr)){i.label->SetOffsetY(float(i.target.h-v.dpi));i.labelEffect->SetOpacity(0.f);}
         return SUCCEEDED(hr);
     }
     static float CloseSize(const View&v){return 28*v.dpi;}
@@ -743,9 +838,7 @@ public:
             for(auto&i:v->items)if(i.source==source)v->windows->RemoveVisual(i.position.Get());
             std::erase_if(v->items,[&](const Item&i){return i.source==source;});remaining+=v->items.size();
             if(v->items.empty())continue;
-            std::vector<Box> original;for(auto&i:v->items)original.push_back(i.original);
-            double pad=28*v->dpi;Box area{pad,pad,std::max(1.,double(v->bounds.right-v->bounds.left)-2*pad),std::max(1.,double(v->bounds.bottom-v->bounds.top)-2*pad)};
-            auto layout=Layout(original,area,22*v->dpi,40*v->dpi);
+            auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){End(false);return;}
             for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
                 if(!CreateTitle(*v,i)){End(false);return;}
@@ -782,7 +875,58 @@ public:
         auto&a=*reinterpret_cast<App*>(param);MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfo(monitor,&mi))return TRUE;
         auto v=std::make_unique<View>();v->monitor=monitor;v->bounds=mi.rcWork;a.views.push_back(std::move(v));return TRUE;
     }
-    static bool Bounds(HWND hwnd,RECT&r){return SUCCEEDED(DwmGetWindowAttribute(hwnd,DWMWA_EXTENDED_FRAME_BOUNDS,&r,sizeof(r)))||GetWindowRect(hwnd,&r);}
+    static bool Bounds(HWND hwnd,RECT&r){
+        if(!IsIconic(hwnd))return SUCCEEDED(DwmGetWindowAttribute(hwnd,DWMWA_EXTENDED_FRAME_BOUNDS,&r,sizeof(r)))||GetWindowRect(hwnd,&r);
+        // Iconic bounds describe the taskbar icon, sometimes at (-32000,-32000).
+        // Use the saved restore placement only for layout, without restoring it.
+        WINDOWPLACEMENT placement{sizeof(placement)};MONITORINFO monitor{sizeof(monitor)};
+        if(!GetWindowPlacement(hwnd,&placement)||!GetMonitorInfo(MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST),&monitor))return false;
+        r=placement.rcNormalPosition;
+        if(placement.flags&WPF_RESTORETOMAXIMIZED)r=monitor.rcWork;
+        else if(!(GetWindowLongPtr(hwnd,GWL_EXSTYLE)&WS_EX_TOOLWINDOW))
+            OffsetRect(&r,monitor.rcWork.left-monitor.rcMonitor.left,monitor.rcWork.top-monitor.rcMonitor.top);
+        return r.right>r.left&&r.bottom>r.top;
+    }
+    static std::vector<Box> Arrange(const View&v){
+        double pad=28*v.dpi,gap=12*v.dpi,caption=26*v.dpi;
+        Box area{pad,pad,std::max(1.,double(v.bounds.right-v.bounds.left)-2*pad),std::max(1.,double(v.bounds.bottom-v.bounds.top)-2*pad)};
+        std::vector<int> normal,small;std::vector<Box> sources,result(v.items.size());
+        for(size_t n=0;n<v.items.size();++n)(v.items[n].minimized?small:normal).push_back(int(n));
+        if(!small.empty()){
+            // Keep the shelf in one shallow row. Crowding reduces horizontal
+            // gaps first, then uniformly scales tiles; it never adds rows.
+            double height=std::min(90.*v.dpi,std::max(1.,area.h*.3-caption)),totalWidth=0,rowHeight=0;
+            for(int id:small){auto b=v.items[id].original;double scale=std::min({.78,height/b.h,160.*v.dpi/b.w});b.w*=scale;b.h*=scale;result[id]=b;totalWidth+=b.w;}
+            double gaps=double(small.size()-1);
+            if(gaps>0)gap=std::clamp((area.w-totalWidth)/gaps,4.*v.dpi,gap);
+            double scale=std::min(1.,std::max(1.,area.w-gap*gaps)/totalWidth);
+            // Even unusually large counts stay inside the available width.
+            if(gap*gaps>=area.w){gap=area.w/(2*small.size());scale=(area.w-gap*gaps)/totalWidth;}
+            // Keep only a small clearance below the caption's selection outline;
+            // the reclaimed height belongs to the main layout above the shelf.
+            double x=area.cx()-(totalWidth*scale+gap*gaps)*.5,bottom=double(v.bounds.bottom-v.bounds.top)-8*v.dpi-caption;
+            for(int id:small){auto&b=result[id];b.w*=scale;b.h*=scale;b.x=x;b.y=bottom-b.h;x+=b.w+gap;rowHeight=std::max(rowHeight,b.h);}
+            double shelfTop=bottom-rowHeight;
+            area.h=std::max(1.,shelfTop-area.y-24*v.dpi);
+        }
+        for(int id:normal)sources.push_back(v.items[id].original);
+        auto layout=Layout(sources,area,22*v.dpi,caption);if(layout.size()!=normal.size())return {};
+        for(size_t n=0;n<normal.size();++n)result[normal[n]]=layout[n];
+        return result;
+    }
+    static Box HiddenPose(const Item&i){return i.minimized?i.minimizedOrigin:i.original;}
+    static float HiddenRadius(const View&v,const Item&i){return i.minimized?OverviewRadius(v,i.minimizedOrigin):i.nativeRadius;}
+    Box ExitPose(const Item&i)const{return i.minimized&&i.source!=chosen?i.minimizedOrigin:i.original;}
+    float ExitRadius(const View&v,const Item&i)const{return i.minimized&&i.source!=chosen?HiddenRadius(v,i):i.nativeRadius;}
+    static void ActivateWindow(HWND target,bool restoreMinimized){
+        if(!IsWindow(target))return;
+        if(restoreMinimized&&IsIconic(target)){
+            WINDOWPLACEMENT placement{sizeof(placement)};int show=SW_RESTORE;
+            if(GetWindowPlacement(target,&placement)&&(placement.flags&WPF_RESTORETOMAXIMIZED))show=SW_SHOWMAXIMIZED;
+            ShowWindowAsync(target,show);
+        }
+        if(GetForegroundWindow()!=target)SetForegroundWindow(target);
+    }
     static RECT SourceRect(const RECT&outer,const RECT&frame,SIZE source){
         LONG width=frame.right-frame.left,height=frame.bottom-frame.top;
         auto same=[](LONG a,LONG b){return std::abs(a-b)<=1;};
@@ -796,7 +940,7 @@ public:
         return {0,0,source.cx,source.cy};
     }
     static BOOL CALLBACK AddWindow(HWND hwnd,LPARAM param){
-        auto&a=*reinterpret_cast<App*>(param);if(!IsWindowVisible(hwnd)||IsIconic(hwnd))return TRUE;
+        auto&a=*reinterpret_cast<App*>(param);if(!IsWindowVisible(hwnd))return TRUE;
         DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);if(pid==GetCurrentProcessId())return TRUE;
         LONG_PTR ex=GetWindowLongPtr(hwnd,GWL_EXSTYLE);if(ex&(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE))return TRUE;
         if(!(ex&WS_EX_APPWINDOW)){
@@ -810,7 +954,7 @@ public:
         wchar_t cls[256];GetClassName(hwnd,cls,256);if(!wcscmp(cls,L"Progman")||!wcscmp(cls,L"WorkerW")||!wcscmp(cls,L"Shell_TrayWnd"))return TRUE;
         RECT bounds{};if(!Bounds(hwnd,bounds)||bounds.right-bounds.left<32||bounds.bottom-bounds.top<32)return TRUE;
         HMONITOR mon=MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST);
-        for(auto&v:a.views)if(v->monitor==mon){Item i;i.source=hwnd;i.original={double(bounds.left-v->bounds.left),double(bounds.top-v->bounds.top),double(bounds.right-bounds.left),double(bounds.bottom-bounds.top)};v->items.push_back(std::move(i));break;}return TRUE;
+        for(auto&v:a.views)if(v->monitor==mon){Item i;i.source=hwnd;i.minimized=IsIconic(hwnd)!=FALSE;i.original={double(bounds.left-v->bounds.left),double(bounds.top-v->bounds.top),double(bounds.right-bounds.left),double(bounds.bottom-bounds.top)};v->items.push_back(std::move(i));break;}return TRUE;
     }
     bool CreateView(View&v){
         RECT r=v.bounds;
@@ -830,24 +974,52 @@ public:
         if(SUCCEEDED(hr))hr=v.root->AddVisual(v.windows.Get(),TRUE,nullptr);
         if(FAILED(hr)){Log(L"Create view",hr);return false;}return true;
     }
+    HRESULT CreateMinimizedPlaceholder(Item&i){
+        // Rare fallback for applications without a retained DWM surface. One
+        // small shared card keeps every minimized window selectable, with its
+        // actual title below; no window capture or source activation is needed.
+        HRESULT hr=S_OK;
+        if(!minimizedPlaceholder)hr=Paint(minimizedPlaceholder,160,100,false,[](ID2D1DeviceContext*ctx){
+            ctx->Clear(D2D1::ColorF(0x29313D));
+            ComPtr<ID2D1SolidColorBrush> brush;
+            if(SUCCEEDED(ctx->CreateSolidColorBrush(D2D1::ColorF(0xAAB5C4,.8f),&brush))){
+                ctx->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(61,35,99,65),3,3),brush.Get(),1.5f);
+                ctx->DrawLine(D2D1::Point2F(62,43),D2D1::Point2F(98,43),brush.Get(),1.5f);
+                ctx->DrawLine(D2D1::Point2F(75,57),D2D1::Point2F(85,57),brush.Get(),1.5f);
+            }
+        });
+        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.surface);
+        if(SUCCEEDED(hr))hr=i.surface->SetContent(minimizedPlaceholder.Get());
+        i.pixels={160,100};return hr;
+    }
     bool CreateItem(View&v,Item&i){
         GetWindowThreadProcessId(i.source,&i.sourceProcess);
+        i.minimized=IsIconic(i.source)!=FALSE;
         HRESULT hr=api.querySize(i.source,FALSE,&i.pixels);
-        if(FAILED(hr)||i.pixels.cx<=0||i.pixels.cy<=0)return false;
+        bool validSize=SUCCEEDED(hr)&&i.pixels.cx>0&&i.pixels.cy>0;
+        if(!validSize&&!i.minimized)return false;
         DWM_THUMBNAIL_PROPERTIES p{};
         p.dwFlags=DWM_TNP_VISIBLE|DWM_TNP_OPACITY|DWM_TNP_SOURCECLIENTAREAONLY|DWM_TNP_RECTDESTINATION|DWM_TNP_RECTSOURCE|0x04000000;
+        // DWM already knows the retained surface's visible frame. Current iconic
+        // window coordinates cannot crop that old surface without cutting edges.
+        if(i.minimized)p.dwFlags&=~DWM_TNP_RECTSOURCE;
         p.fVisible=TRUE;p.opacity=255;p.fSourceClientAreaOnly=FALSE;
         // DWM preserves per-pixel alpha and color keys, but the explicit
         // thumbnail opacity replaces a layered source's whole-window alpha.
         COLORREF key=0;BYTE alpha=255;DWORD flags=0;
         if(GetLayeredWindowAttributes(i.source,&key,&alpha,&flags)&&(flags&LWA_ALPHA))p.opacity=alpha;
         RECT outer{},frame{};p.rcSource={0,0,i.pixels.cx,i.pixels.cy};
-        if(GetWindowRect(i.source,&outer)&&SUCCEEDED(DwmGetWindowAttribute(i.source,DWMWA_EXTENDED_FRAME_BOUNDS,&frame,sizeof(frame))))
+        if(!i.minimized&&GetWindowRect(i.source,&outer)&&SUCCEEDED(DwmGetWindowAttribute(i.source,DWMWA_EXTENDED_FRAME_BOUNDS,&frame,sizeof(frame))))
             p.rcSource=SourceRect(outer,frame,i.pixels);
         // Normalize the sampled visible frame to a zero-based destination.
         i.pixels={p.rcSource.right-p.rcSource.left,p.rcSource.bottom-p.rcSource.top};
+        if(i.minimized&&validSize){
+            double cx=i.original.cx(),cy=i.original.cy();
+            i.original={cx-i.pixels.cx*.5,cy-i.pixels.cy*.5,double(i.pixels.cx),double(i.pixels.cy)};
+        }
         p.rcDestination={0,0,i.pixels.cx,i.pixels.cy};
-        hr=api.createThumb(v.hwnd,i.source,2,&p,device.Get(),reinterpret_cast<void**>(i.surface.GetAddressOf()),&i.thumbnail);
+        hr=validSize?api.createThumb(v.hwnd,i.source,2,&p,device.Get(),reinterpret_cast<void**>(i.surface.GetAddressOf()),&i.thumbnail):E_FAIL;
+        if(FAILED(hr)&&i.minimized){i.surface.Reset();i.thumbnail=nullptr;hr=CreateMinimizedPlaceholder(i);}
         if(FAILED(hr)){Log(L"Create shared source",hr);return false;}
         // DWM's shared visual may reject rendering-mode setters. Apply them to
         // our own parent visual; descendants inherit the composition settings.
@@ -896,9 +1068,7 @@ public:
                 if(a.original.h!=b.original.h)return a.original.h>b.original.h;
                 return reinterpret_cast<ULONG_PTR>(a.source)<reinterpret_cast<ULONG_PTR>(b.source);
             });
-            std::vector<Box> original;for(auto&i:v->items)original.push_back(i.original);
-            double pad=28*v->dpi;Box area{pad,pad,std::max(1.,double(v->bounds.right-v->bounds.left)-2*pad),std::max(1.,double(v->bounds.bottom-v->bounds.top)-2*pad)};
-            auto layout=Layout(original,area,22*v->dpi,40*v->dpi);
+            auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){building=false;End(false);return false;}
             for(size_t j=0;j<layout.size();++j){v->items[j].target=layout[j];if(!CreateTitle(*v,v->items[j])){building=false;End(false);return false;}}
             count+=v->items.size();
@@ -917,6 +1087,7 @@ public:
         if(focus){SetForegroundWindow(focus);SetFocus(focus);}
         foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT);
         destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+        restoreStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND,EVENT_SYSTEM_MINIMIZEEND,nullptr,RestoreEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         building=false;Animate(1);return true;
     }
     template<class Setter> void Property(double a,double b,Setter setter){
@@ -938,25 +1109,25 @@ public:
     }
     void StaticPose(double p){
         for(auto&v:views)for(auto&i:v->items){
-            Box b=Mix(i.original,i.target,p);i.position->SetOffsetX(float(b.x));i.position->SetOffsetY(float(b.y));
+            Box b=Mix(ExitPose(i),i.target,p);i.position->SetOffsetX(float(b.x));i.position->SetOffsetY(float(b.y));
             i.scale->SetScaleX(float(b.w/i.pixels.cx));i.scale->SetScaleY(float(b.h/i.pixels.cy));
             i.clip->SetRight(float(b.w));i.clip->SetBottom(float(b.h));
-            i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+2*i.Outset())/i.borderHeight);
+            i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight);
             if(i.closeButton)i.closeButton->SetOffsetX(float(b.w)-CloseSize(*v)-CloseInset(*v));
-            if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h+i.Outset()+6*v->dpi));i.labelEffect->SetOpacity(float(p));}
-            float radius=float(i.nativeRadius+(OverviewRadius(*v,i.target)-i.nativeRadius)*p);
+            if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h-v->dpi));i.labelEffect->SetOpacity(float(p));}
+            float radius=float(ExitRadius(*v,i)+(OverviewRadius(*v,i.target)-ExitRadius(*v,i))*p);
             SetCorners(i,radius);i.radiusFrom=i.radiusTo=radius;i.motionFrom=i.motionTo=b;
         }
     }
     double MotionFraction()const{return Curve(seconds<=0?1:(Now()-start)/seconds);}
     Box CurrentBox(const Item&i)const{
-        if(phase==Phase::Hidden)return i.original;if(phase==Phase::Settled)return i.target;
+        if(phase==Phase::Hidden)return HiddenPose(i);if(phase==Phase::Settled)return i.target;
         return Mix(i.motionFrom,i.motionTo,MotionFraction());
     }
     void CaptureMotion(){
         double t=MotionFraction();
         for(auto&v:views)for(auto&i:v->items){
-            i.radiusFrom=phase==Phase::Hidden?i.nativeRadius:phase==Phase::Settled?OverviewRadius(*v,i.target):float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*t);
+            i.radiusFrom=phase==Phase::Hidden?HiddenRadius(*v,i):phase==Phase::Settled?OverviewRadius(*v,i.target):float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*t);
             i.motionFrom=CurrentBox(i);
         }
     }
@@ -972,8 +1143,8 @@ public:
         seconds=(enabled?settings.duration:0)/1000.0*(reflow?1.:std::abs(to-from));
         phase=to==1?Phase::Opening:Phase::Closing;
         for(auto&v:views)for(auto&i:v->items){
-            Box a=i.motionFrom,b=destination==1?i.target:i.original;i.motionTo=b;
-            i.radiusTo=destination==1?OverviewRadius(*v,i.target):i.nativeRadius;
+            Box a=i.motionFrom,b=destination==1?i.target:ExitPose(i);i.motionTo=b;
+            i.radiusTo=destination==1?OverviewRadius(*v,i.target):ExitRadius(*v,i);
             Property(a.x,b.x,[&](auto value){i.position->SetOffsetX(value);});
             Property(a.y,b.y,[&](auto value){i.position->SetOffsetY(value);});
             Property(a.w/i.pixels.cx,b.w/i.pixels.cx,[&](auto value){i.scale->SetScaleX(value);});
@@ -982,11 +1153,11 @@ public:
             Property(a.h,b.h,[&](auto value){i.clip->SetBottom(value);});
             Property(i.radiusFrom,i.radiusTo,[&](auto value){SetCorners(i,value);});
             Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
-            Property((a.h+2*i.Outset())/i.borderHeight,(b.h+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
+            Property((a.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
             if(i.closeButton)Property(a.w-CloseSize(*v)-CloseInset(*v),b.w-CloseSize(*v)-CloseInset(*v),[&](auto value){i.closeButton->SetOffsetX(value);});
             if(i.label){
                 Property((a.w-i.target.w)*.5,(b.w-i.target.w)*.5,[&](auto value){i.label->SetOffsetX(value);});
-                Property(a.h+i.Outset()+6*v->dpi,b.h+i.Outset()+6*v->dpi,[&](auto value){i.label->SetOffsetY(value);});
+                Property(a.h-v->dpi,b.h-v->dpi,[&](auto value){i.label->SetOffsetY(value);});
                 Property(from,to,[&](auto value){i.labelEffect->SetOpacity(value);});
             }
         }
@@ -1010,6 +1181,7 @@ public:
     }
     void FinishTransition(){
         if(phase!=Phase::Opening&&phase!=Phase::Closing)return;
+        if(phase==Phase::Closing)RefreshRestoredGeometry(false);
         progress=to;StaticPose(to);device->Commit();
         if(phase==Phase::Closing){End(true);return;}
         phase=Phase::Settled;
@@ -1029,14 +1201,94 @@ public:
                 for(auto&i:v->items)if(i.source==*hwnd){v->windows->AddVisual(i.position.Get(),FALSE,nullptr);break;}
         }
     }
+    bool RebindRestoredSample(View&v,Item&i,const RECT&r){
+        // An iconic thumbnail starts with DWM's implicit retained crop.
+        // When its source becomes live again, explicitly sample the restored
+        // visible frame. Keep the existing destination normalization so the
+        // in-flight compositor scale does not jump with the source size.
+        RECT outer{};SIZE size{};
+        bool rebound=false;
+        if(GetWindowRect(i.source,&outer)&&SUCCEEDED(api.querySize(i.source,FALSE,&size))&&size.cx>0&&size.cy>0){
+            RECT sample=SourceRect(outer,r,size);
+            if(!i.restoredSampleValid||!EqualRect(&sample,&i.restoredSample)){
+                DWM_THUMBNAIL_PROPERTIES properties{};
+                properties.dwFlags=DWM_TNP_RECTSOURCE|DWM_TNP_RECTDESTINATION|DWM_TNP_VISIBLE|DWM_TNP_OPACITY|DWM_TNP_SOURCECLIENTAREAONLY|0x04000000;
+                properties.rcSource=sample;properties.rcDestination={0,0,i.pixels.cx,i.pixels.cy};
+                properties.fVisible=TRUE;properties.opacity=255;
+                COLORREF key=0;BYTE alpha=255;DWORD flags=0;
+                if(GetLayeredWindowAttributes(i.source,&key,&alpha,&flags)&&(flags&LWA_ALPHA))properties.opacity=alpha;
+                // Shared DComp thumbnails cannot use the public update API.
+                // Replace only their source visual in the same commit; the
+                // animated transform, clip and position remain attached.
+                ComPtr<IDCompositionVisual2> surface;HTHUMBNAIL thumbnail=nullptr;
+                HRESULT hr=api.createThumb(v.hwnd,i.source,2,&properties,device.Get(),reinterpret_cast<void**>(surface.GetAddressOf()),&thumbnail);
+                if(SUCCEEDED(hr))hr=surface->SetTransform(i.scale.Get());
+                if(SUCCEEDED(hr))hr=i.content->AddVisual(surface.Get(),FALSE,i.surface.Get());
+                if(SUCCEEDED(hr)){
+                    i.surface->SetTransform(nullptr);i.content->RemoveVisual(i.surface.Get());i.surface=std::move(surface);i.thumbnail=thumbnail;
+                    i.restoredSample=sample;i.restoredSampleValid=true;rebound=true;
+                }else{if(surface)surface->SetTransform(nullptr);Log(L"Rebind restored thumbnail sampling",hr);}
+            }
+        }
+        return rebound;
+    }
+    bool ReconcileRestoredWindows(bool captured=false){
+        bool changed=false;
+        for(auto&v:views)for(auto&i:v->items)if(i.minimized&&IsWindow(i.source)&&!IsIconic(i.source)){
+            RECT r{};if(!Bounds(i.source,r))continue;
+            if(!changed&&!captured){progress=CurrentProgress();CaptureMotion();}
+            changed=true;RebindRestoredSample(*v,i,r);
+            i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+            i.nativeRadius=SystemCornerRadius(i.source,v->dpi);i.minimized=false;
+        }
+        if(!changed)return false;
+        if(restoreSource&&!IsIconic(restoreSource)){
+            if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}restoreSource=nullptr;
+        }
+        ClearSelection();BuildGuard guard(*this);
+        for(auto&v:views){
+            auto layout=Arrange(*v);
+            if(layout.size()!=v->items.size()){End(false);return true;}
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
+                if(!CreateTitle(*v,i)){End(false);return true;}
+            }
+        }
+        FollowNativeZOrder();Animate(1,true,true);return true;
+    }
+    void RefreshRestoredGeometry(bool animate=true){
+        if(phase==Phase::Opening||phase==Phase::Settled){ReconcileRestoredWindows();return;}
+        if(phase!=Phase::Closing||!chosen||IsIconic(chosen))return;
+        for(auto&v:views)for(auto&i:v->items)if(i.source==chosen&&i.minimized){
+            RECT r{};if(!Bounds(i.source,r))return;
+            Box restored{double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+            float radius=SystemCornerRadius(i.source,v->dpi);
+            bool rebound=RebindRestoredSample(*v,i,r);
+            if(std::abs(restored.x-i.original.x)<.1&&std::abs(restored.y-i.original.y)<.1&&std::abs(restored.w-i.original.w)<.1&&std::abs(restored.h-i.original.h)<.1&&radius==i.nativeRadius){if(rebound)device->Commit();return;}
+            if(animate){progress=CurrentProgress();CaptureMotion();}
+            i.original=restored;i.nativeRadius=radius;
+            if(animate)Animate(0,true);
+            return;
+        }
+    }
     void Close(HWND selection){
         if(phase==Phase::Hidden||phase==Phase::Closing)return;
         ResetGesture();RemoveProp(controller,kOverviewProperty);
         progress=CurrentProgress();CaptureMotion();chosen=selection;
+        if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}restoreSource=nullptr;
         HWND target=chosen?chosen:previous;
         // Match the current native rectangle at handoff, including app-driven
         // size changes that may have happened while the overview was open.
-        for(auto&v:views)for(auto&i:v->items){RECT r{};if(Bounds(i.source,r))i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};}
+        for(auto&v:views)for(auto&i:v->items){RECT r{};if(Bounds(i.source,r))i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+            if(i.minimized&&i.source==chosen){
+                // The selected tile grows directly into its restored window;
+                // only the other minimized tiles retreat to the taskbar edge.
+                WINDOWPLACEMENT placement{sizeof(placement)};
+                i.nativeRadius=GetWindowPlacement(i.source,&placement)&&(placement.flags&WPF_RESTORETOMAXIMIZED)?0.f:SystemCornerRadius(i.source,v->dpi);
+                DWORD pid=0,tid=GetWindowThreadProcessId(i.source,&pid);
+                restoreSource=i.source;
+                restoreHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,RestoreEvent,pid,tid,WINEVENT_OUTOFCONTEXT);
+            }
+        }
         ClearSelection();
         // Anticipate foreground order while preserving topmost windows; the
         // foreground event then reconciles the exact native order.
@@ -1044,11 +1296,15 @@ public:
         Animate(0,true);
         // Submit motion before calling the native activation API: another
         // input queue may take ~100 ms to respond, while DWM keeps animating.
-        if(phase==Phase::Closing&&IsWindow(target))SetForegroundWindow(target);
+        if(phase==Phase::Closing){ActivateWindow(target,chosen!=nullptr);RefreshRestoredGeometry();}
     }
     void Reopen(){
-        progress=CurrentProgress();chosen=nullptr;previous=GetForegroundWindow();
-        SetProp(controller,kOverviewProperty,reinterpret_cast<HANDLE>(kShellAck));FocusOverview();Animate(1);
+        chosen=nullptr;previous=GetForegroundWindow();
+        SetProp(controller,kOverviewProperty,reinterpret_cast<HANDLE>(kShellAck));FocusOverview();
+        // Native focus transfer can take time. Sample geometry and progress
+        // together afterwards, then continue from that pose without resetting it.
+        progress=CurrentProgress();CaptureMotion();
+        if(!ReconcileRestoredWindows(true))Animate(1,true);
     }
     void End(bool restore,bool idle=true){
         ResetGesture();RemoveProp(controller,kOverviewProperty);
@@ -1058,8 +1314,10 @@ public:
         phase=Phase::Hidden;
         if(foregroundHook){UnhookWinEvent(foregroundHook);foregroundHook=nullptr;}
         if(destroyHook){UnhookWinEvent(destroyHook);destroyHook=nullptr;}
+        if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}
+        if(restoreStateHook){UnhookWinEvent(restoreStateHook);restoreStateHook=nullptr;}restoreSource=nullptr;
         HWND target=chosen?chosen:previous;
-        if(restore&&IsWindow(target)&&GetForegroundWindow()!=target)SetForegroundWindow(target);
+        if(restore)ActivateWindow(target,chosen!=nullptr);
         if(visible&&device){
             // Finish the existing, valid scene. Creating a new whole-desktop
             // thumbnail here can publish an uninitialized black surface.
@@ -1085,7 +1343,13 @@ public:
         }
     }
     int Hit(const View&v,POINT p){
-        auto hit=[&](int n){Box b=CurrentBox(v.items[n]);return p.x>=b.x&&p.x<b.right()&&p.y>=b.y&&p.y<b.bottom();};
+        auto hit=[&](int n){const auto&i=v.items[n];Box b=CurrentBox(i);
+            if(p.x>=b.x&&p.x<b.right()&&p.y>=b.y&&p.y<b.bottom())return true;
+            double x=b.x+(b.w-i.target.w)*.5,y=b.bottom()-v.dpi;
+            double r=TitleShoulderRadius(v,i),dy=std::clamp(y+v.dpi+r-p.y,0.,r);
+            double flare=r-std::sqrt(std::max(0.,r*r-dy*dy));
+            return i.label&&p.x>=x+i.titleLeft-flare&&p.x<x+i.titleRight+flare&&p.y>=y&&p.y<y+i.titleHeight;
+        };
         if(!v.hitOrder.empty()){for(int n:v.hitOrder)if(hit(n))return n;}
         else for(size_t n=0;n<v.items.size();++n)if(hit(int(n)))return int(n);
         return -1;
@@ -1166,7 +1430,7 @@ public:
         for(auto&v:views)for(size_t n=0;n<v->items.size();++n){auto&i=v->items[n];if(i.source!=source)continue;
             if((!i.borderSurface||i.borderColor!=accentColor)&&!CreateOutline(*v,i)){End(false);return;}
             if(!PrepareCloseButton(*v,i)){End(false);return;}
-            i.position->AddVisual(i.border.Get(),FALSE,i.content.Get());i.borderAttached=true;i.borderEffect->SetOpacity(1.f);v->selected=int(n);
+            i.position->AddVisual(i.border.Get(),FALSE,i.label?i.label.Get():i.content.Get());i.borderAttached=true;i.borderEffect->SetOpacity(1.f);v->selected=int(n);
             i.position->AddVisual(i.closeButton.Get(),FALSE,nullptr);i.closeAttached=true;
         }
         device->Commit();
@@ -1228,7 +1492,8 @@ public:
         case kReleaseInactive:ReleaseInactiveGraphics();return 0;
         case kWindowGone:RemoveWindowFromOverview(reinterpret_cast<HWND>(wp));return 0;
         case kWarmup:Warmup();return 0;
-        case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
+        case kRestoreGeometry:RefreshRestoredGeometry();return 0;
+        case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){RefreshRestoredGeometry();FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
         case kAccentChanged:case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
         case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:desktopCache.clear();if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
