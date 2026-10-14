@@ -27,17 +27,6 @@
 
 生成文件位于 `build/`。脚本只编译；安装仍使用 Windhawk 编辑器中的源码。
 
-最小化窗口回归测试会短暂显示独立的虚构测试窗口，检查筛选、画面边缘、弱化、恢复状态和资源释放；不会操作现有应用窗口：
-
-```powershell
-.\test-minimized.ps1 -Compiler 'C:\path\to\llvm-mingw\bin\clang++.exe'
-.\test-minimized.ps1 -Compiler 'C:\path\to\llvm-mingw\bin\clang++.exe' -Architecture i686
-```
-
-## 文档预览素材
-
-预览录制方式、内容来源和复现步骤见[素材说明](media/README.md)。
-
 ## 来源与许可
 
 作者：SinCircle。共享窗口画面实现参考 [ADeltaX 的 DWM 接口研究](https://gist.github.com/ADeltaX/aea6aac248604d0cb7d423a61b06e247)。独立进程启动代码来自 [Ramen Software 的官方示例](https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process)，源码保留相应署名与链接。原始模组未指定整体许可证，本仓库暂未另行指定。

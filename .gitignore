@@ -7,3 +7,10 @@ build/
 *.log
 .vs/
 .vscode/
+
+# Local development checks and preview recording helpers
+/tests/
+/test-*
+/tools/record-preview.*
+/docs/media/README.md
+/self-test.txt
