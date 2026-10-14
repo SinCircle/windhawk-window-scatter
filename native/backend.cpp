@@ -98,7 +98,7 @@ static bool BundledSymbols(const ModuleIdentity&id,SymbolTable&table){
 }
 struct InternetHandle{HINTERNET h=nullptr;~InternetHandle(){if(h)WinHttpCloseHandle(h);}};
 static bool DownloadPdb(const std::wstring&id,const std::filesystem::path&path,HANDLE stop,std::wstring&error){
-    InternetHandle session{WinHttpOpen(L"WindowScatter/0.5.4",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
+    InternetHandle session{WinHttpOpen(L"WindowScatter/0.5.5",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
     if(!session.h){error=ErrorText(GetLastError());return false;}
     WinHttpSetTimeouts(session.h,5000,5000,5000,5000);
     InternetHandle connection{WinHttpConnect(session.h,L"msdl.microsoft.com",INTERNET_DEFAULT_HTTPS_PORT,0)};

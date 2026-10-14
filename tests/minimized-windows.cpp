@@ -102,8 +102,16 @@ int wmain(int argc,wchar_t**argv){
         if(!i.position)return 5;Check(app.CreateTitle(v,i),"title and minimized-state label are created");v.windows->AddVisual(i.position.Get(),FALSE,nullptr);
     }
     Check(v.items[0].iconBitmap&&v.items[1].iconBitmap&&!v.items[2].iconBitmap&&!v.items[3].iconBitmap,"application icons are included; windows without icons retain plain text");
+    bool noDecorations=true;for(auto&i:v.items)noDecorations&=!i.border&&!i.borderFill&&!i.buttons&&!i.borderScale&&!i.borderEffect;
+    Check(noDecorations,"unselected previews allocate no outline, button or decoration animation objects");
     HANDLE queries=GetProp(child.Window(1),L"IconQueries");IWICBitmap*cachedIcon=v.items[1].iconBitmap.Get();app.CreateTitle(v,v.items[1]);
     Check(cachedIcon==v.items[1].iconBitmap.Get()&&queries==GetProp(child.Window(1),L"IconQueries"),"title reflow reuses the icon without messaging its application again");
+    auto savedLabel=v.items[1].label;auto savedSurface=v.items[1].labelSurface;auto savedEffect=v.items[1].labelEffect;
+    double savedY=v.items[1].target.y;v.items[1].target.y+=12;app.CreateTitle(v,v.items[1]);v.items[1].target.y=savedY;
+    Check(savedLabel==v.items[1].label&&savedSurface==v.items[1].labelSurface&&savedEffect==v.items[1].labelEffect,"position-only reflow reuses the caption surface, visual and opacity effect");
+    double savedWidth=v.items[1].target.w;v.items[1].target.w-=20;app.CreateTitle(v,v.items[1]);
+    Check(savedSurface!=v.items[1].labelSurface,"caption width changes rebuild the rasterized label instead of stretching old text");
+    v.items[1].target.w=savedWidth;app.CreateTitle(v,v.items[1]);savedSurface.Reset();savedLabel.Reset();savedEffect.Reset();
     Check(v.items[1].thumbnail&&!v.items[2].thumbnail&&!v.items[3].thumbnail&&app.minimizedPlaceholder,"failed DWM surfaces share a small placeholder; cached surface remains native");
     auto packed=App::Arrange(v);Check(packed.size()==4,"ordinary and minimized previews both receive layout positions");
     if(packed.size()!=4)return 7;
@@ -170,6 +178,8 @@ int wmain(int argc,wchar_t**argv){
     Check(v.items[0].labelSeconds==v.items[1].labelSeconds&&std::abs(v.items[0].labelSeconds-(app.seconds+std::min(.12,app.seconds*.28))*.5)<1e-6,"both caption types enter together at the mean of the two previous durations");Sleep(160);
     Box opening=app.CurrentBox(v.items[1]);
     Check(opening.w>hidden.w&&opening.w<v.items[1].target.w&&opening.y>v.items[1].target.y&&opening.y<hidden.y,"opening slides upwards with only subtle scaling");
+    double sameStart=app.start,sameDuration=app.seconds;app.Select(child.Window(1));
+    Check(v.items[1].borderAttached&&v.items[1].buttonsAttached&&app.start==sameStart&&app.seconds==sameDuration,"first hover during opening attaches decorations on the original animation timeline");
     app.Close(nullptr);
     Check(v.items[1].motionFrom.w>=opening.w&&v.items[1].motionFrom.w<v.items[1].target.w,"closing continues from the in-flight opening pose");
     Check(std::abs(v.items[1].labelSeconds-(app.seconds+std::min(.12,app.seconds*.28))*.5)<1e-6,"caption fade uses the mean of the two previous durations");
@@ -241,7 +251,11 @@ int wmain(int argc,wchar_t**argv){
     Check(v.items.size()==5&&v.items.back().source==child.Window(4)&&app.phase!=Phase::Hidden,"a newly shown native window joins the open overview through its show event");
     if(v.items.size()!=5)return 9;
     app.SceneChanged(child.Window(4));Check(v.items.size()==5,"duplicate show notifications cannot duplicate a preview");
-    SetWindowPos(child.Window(4),nullptr,120,110,710,390,SWP_NOZORDER|SWP_NOACTIVATE);Pump(180);
+    unsigned beforePasses=app.layoutPasses;
+    SetWindowPos(child.Window(4),nullptr,120,110,710,390,SWP_NOZORDER|SWP_NOACTIVATE);
+    for(int n=0;n<500;++n)PostMessage(app.controller,kSceneChanged,reinterpret_cast<WPARAM>(child.Window(4)),0);
+    Pump(180);
+    Check(app.layoutPasses==beforePasses+1,"500 queued geometry notifications coalesce into one layout of the final native size");
     RECT resized{};App::Bounds(child.Window(4),resized);
     Check(v.items.back().original.w==resized.right-resized.left&&v.items.back().restoredSampleValid,"native size events update live source sampling and the stable layout");
     Box beforeMove=v.items.back().target;bool moveRight=beforeMove.cx()<=v.items[0].target.cx();

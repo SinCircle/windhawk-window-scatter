@@ -30,6 +30,10 @@ int main(int argc,char**argv){
             for(size_t n=1;n<shelf.size();++n)sorted&=v->items[shelf[n-1]].taskbarRank<=v->items[shelf[n]].taskbarRank;
         }
         printf("Live minimized windows: %d, mapped to taskbar groups: %d\n",minimized,matched);Check(sorted,"current minimized-window layout follows the live taskbar snapshot");
+        auto snapshot=order.Read();order.Stop();auto stopped=order.Read();
+        bool preserved=snapshot.size()==stopped.size();for(size_t n=0;n<stopped.size()&&preserved;++n)preserved&=snapshot[n].window==stopped[n].window&&snapshot[n].group==stopped[n].group;
+        Check(!order.Running()&&preserved,"idle taskbar shutdown releases its worker while retaining the last ordering snapshot");
+        order.Start(nullptr);Check(order.Running()&&order.Read().size()==snapshot.size(),"restarting the taskbar reader exposes its previous snapshot without a synchronous query");
         order.Stop();CoUninitialize();return passed?0:1;
     }
     Box area{42,42,1836,1080};double caption=39,gap=33;
@@ -195,6 +199,32 @@ int main(int argc,char**argv){
     Check(crowdedValid&&crowdedStable,"one through forty windows retain caption spacing, uniform scale and stable reopening on a negative-origin monitor");
     Check(crowdedReflow,"crowded-scene insertions retain separated motion paths for existing windows");
     Check(crowdedMax<100,"bounded search keeps the crowded-scene geometry pass below 100 ms");
+    // Hundreds of sources exercise the optimized relation scorer and redundant
+    // constraint reduction, rather than only the small-scene search path.
+    bool largeValid=true,largeStable=true,largePaths=true,cacheExact=true;
+    for(int count:{64,128,256,512}){
+        Box monitor{-3840,-550,3756,2028};std::vector<Box> sources;std::mt19937 generator(4721);
+        for(int n=0;n<count;++n)sources.push_back({monitor.x+double(generator()%2000),monitor.y+double(generator()%1000),double(500+generator()%1800),double(350+generator()%1000)});
+        std::vector<LayoutSlot> saved;auto fitted=Layout(sources,monitor,33,39,&saved);largeValid&=fitted.size()==sources.size()&&Valid(fitted,monitor,39);
+        if(fitted.size()!=sources.size())continue;
+        double scale=fitted[0].w/sources[0].w;SourceRelationCache cached(sources,monitor);
+        cacheExact&=std::abs(cached.Cost(fitted,monitor,scale,1e100)-SourceRelationCost(sources,fitted,monitor,scale))<1e-10;
+        for(size_t n=0;n<fitted.size();++n)largeValid&=std::abs(fitted[n].w/sources[n].w-scale)<1e-8&&std::abs(fitted[n].h/sources[n].h-scale)<1e-8;
+        auto repeated=StableLayout(sources,fitted,monitor,33,39,saved);for(size_t n=0;n<fitted.size();++n)largeStable&=Distance(fitted[n],repeated[n])<1e-8;
+        sources.push_back({monitor.x+600,monitor.y+500,1100,700});fitted.push_back({});saved.push_back({});
+        auto added=StableLayout(sources,fitted,monitor,33,39,saved);largeValid&=added.size()==sources.size()&&Valid(added,monitor,39);largePaths&=ClearReflow(fitted,added,39);
+    }
+    Check(largeValid,"64 through 512 mixed-size windows keep common scale, caption clearance and negative-origin monitor bounds");
+    Check(largeStable&&largePaths,"large-scene reopening is exact and additions retain separated motion paths");
+    Check(cacheExact,"cached source-relation scores agree with the original formula to 1e-10");
+    std::vector<PositionEdge> redundant;for(int a=0;a<64;++a)for(int b=a+1;b<64;++b)redundant.push_back({a,b,2.+(a+b)%7});
+    auto reduced=redundant;ReducePositionEdges(64,reduced);bool implied=true;
+    for(int a=0;a<64;++a){std::vector<double> reach(64,-1e100);reach[a]=0;
+        for(int n=a;n<64;++n)for(auto edge:reduced)if(edge.first==n)reach[edge.second]=std::max(reach[edge.second],reach[n]+edge.distance);
+        for(auto edge:redundant)if(edge.first==a)implied&=reach[edge.second]>=edge.distance-1e-9;}
+    Check(implied&&reduced.size()<redundant.size()/4,"reduced constraints still imply every original weighted separation constraint");
+    auto cycle=redundant;cycle.push_back({63,0,1});auto originalCycle=cycle;ReducePositionEdges(64,cycle);
+    Check(cycle.size()==originalCycle.size(),"cyclic constraint graphs retain the existing infeasibility checks");
     std::vector<Box> example{{43,42,788,507},{227,622,1337,508},{1996,42,1589,870},{2219,984,1580,870},{475,1275,838,508},{1348,1276,838,508}};
     for(auto&b:example){b.w/=.65;b.h/=.65;}
     Box wideArea{42,42,3754,1858};auto compactExample=Layout(example,wideArea,33,39);

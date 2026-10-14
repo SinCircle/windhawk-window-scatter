@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.9
+// @version         0.4.10
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -145,6 +145,8 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <numeric>
 #include <string>
 #include <utility>
+#include <array>
+#include <unordered_map>
 #include <vector>
 
 namespace scatter {
@@ -173,8 +175,34 @@ static Box Mix(const Box&a,const Box&b,double t){return {a.x+(b.x-a.x)*t,a.y+(b.
 // optimized independently; history stores CPU geometry, never grid membership.
 using LayoutStacks=std::vector<std::vector<int>>;
 struct LayoutSlot {int group=-1,order=0,count=0;bool columns=false;double offset=0;Box original,area;bool mixed=false;std::string path;};
+// Source geometry is constant across packing candidates. Cache its directional
+// weights once and abandon a candidate only when its proven score bound loses.
+struct SourceRelationCache {
+    struct Axis {int a,b;bool vertical;double sign,weight,separation;};
+    std::vector<Axis> axes;double weights=0;
+    SourceRelationCache(const std::vector<Box>&src,Box area){
+        for(size_t a=0;a<src.size();++a)for(size_t b=0;b<a;++b){
+            double x=(src[a].cx()-src[b].cx())/area.w,y=(src[a].cy()-src[b].cy())/area.h;
+            auto add=[&](double before,double other,bool vertical){double weight=std::clamp((std::abs(before)-.025)/.25,0.,1.);if(weight<=0)return;
+                if(std::abs(before)*1.25<std::abs(other)){if(std::abs(before)<.08)return;weight*=.15;}
+                axes.push_back({int(a),int(b),vertical,before>0?1.:-1.,weight,std::abs(before)*.5});weights+=weight;};
+            add(x,y,false);add(y,x,true);
+        }
+    }
+    double Cost(const std::vector<Box>&boxes,Box area,double scale,double limit)const{
+        std::vector<double> x(boxes.size()),y(boxes.size());for(size_t i=0;i<boxes.size();++i){x[i]=boxes[i].cx();y[i]=boxes[i].cy();}
+        double cost=0,denominator=std::max(1.,weights),maximum=limit*denominator;
+        for(const auto&a:axes){double separation=std::min(.12,a.separation*scale);
+            double after=a.sign*(a.vertical?(y[a.a]-y[a.b])/area.h:(x[a.a]-x[a.b])/area.w);
+            cost+=a.weight*std::clamp((separation-after)/std::max(.001,separation),0.,2.);
+            if(cost>maximum)return cost/denominator;
+        }
+        return cost/denominator;
+    }
+};
+
 static double SourceRelationCost(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double scale);
-static double LayoutQuality(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double caption){
+static double LayoutQuality(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double caption,double cutoff=-1e100,const SourceRelationCache*relations=nullptr){
     if(boxes.empty())return -1e100;
     double left=1e100,top=1e100,right=-1e100,bottom=-1e100,occupied=0,movement=0,spread=0,scale=.85;int count=0;
     for(size_t i=0;i<boxes.size();++i){auto b=boxes[i];if(b.w<=0)continue;++count;scale=std::min(scale,b.w/src[i].w);
@@ -183,7 +211,9 @@ static double LayoutQuality(const std::vector<Box>&src,const std::vector<Box>&bo
         double cx=(b.cx()-area.cx())/area.w,cy=(b.cy()+caption*.5-area.cy())/area.h;spread+=b.w*(b.h+caption)*(cx*cx+cy*cy);}
     if(!count||scale<=0)return -1e100;
     double waste=1-occupied/std::max(1.,(right-left)*(bottom-top));
-    return std::log(scale)-.18*waste-.5*spread/occupied-.06*movement/count-1.4*SourceRelationCost(src,boxes,area,scale);
+    double upper=std::log(scale)-.18*waste-.5*spread/occupied-.06*movement/count;
+    if(upper<=cutoff+1e-10)return -1e100;
+    return upper-1.4*(relations?relations->Cost(boxes,area,scale,(upper-cutoff)/1.4):SourceRelationCost(src,boxes,area,scale));
 }
 static std::vector<LayoutSlot> SaveSlots(const std::vector<Box>&src,const std::vector<Box>&boxes,const LayoutStacks&stacks,bool columns,Box area){
     std::vector<LayoutSlot> slots(src.size());
@@ -211,6 +241,7 @@ static std::vector<Box> StackLayout(const std::vector<Box>&src,Box area,double g
     });
     std::vector<int> rank(count);for(int n=0;n<count;++n)rank[canonical[n]]=n;
     double bestScore=-std::numeric_limits<double>::infinity();std::vector<Box> best;LayoutStacks bestStacks;bool bestColumns=false;
+    std::unique_ptr<SourceRelationCache> relations;if(count>24)relations=std::make_unique<SourceRelationCache>(src,area);
     int limit=std::min(count,std::max(12,int(std::ceil(std::sqrt(double(count))*2))));
     for(bool columns:{true,false})for(int groups=1;groups<=limit;++groups)for(int strategy=0;strategy<3;++strategy){
         std::vector<int> order=canonical;
@@ -291,7 +322,7 @@ static std::vector<Box> StackLayout(const std::vector<Box>&src,Box area,double g
             }
             cursor+=(columns?f.w:f.h)+gap;
         }
-        double score=LayoutQuality(src,attempt,area,caption);
+        double score=LayoutQuality(src,attempt,area,caption,bestScore,relations.get());
         if(score>bestScore+1e-10){bestScore=score;bestStacks=stack;bestColumns=columns;best=std::move(attempt);}
     }
     if(!best.empty()&&slots)*slots=SaveSlots(src,best,bestStacks,bestColumns,area);
@@ -439,6 +470,31 @@ static std::vector<Box> PackedLayout(const std::vector<Box>&src,Box area,double 
 // to use, not a row or column. The remaining coordinates solve a weighted
 // convex projection. Window area is its resistance to leaving the real center.
 struct PositionEdge {int first,second;double distance;};
+// Retain the same feasible region while removing constraints already implied
+// by a longer path. Cyclic graphs are left to the existing infeasibility check.
+static void ReducePositionEdges(int count,std::vector<PositionEdge>&edges){
+    if(count<=24||edges.size()<size_t(count*2))return;
+    std::vector<std::vector<size_t>> outgoing(count);std::vector<int> degree(count),order;
+    for(size_t k=0;k<edges.size();++k){outgoing[edges[k].first].push_back(k);++degree[edges[k].second];}
+    for(int i=0;i<count;++i)if(!degree[i])order.push_back(i);
+    for(size_t n=0;n<order.size();++n)for(size_t k:outgoing[order[n]])if(!--degree[edges[k].second])order.push_back(edges[k].second);
+    if(order.size()!=size_t(count))return;
+    std::vector<int> rank(count);for(int n=0;n<count;++n)rank[order[n]]=n;
+    std::vector<bool> keep(edges.size(),true);std::vector<double> distance(count);
+    for(int sourceRank=count-1;sourceRank>=0;--sourceRank){int source=order[sourceRank];
+        std::fill(distance.begin(),distance.end(),-1e100);
+        auto direct=outgoing[source];std::sort(direct.begin(),direct.end(),[&](size_t a,size_t b){return rank[edges[a].second]<rank[edges[b].second];});
+        size_t next=0;
+        for(int n=rank[source]+1;n<count;++n){int node=order[n];
+            while(next<direct.size()&&edges[direct[next]].second==node){auto k=direct[next++];if(distance[node]>=edges[k].distance-1e-9)keep[k]=false;else distance[node]=edges[k].distance;}
+            if(distance[node]<=-1e99)continue;
+            for(size_t k:outgoing[node])distance[edges[k].second]=std::max(distance[edges[k].second],distance[node]+edges[k].distance);
+        }
+        std::erase_if(outgoing[source],[&](size_t k){return !keep[k];});
+    }
+    size_t write=0;for(size_t k=0;k<edges.size();++k)if(keep[k])edges[write++]=edges[k];edges.resize(write);
+}
+
 struct PositionSeparation {int first,second;bool vertical;};
 struct PositionFit {std::vector<Box> boxes;double cost=1e100;};
 static bool ProjectPositions(const std::vector<double>&target,const std::vector<double>&weight,
@@ -525,10 +581,12 @@ static PositionFit FreePositions(const std::vector<Box>&src,const std::vector<Bo
             else if(std::abs(dy)>.08&&std::abs(dy)>1.25*std::abs(dx))sourceY.push_back({dy>0?i:j,dy>0?j:i,.001});
         }
     }
+    ReducePositionEdges(count,sourceX);ReducePositionEdges(count,sourceY);
     auto project=[&](const std::vector<PositionSeparation>&separations){
         auto ex=sourceX,ey=sourceY;
         for(auto s:separations){double distance=(s.vertical?(src[s.first].h+src[s.second].h)*scale*.5+caption:(src[s.first].w+src[s.second].w)*scale*.5)+gap;
             (s.vertical?ey:ex).push_back({s.first,s.second,distance});}
+        if(separations.size()>size_t(count*2)){ReducePositionEdges(count,ex);ReducePositionEdges(count,ey);}
         std::vector<double> x,y;PositionFit fit;
         if(!ProjectPositions(tx,weight,lx,hx,ex,x)||!ProjectPositions(ty,weight,ly,hy,ey,y))return fit;
         fit.cost=0;for(int i=0;i<count;++i){fit.boxes.push_back({x[i]-src[i].w*scale*.5,y[i]-src[i].h*scale*.5,src[i].w*scale,src[i].h*scale});
@@ -669,6 +727,7 @@ public:
         if(request&&stop)thread=CreateThread(nullptr,0,Worker,this,0,nullptr);if(!thread){Stop();return;}Refresh();}
     void Refresh(){if(request)SetEvent(request);}
     std::vector<TaskbarEntry> Read(){std::lock_guard<std::mutex> lock(mutex);return snapshot;}
+    bool Running()const{return thread!=nullptr;}
     void Stop(){if(stop)SetEvent(stop);if(thread){WaitForSingleObject(thread,INFINITE);CloseHandle(thread);thread=nullptr;}
         if(request){CloseHandle(request);request=nullptr;}if(stop){CloseHandle(stop);stop=nullptr;}}
     ~TaskbarOrder(){Stop();}
@@ -752,12 +811,14 @@ struct Item {
     WindowButton hotButton=WindowButton::None;
     float stroke=3,gap=4,borderWidth=1,borderHeight=1;
     float titleLeft=0,titleRight=0,titleHeight=0;
+    std::wstring titleText;double titleWidth=0,titleRadius=0;float titleDpi=0;
     float Outset()const{return stroke+gap;}
 };
 struct View {
     HWND hwnd=nullptr;HMONITOR monitor=nullptr;RECT bounds{};float dpi=1;
     std::vector<Item> items;int selected=-1;
     std::vector<int> hitOrder; // Front to back, matching the visual tree.
+    std::vector<HWND> visualOrder;
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual2> root,windows,desktop;
     ComPtr<IDCompositionSurface> wallpaperSurface;
@@ -787,6 +848,8 @@ public:
     ComPtr<IDCompositionSurface> minimizedPlaceholder;
     UINT32 accentColor=0x0078D4;bool accentValid=false;
     ComPtr<IDWriteFactory> textFactory;
+    struct TitleStyle {ComPtr<IDWriteTextFormat> format;ComPtr<IDWriteInlineObject> ellipsis;};
+    std::map<float,TitleStyle> titleStyles;
     ComPtr<IWICImagingFactory> imageFactory;
     std::vector<DesktopCache> desktopCache;
     struct LayoutMemory{HWND source;DWORD process;HMONITOR monitor;RECT bounds;float dpi;bool minimized;Box target;LayoutSlot slot;};
@@ -810,6 +873,10 @@ public:
     UINT deferredCommand=0;
     std::vector<HWND> deferredRemovals;
     std::vector<HWND> deferredSceneChanges;
+    bool sceneNeedsLayout=false;
+#ifdef SCATTER_TEST
+    unsigned layoutPasses=0;
+#endif
     struct BuildGuard {
         App&a;bool wasBuilding;explicit BuildGuard(App&app):a(app),wasBuilding(app.building){a.building=true;}
         ~BuildGuard(){a.building=wasBuilding;if(!wasBuilding){if(UINT msg=std::exchange(a.deferredCommand,0u))PostMessage(a.controller,msg,0,0);
@@ -824,6 +891,7 @@ public:
     LONGLONG animationStart=0;
     struct AnimationEntry {double a,b,duration;ComPtr<IDCompositionAnimation> animation;};
     std::vector<AnimationEntry> animations;
+    std::map<std::array<double,3>,size_t> animationIndex;
     double frameSeconds=1./60;
 
     double Now()const{LARGE_INTEGER t;QueryPerformanceCounter(&t);return double(t.QuadPart)/frequency.QuadPart;}
@@ -917,7 +985,7 @@ public:
     }
     void ReleaseDevice(){
         BuildGuard guard(*this);
-        desktopCache.clear();animations.clear();minimizedPlaceholder.Reset();imageFactory.Reset();textFactory.Reset();
+        desktopCache.clear();animations.clear();animationIndex.clear();minimizedPlaceholder.Reset();imageFactory.Reset();titleStyles.clear();textFactory.Reset();
         surfaceFactory.Reset();d2dDevice.Reset();d2dFactory.Reset();
         if(device){HRESULT hr=device->Commit();if(SUCCEEDED(hr))device->WaitForCommitCompletion();}
         device.Reset();dxgi.Reset();d3d.Reset();
@@ -937,6 +1005,13 @@ public:
     }
     bool PrepareDesktop(View&v){
         MONITORINFO mi{sizeof(mi)};GetMonitorInfo(v.monitor,&mi);
+        // Display/settings notifications invalidate the metadata. Between them,
+        // validate the file timestamp without repeating shell COM enumeration.
+        for(const auto&cached:desktopCache)if(cached.monitor==v.monitor&&EqualRect(&cached.bounds,&v.bounds)){
+            RECT expected=mi.rcMonitor;if(cached.mode==DWPOS_SPAN)expected={GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+            WIN32_FILE_ATTRIBUTE_DATA info{};if(!cached.path.empty())GetFileAttributesEx(cached.path.c_str(),GetFileExInfoStandard,&info);
+            if(EqualRect(&cached.display,&expected)&&CompareFileTime(&cached.modified,&info.ftLastWriteTime)==0){v.wallpaperSurface=cached.surface;return true;}
+        }
         RECT display=mi.rcMonitor;COLORREF color=GetSysColor(COLOR_DESKTOP);
         DESKTOP_WALLPAPER_POSITION mode=DWPOS_FILL;std::wstring path;
         ComPtr<IDesktopWallpaper> wallpaper;
@@ -1078,7 +1153,20 @@ public:
         c->SetBottomLeftRadiusX(radius);c->SetBottomLeftRadiusY(radius);
         c->SetBottomRightRadiusX(radius);c->SetBottomRightRadiusY(radius);
     }
+    bool EnsureDecorations(View&v,Item&i){
+        if(i.border&&i.borderFill&&i.buttons&&i.borderScale&&i.borderEffect)return true;
+        HRESULT hr=device->CreateVisual(i.border.ReleaseAndGetAddressOf());
+        if(SUCCEEDED(hr))hr=device->CreateVisual(i.borderFill.ReleaseAndGetAddressOf());
+        if(SUCCEEDED(hr))hr=device->CreateVisual(i.buttons.ReleaseAndGetAddressOf());
+        if(SUCCEEDED(hr))hr=device->CreateScaleTransform(i.borderScale.ReleaseAndGetAddressOf());
+        if(SUCCEEDED(hr))hr=device->CreateEffectGroup(i.borderEffect.ReleaseAndGetAddressOf());
+        if(FAILED(hr))return false;
+        i.border->SetBorderMode(DCOMPOSITION_BORDER_MODE_SOFT);i.borderFill->SetTransform(i.borderScale.Get());
+        i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);i.border->SetOffsetX(-i.Outset());i.border->SetOffsetY(-i.Outset());
+        i.borderEffect->SetOpacity(0.f);i.border->SetEffect(i.borderEffect.Get());i.buttons->SetOffsetY(CloseInset(v));return true;
+    }
     bool CreateOutline(View&v,Item&i){
+        if(!EnsureDecorations(v,i))return false;
         // A hollow premultiplied surface leaves the requested gap transparent.
         // Rasterize once at overview size, then animate its transform on the GPU.
         i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+TitleProtrusion(v,i)+2*i.Outset();
@@ -1146,23 +1234,30 @@ public:
         // Only the selected preview needs a border surface. Avoid allocating
         // and rasterizing one full-size transparent bitmap for every window.
         i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
-        if(i.label)i.position->RemoveVisual(i.label.Get());
         wchar_t title[512]{};GetWindowText(i.source,title,480);if(!title[0])wcscpy_s(title,L"Window");
+        if(i.label&&i.titleText==title&&i.titleWidth==i.target.w&&i.titleRadius==OverviewRadius(v,i.target)&&i.titleDpi==v.dpi){
+            i.borderHeight=float(i.target.h)+TitleProtrusion(v,i)+2*i.Outset();return true;
+        }
+        if(i.label)i.position->RemoveVisual(i.label.Get());
         PrepareIcon(v,i);
         UINT width=UINT(std::max(1.,std::ceil(i.target.w))),height=UINT(std::ceil(24*v.dpi));
         i.titleHeight=float(height);i.titleLeft=i.titleRight=0;
         i.borderHeight=float(i.target.h)+TitleProtrusion(v,i)+2*i.Outset();
         HRESULT hr=Paint(i.labelSurface,width,height,false,[&](ID2D1DeviceContext*ctx){
-            ComPtr<IDWriteTextFormat> format;ComPtr<IDWriteTextLayout> layout;
+            ComPtr<IDWriteTextLayout> layout;
             ComPtr<ID2D1SolidColorBrush> textBrush,bgBrush;ComPtr<ID2D1Bitmap1> icon;
             if(i.iconBitmap&&width>=48*v.dpi)ctx->CreateBitmapFromWicBitmap(i.iconBitmap.Get(),nullptr,&icon);
             float iconSize=icon?16*v.dpi:0,iconSpace=icon?iconSize+6*v.dpi:0,padding=8*v.dpi;
             float inset=std::min(16*v.dpi,float(width)*.2f);
             float available=std::max(1.f,float(width)-2*(padding+inset)-iconSpace);
-            if(FAILED(textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*v.dpi,L"",&format)))return;
-            format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            if(FAILED(textFactory->CreateTextLayout(title,UINT32(wcslen(title)),format.Get(),available,float(height),&layout)))return;
-            ComPtr<IDWriteInlineObject> ellipsis;textFactory->CreateEllipsisTrimmingSign(format.Get(),&ellipsis);DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};layout->SetTrimming(&trimming,ellipsis.Get());
+            auto&style=titleStyles[v.dpi];
+            if(!style.format){
+                if(FAILED(textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*v.dpi,L"",&style.format)))return;
+                style.format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);style.format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);style.format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                textFactory->CreateEllipsisTrimmingSign(style.format.Get(),&style.ellipsis);
+            }
+            if(FAILED(textFactory->CreateTextLayout(title,UINT32(wcslen(title)),style.format.Get(),available,float(height),&layout)))return;
+            DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};layout->SetTrimming(&trimming,style.ellipsis.Get());
             ctx->CreateSolidColorBrush(D2D1::ColorF(0x20252B),&textBrush);ctx->CreateSolidColorBrush(D2D1::ColorF(0xF2F4F7),&bgBrush);
             if(!textBrush||!bgBrush)return;
             DWRITE_TEXT_METRICS metrics{};layout->GetMetrics(&metrics);float groupWidth=std::min(available,metrics.width)+iconSpace;
@@ -1179,7 +1274,8 @@ public:
         if(SUCCEEDED(hr))hr=i.label->SetContent(i.labelSurface.Get());
         if(SUCCEEDED(hr))hr=i.label->SetEffect(i.labelEffect.Get());
         if(SUCCEEDED(hr))hr=i.position->AddVisual(i.label.Get(),FALSE,i.content.Get());
-        if(SUCCEEDED(hr)){i.label->SetOffsetY(float(i.target.h-v.dpi));i.labelEffect->SetOpacity(0.f);}
+        if(SUCCEEDED(hr)){i.label->SetOffsetY(float(i.target.h-v.dpi));i.labelEffect->SetOpacity(0.f);
+            i.titleText=title;i.titleWidth=i.target.w;i.titleRadius=OverviewRadius(v,i.target);i.titleDpi=v.dpi;}
         return SUCCEEDED(hr);
     }
     static float CloseSize(const View&v){return 28*v.dpi;}
@@ -1192,6 +1288,7 @@ public:
     static float ButtonsWidth(const View&v,const Item&i){return CloseSize(v)+(HasMinimizeButton(i)?CloseSize(v)+6*v.dpi:0);}
     static Box MinimizeBox(const View&v,const Box&window){auto b=CloseBox(v,window);b.x-=CloseSize(v)+6*v.dpi;return b;}
     bool PrepareButtons(View&v,Item&i){
+        if(!EnsureDecorations(v,i))return false;
         bool minimize=HasMinimizeButton(i);float width=ButtonsWidth(v,i);
         // Both controls share the existing visual and cached small surfaces.
         // No additional per-preview visual or animation layer is needed.
@@ -1258,7 +1355,7 @@ public:
             if(v->items.empty())continue;
             auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){End(false);return;}
-            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
                 if(!CreateTitle(*v,i)){End(false);return;}
             }
         }
@@ -1285,7 +1382,7 @@ public:
             DWORD timeout=watch&&!lowMemoryEvent?5000:INFINITE;
             DWORD r=MsgWaitForMultipleObjectsEx(count,handles,timeout,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
             if(r==WAIT_OBJECT_0||r==WAIT_FAILED)break;
-            if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden){idleTimer=false;desktopCache.clear();if(d2dDevice)d2dDevice->ClearResources(0);if(device)device->Commit();}else FinishTransition();}
+            if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden){idleTimer=false;desktopCache.clear();taskbarOrder.Stop();if(d2dDevice)d2dDevice->ClearResources(0);if(device)device->Commit();}else FinishTransition();}
             if((count==3&&r==WAIT_OBJECT_0+2)||(r==WAIT_TIMEOUT&&LowMemory()))MemoryBecameLow();
             MSG msg;for(int n=0;n<64&&PeekMessage(&msg,nullptr,0,0,PM_REMOVE);++n){if(msg.message==WM_QUIT)return;TranslateMessage(&msg);DispatchMessage(&msg);}
         }
@@ -1325,12 +1422,15 @@ public:
         if(changed)Relayout();
     }
     void Relayout(){
+#ifdef SCATTER_TEST
+        ++layoutPasses;
+#endif
         progress=CurrentProgress();CaptureMotion();ClearSelection();BuildGuard guard(*this);
         for(auto&v:views){auto layout=Arrange(*v);if(layout.size()!=v->items.size()){End(false);return;}
-            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();if(!CreateTitle(*v,i)){End(false);return;}}}
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();if(!CreateTitle(*v,i)){End(false);return;}}}
         RememberLayout();FollowNativeZOrder();Animate(1,true,true);
     }
-    void SceneChanged(HWND source){
+    void SceneChanged(HWND source,bool deferLayout=false){
         if(phase!=Phase::Opening&&phase!=Phase::Settled)return;
         for(auto&v:views)for(auto&i:v->items)if(i.source==source){
             if(i.minimized!=(IsIconic(source)!=FALSE)){ReconcileWindowStates();return;}
@@ -1340,7 +1440,7 @@ public:
             bool moved=std::abs(actual.x-i.original.x)>.5||std::abs(actual.y-i.original.y)>.5;
             i.original=actual;i.nativeRadius=SystemCornerRadius(source,v->dpi);
             if(resize)RebindRestoredSample(*v,i,r);
-            if(resize||moved)Relayout();return;
+            if(resize||moved){if(deferLayout)sceneNeedsLayout=true;else Relayout();}return;
         }
         if(!IsWindowVisible(source)||GetAncestor(source,GA_ROOT)!=source)return;
         BuildGuard guard(*this);std::vector<size_t> counts;for(auto&v:views)counts.push_back(v->items.size());AddWindow(source,reinterpret_cast<LPARAM>(this));
@@ -1510,23 +1610,13 @@ public:
         if(SUCCEEDED(hr))hr=device->CreateVisual(&i.content);
         if(SUCCEEDED(hr))hr=device->CreateScaleTransform(&i.scale);
         if(SUCCEEDED(hr))hr=device->CreateRectangleClip(&i.clip);
-        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.border);
-        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.borderFill);
-        if(SUCCEEDED(hr))hr=device->CreateVisual(&i.buttons);
-        if(SUCCEEDED(hr))hr=device->CreateScaleTransform(&i.borderScale);
-        if(SUCCEEDED(hr))hr=device->CreateEffectGroup(&i.borderEffect);
         if(SUCCEEDED(hr))hr=i.content->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
         if(SUCCEEDED(hr))hr=i.content->SetBorderMode(DCOMPOSITION_BORDER_MODE_SOFT);
-        if(SUCCEEDED(hr))hr=i.border->SetBorderMode(DCOMPOSITION_BORDER_MODE_SOFT);
         if(FAILED(hr)){Log(L"Create window surface",hr);return false;}
         i.stroke=3*v.dpi;i.gap=4*v.dpi;
         i.surface->SetTransform(i.scale.Get());i.content->AddVisual(i.surface.Get(),TRUE,nullptr);i.content->SetClip(i.clip.Get());
         i.position->AddVisual(i.content.Get(),TRUE,nullptr);
-        i.borderFill->SetTransform(i.borderScale.Get());
-        i.border->AddVisual(i.borderFill.Get(),TRUE,nullptr);
-        i.border->SetOffsetX(-i.Outset());i.border->SetOffsetY(-i.Outset());
-        i.borderEffect->SetOpacity(0.f);i.border->SetEffect(i.borderEffect.Get());
-        i.buttons->SetOffsetY(CloseInset(v));i.canMinimize=(GetWindowLongPtr(i.source,GWL_STYLE)&WS_MINIMIZEBOX)!=0;
+        i.canMinimize=(GetWindowLongPtr(i.source,GWL_STYLE)&WS_MINIMIZEBOX)!=0;
         i.nativeRadius=SystemCornerRadius(i.source,v.dpi);
         i.clip->SetLeft(0.f);i.clip->SetTop(0.f);
         return true;
@@ -1578,9 +1668,13 @@ public:
     template<class Setter> void Property(double a,double b,Setter setter,double duration=-1){
         if(duration<0)duration=seconds;
         if(duration<=0||std::abs(b-a)<.00001){setter(float(b));return;}
-        for(auto&e:animations)if(e.a==a&&e.b==b&&e.duration==duration){setter(e.animation.Get());return;}
-        ComPtr<IDCompositionAnimation> animation;
-        if(FAILED(device->CreateAnimation(&animation))){setter(float(b));return;}
+        std::array<double,3> key{a,b,duration};
+        if(auto found=animationIndex.find(key);found!=animationIndex.end()){setter(animations[found->second].animation.Get());return;}
+        auto animation=MakeAnimation(a,b,duration);if(!animation){setter(float(b));return;}
+        setter(animation.Get());animationIndex.emplace(key,animations.size());animations.push_back({a,b,duration,std::move(animation)});
+    }
+    ComPtr<IDCompositionAnimation> MakeAnimation(double a,double b,double duration){
+        ComPtr<IDCompositionAnimation> animation;if(FAILED(device->CreateAnimation(&animation)))return {};
         // Twelve Hermite cubics approximate critically damped motion. All share
         // an absolute QPC start so position, scale and rectangular bounds stay in sync.
         constexpr int parts=12;double dt=duration/parts,delta=b-a;
@@ -1591,14 +1685,27 @@ public:
             double c2=(3*(f1-f0)/dt-2*m0-m1)/dt,c3=(2*(f0-f1)/dt+m0+m1)/(dt*dt);
             animation->AddCubic(j*dt,float(f0),float(m0),float(c2),float(c3));
         }
-        animation->End(duration,float(b));setter(animation.Get());animations.push_back({a,b,duration,std::move(animation)});
+        animation->End(duration,float(b));return animation;
+    }
+    void SyncDecorations(View&v,Item&i){
+        Box a=phase==Phase::Settled?i.target:i.motionFrom,b=phase==Phase::Settled?i.target:i.motionTo;
+        auto property=[&](double from,double to,auto setter){
+            if(phase==Phase::Settled||seconds<=0||std::abs(to-from)<.00001){setter(float(to));return;}
+            auto animation=MakeAnimation(from,to,seconds);if(!animation){setter(float(to));return;}
+            LARGE_INTEGER begin{};begin.QuadPart=animationStart;animation->SetAbsoluteBeginTime(begin);setter(animation.Get());
+        };
+        // A decoration first hovered during motion joins the existing absolute
+        // timeline; it must not jump to the destination or restart the scene.
+        property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
+        property((a.h+TitleProtrusion(v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
+        property(a.w-ButtonsWidth(v,i)-CloseInset(v),b.w-ButtonsWidth(v,i)-CloseInset(v),[&](auto value){i.buttons->SetOffsetX(value);});
     }
     void StaticPose(double p){
         for(auto&v:views)for(auto&i:v->items){
             Box b=Mix(ExitPose(i),i.target,p);i.position->SetOffsetX(float(b.x));i.position->SetOffsetY(float(b.y));
             i.scale->SetScaleX(float(b.w/i.pixels.cx));i.scale->SetScaleY(float(b.h/i.pixels.cy));
             i.clip->SetRight(float(b.w));i.clip->SetBottom(float(b.h));
-            i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight);
+            if(i.borderScale){i.borderScale->SetScaleX(float(b.w+2*i.Outset())/i.borderWidth);i.borderScale->SetScaleY(float(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight);}
             if(i.buttons)i.buttons->SetOffsetX(float(b.w)-ButtonsWidth(*v,i)-CloseInset(*v));
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h-v->dpi));i.labelEffect->SetOpacity(float(p));}
             i.labelFrom=i.labelTo=p;i.labelSeconds=0;
@@ -1627,7 +1734,7 @@ public:
         return from+(to-from)*Curve(seconds<=0?1:(Now()-start)/seconds);
     }
     void Animate(double destination,bool captured=false,bool reflow=false){
-        if(!captured)CaptureMotion();animations.clear();
+        if(!captured)CaptureMotion();animations.clear();animationIndex.clear();
         from=progress;to=destination;
         BOOL enabled=TRUE;SystemParametersInfo(SPI_GETCLIENTAREAANIMATION,0,&enabled,0);
         seconds=(enabled?settings.duration:0)/1000.0*(reflow?1.:std::abs(to-from));
@@ -1643,9 +1750,11 @@ public:
             Property(a.w,b.w,[&](auto value){i.clip->SetRight(value);});
             Property(a.h,b.h,[&](auto value){i.clip->SetBottom(value);});
             Property(i.radiusFrom,i.radiusTo,[&](auto value){SetCorners(i,value);});
-            Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
-            Property((a.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
-            if(i.buttons)Property(a.w-ButtonsWidth(*v,i)-CloseInset(*v),b.w-ButtonsWidth(*v,i)-CloseInset(*v),[&](auto value){i.buttons->SetOffsetX(value);});
+            if(i.borderAttached){
+                Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
+                Property((a.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
+            }
+            if(i.buttonsAttached)Property(a.w-ButtonsWidth(*v,i)-CloseInset(*v),b.w-ButtonsWidth(*v,i)-CloseInset(*v),[&](auto value){i.buttons->SetOffsetX(value);});
             if(i.label){
                 Property((a.w-i.target.w)*.5,(b.w-i.target.w)*.5,[&](auto value){i.label->SetOffsetX(value);});
                 Property(a.h-v->dpi,b.h-v->dpi,[&](auto value){i.label->SetOffsetY(value);});
@@ -1666,7 +1775,7 @@ public:
         start=double(animationStart)/frequency.QuadPart;LARGE_INTEGER begin{};begin.QuadPart=animationStart;
         for(auto&e:animations)e.animation->SetAbsoluteBeginTime(begin);
         HRESULT hr=device->Commit();if(FAILED(hr)){Log(L"Animate",hr);End(true);return;}
-        animations.clear();
+        animations.clear();animationIndex.clear();
         if(seconds<=0){FinishTransition();return;}
         Schedule(std::max(0.,start+seconds-Now())+frameSeconds);
     }
@@ -1686,10 +1795,13 @@ public:
             native.insert(position,preferred);
         }
         for(auto&v:views)if(v->windows){
+            std::unordered_map<HWND,int> indices;indices.reserve(v->items.size());for(size_t n=0;n<v->items.size();++n)indices.emplace(v->items[n].source,int(n));
+            std::vector<HWND> order;order.reserve(v->items.size());v->hitOrder.clear();
+            for(HWND w:native)if(auto found=indices.find(w);found!=indices.end()){order.push_back(w);v->hitOrder.push_back(found->second);}
+            if(order==v->visualOrder)continue;
             v->windows->RemoveAllVisuals();
-            v->hitOrder.clear();for(HWND w:native)for(size_t n=0;n<v->items.size();++n)if(v->items[n].source==w)v->hitOrder.push_back(int(n));
-            for(auto hwnd=native.rbegin();hwnd!=native.rend();++hwnd)
-                for(auto&i:v->items)if(i.source==*hwnd){v->windows->AddVisual(i.position.Get(),FALSE,nullptr);break;}
+            for(auto n=v->hitOrder.rbegin();n!=v->hitOrder.rend();++n)v->windows->AddVisual(v->items[*n].position.Get(),FALSE,nullptr);
+            v->visualOrder=std::move(order);
         }
     }
     bool RebindRestoredSample(View&v,Item&i,const RECT&r){
@@ -1745,7 +1857,7 @@ public:
         for(auto&v:views){
             auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){End(false);return true;}
-            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
                 if(!CreateTitle(*v,i)){End(false);return true;}
             }
         }
@@ -1805,7 +1917,7 @@ public:
     void End(bool restore,bool idle=true){
         ResetGesture();RemoveProp(controller,kOverviewProperty);
         if(timer)CancelWaitableTimer(timer);idleTimer=false;
-        animations.clear();
+        animations.clear();animationIndex.clear();
         bool visible=std::any_of(views.begin(),views.end(),[](const auto&v){return v->hwnd&&IsWindowVisible(v->hwnd);});
         phase=Phase::Hidden;
         if(foregroundHook){UnhookWinEvent(foregroundHook);foregroundHook=nullptr;}
@@ -1927,6 +2039,7 @@ public:
         for(auto&v:views)for(size_t n=0;n<v->items.size();++n){auto&i=v->items[n];if(i.source!=source)continue;
             if((!i.borderSurface||i.borderColor!=accentColor)&&!CreateOutline(*v,i)){End(false);return;}
             if(!PrepareButtons(*v,i)){End(false);return;}
+            SyncDecorations(*v,i);
             i.position->AddVisual(i.border.Get(),FALSE,i.label?i.label.Get():i.content.Get());i.borderAttached=true;i.borderEffect->SetOpacity(1.f);v->selected=int(n);
             i.position->AddVisual(i.buttons.Get(),FALSE,nullptr);i.buttonsAttached=true;
         }
@@ -1994,10 +2107,19 @@ public:
         case kWarmup:Warmup();return 0;
         case kWindowStateChanged:RefreshRestoredGeometry();return 0;
         case kTaskbarOrder:TaskbarChanged();return 0;
-        case kSceneChanged:SceneChanged(reinterpret_cast<HWND>(wp));return 0;
+        case kSceneChanged:{
+            // Coalesce already queued geometry notifications without a polling
+            // timer or an extra frame of debounce latency.
+            std::vector<HWND> sources{reinterpret_cast<HWND>(wp)};MSG pending{};
+            for(int n=0;n<256&&PeekMessage(&pending,controller,kSceneChanged,kSceneChanged,PM_REMOVE);++n){HWND source=reinterpret_cast<HWND>(pending.wParam);
+                if(std::find(sources.begin(),sources.end(),source)==sources.end())sources.push_back(source);}
+            sceneNeedsLayout=false;for(HWND source:sources)SceneChanged(source,true);
+            if(std::exchange(sceneNeedsLayout,false)&&(phase==Phase::Opening||phase==Phase::Settled))Relayout();return 0;
+        }
         case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){RefreshRestoredGeometry();FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
-        case kAccentChanged:case WM_DWMCOLORIZATIONCOLORCHANGED:case WM_THEMECHANGED:if(hwnd==controller)RefreshAccent();return 0;
+        case kAccentChanged:case WM_DWMCOLORIZATIONCOLORCHANGED:if(hwnd==controller)RefreshAccent();return 0;
+        case WM_THEMECHANGED:desktopCache.clear();if(hwnd==controller)RefreshAccent();return 0;
         case WM_DISPLAYCHANGE:case WM_DPICHANGED:case WM_SETTINGCHANGE:desktopCache.clear();if(!building&&phase!=Phase::Hidden)PostMessage(controller,kDismiss,1,0);return 0;
         case WM_QUERYENDSESSION:return TRUE;
         case WM_ENDSESSION:if(wp)SetEvent(g_stopEvent);return 0;
