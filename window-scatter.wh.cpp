@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.10
+// @version         0.4.12
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -29,10 +29,12 @@ selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
 Ordinary windows use one common scale per monitor, preserving their relative dimensions.
+Every new opening computes a fresh layout, including an interrupted closing animation.
 The initial layout compares compact stacks with mixed horizontal/vertical
 subgroups and centers the complete footprint within each monitor. Later changes
-reuse grouping and close nearby gaps; a substantially better screen fit can
-replace the grouping when existing previews retain separated motion paths. Minimized
+preserve a feasible common scale and allow wider movement to use available space,
+while existing previews retain separated motion paths. Interrupted local changes
+use the current captured positions instead of their unfinished destinations. Minimized
 previews have a separate bottom-center shelf and slide from below the display
 with a subtle 94%-100% scale change, retaining their colors and opacity.
 Size, compactness, visual balance and the original left/right
@@ -52,7 +54,8 @@ leaving the shell request/event listeners. Resident mode always keeps the device
 Memory saver skips startup prewarming and releases it after each overview.
 Reopening after release recreates graphics resources. No periodic memory polling
 is used when Windows memory notifications are available. Cached wallpaper surfaces
-are reused per monitor and released after 60 seconds of inactivity. Wallpaper
+are reused per monitor; after 60 seconds of inactivity, at most 64 MiB of
+wallpaper pixels remain cached. Automatic low-memory handling and Memory saver release them. Wallpaper
 file timestamps and display/theme notifications invalidate stale backgrounds.
 DWM supplies the live window surface and its transparency. The existing native
 DirectComposition rectangle clip applies 8 DIP corners, including to maximized
@@ -72,7 +75,8 @@ Explorer's Task View request is redirected to the dedicated renderer. The system
 recognizes Win+Tab and the configured three-finger upward swipe. There is no
 keyboard capture or periodic hook renewal. UISettings supplies the accent color
 and notifies color changes. Native activation
-happens after animation submission, so a slow input queue cannot delay its start. Reversing a closing animation reuses the existing scene.
+happens after animation submission, so a slow input queue cannot delay its start.
+Reversing a closing animation keeps the current pose and computes fresh destinations.
 Animated click targets follow the same front-to-back order as the previews.
 
 An opaque wallpaper background covers the original windows during the overview.
@@ -597,11 +601,22 @@ static PositionFit FreePositions(const std::vector<Box>&src,const std::vector<Bo
     PositionFit best;
     // Start with a complete feasible candidate when available. Optimizing all
     // its positions already removes group-center and cross-axis alignment.
-    std::vector<PositionSeparation> complete;
-    for(const auto&p:pairs){unsigned directions=SeparationDirections(seed[p.first],seed[p.second],gap,caption)&p.allowed;
-        if(!directions){complete.clear();break;}
-        int direction=0;while(!(directions&(1u<<direction)))++direction;complete.push_back(separation(p,direction));}
-    if(complete.size()==pairs.size())best=project(complete);
+    auto trySeed=[&](const std::vector<Box>&positions,bool completeGaps=false){
+        if(positions.size()!=src.size())return;
+        std::vector<PositionSeparation> complete;
+        for(const auto&p:pairs){auto a=positions[p.first],b=positions[p.second];
+            if(a.w<=0){if(!completeGaps)return;a=seed[p.first];}
+            if(b.w<=0){if(!completeGaps)return;b=seed[p.second];}
+            unsigned directions=SeparationDirections(a,b,gap,caption)&p.allowed;
+            int direction=0;
+            if(!directions){if(!completeGaps)return;
+                double bestShift=1e100,shifts[]{(a.right()+gap-b.x)/area.w,(b.right()+gap-a.x)/area.w,(a.bottom()+caption+gap-b.y)/area.h,(b.bottom()+caption+gap-a.y)/area.h};
+                for(int d=0;d<4;++d)if((p.allowed&(1u<<d))&&shifts[d]<bestShift){bestShift=shifts[d];direction=d;}}
+            else while(!(directions&(1u<<direction)))++direction;
+            complete.push_back(separation(p,direction));}
+        auto fit=project(complete);if(fit.cost<best.cost)best=std::move(fit);
+    };
+    trySeed(seed);trySeed(anchors,count<=64);
     struct Node {std::vector<PositionSeparation> separations;PositionFit fit;};
     std::vector<Node> pending;auto root=project({});if(!root.boxes.empty())pending.push_back({{},std::move(root)});
     // Branch only on an actual conflict. The budget is deterministic, so many
@@ -639,30 +654,57 @@ static std::vector<Box> Layout(const std::vector<Box>&src,Box area,double gap,do
 static std::vector<Box> StableLayout(const std::vector<Box>&src,const std::vector<Box>&anchors,Box area,double gap,double caption,
         const std::vector<LayoutSlot>&previous={},std::vector<LayoutSlot>*next=nullptr,bool liveReflow=true){
     if(src.empty()||area.w<=0||area.h<=0)return {};
+    // A completed session's locally adjusted layout is not an optimization seed.
+    // Only previews already on screen need stable positions and separated paths.
+    if(!liveReflow)return Layout(src,area,gap,caption,next);
     if(anchors.size()!=src.size()||previous.size()!=src.size())return Layout(src,area,gap,caption,next);
-    bool unchanged=true,removed=false;int known=0;
+    bool unchanged=true;int known=0;double oldScale=.85;
     for(size_t i=0;i<src.size();++i){auto p=previous[i];if(anchors[i].w<=0||p.group<0){unchanged=false;continue;}++known;
-        if(std::abs(p.original.x-src[i].x)>.5||std::abs(p.original.y-src[i].y)>.5||p.area.x!=area.x||p.area.y!=area.y||p.area.w!=area.w||p.area.h!=area.h)
+        if(std::abs(p.original.x-src[i].x)>.5||std::abs(p.original.y-src[i].y)>.5)
             return Layout(src,area,gap,caption,next);
-        removed|=p.count>int(src.size());unchanged&=p.count==int(src.size())&&std::abs(p.original.w-src[i].w)<.01&&std::abs(p.original.h-src[i].h)<.01;
+        oldScale=std::min({oldScale,anchors[i].w/p.original.w,anchors[i].h/p.original.h});
+        unchanged&=p.count==int(src.size())&&std::abs(p.original.w-src[i].w)<.01&&std::abs(p.original.h-src[i].h)<.01&&p.area.x==area.x&&p.area.y==area.y&&p.area.w==area.w&&p.area.h==area.h;
     }
     if(!known)return Layout(src,area,gap,caption,next);
     if(unchanged){if(next)*next=previous;return anchors;}
-    // Between overview sessions no previews travel from the old arrangement.
-    // Changed desktop scenes therefore need no inherited separation paths.
-    if(!liveReflow)return Layout(src,area,gap,caption,next);
     auto seed=PackedLayout(src,area,gap,caption);if(seed.empty())return seed;
     gap=std::min(gap,std::sqrt(area.w*area.h/src.size())*.10);
-    double scale=seed[0].w/src[0].w;PositionFit fit;
-    // Old previews must retain a separating direction during linear reflow.
-    // This constrains paths, not permanent grouping. A crowded insertion can
-    // use a slightly smaller shared scale rather than swap existing windows.
-    for(int attempt=0;attempt<8;++attempt){
-        fit=FreePositions(src,seed,area,gap,caption,scale,anchors,removed?.75:3);
-        if(!fit.boxes.empty())break;scale*=.9;
+    double seedScale=seed[0].w/src[0].w,low=0,high=.85,bodyArea=0,captionArea=0;PositionFit best;
+    bool allKnown=known==int(src.size());
+    // Retain a directly verified feasible layout before searching. Removing a
+    // window cannot lose its old scale merely because a new packing seed or a
+    // bounded position search chooses a poorer arrangement.
+    if(allKnown){std::vector<Box> retained;bool valid=true;
+        for(size_t i=0;i<src.size();++i){Box b{anchors[i].cx()-src[i].w*oldScale*.5,anchors[i].cy()-src[i].h*oldScale*.5,src[i].w*oldScale,src[i].h*oldScale};
+            auto footprint=b;footprint.h+=caption;valid&=Contains(area,footprint);
+            for(size_t j=0;j<retained.size();++j)valid&=SeparationDirections(retained[j],b,gap,caption)!=0;
+            retained.push_back(b);}
+        if(valid&&ClearReflow(anchors,retained,caption)){best.boxes=std::move(retained);low=oldScale;}
     }
+    if(seedScale>low&&ClearReflow(anchors,seed,caption)){best.boxes=seed;low=seedScale;}
+    for(auto b:src){high=std::min({high,area.w/b.w,(area.h-caption)/b.h});bodyArea+=b.w*b.h;captionArea+=b.w*caption;}
+    high=std::min(high,2*area.w*area.h/(captionArea+std::sqrt(captionArea*captionArea+4*bodyArea*area.w*area.h)));
+    // Larger scenes retain the packing estimate as their search ceiling. Small
+    // scenes can use the free space beyond it without an unbounded search.
+    if(src.size()>24)high=std::min(high,std::max(seedScale,allKnown?oldScale:0.));
+    double history=allKnown||src.size()<=24?.35:3.;
+    auto attempt=[&](double scale){
+        auto fit=FreePositions(src,seed,area,gap,caption,scale,anchors,history);
+        if(!fit.boxes.empty()){low=scale;best=std::move(fit);seed=best.boxes;return true;}
+        high=scale;return false;
+    };
+    double initial=std::clamp(std::max(seedScale,allKnown?oldScale:0.),low,std::max(low,high));
+    attempt(initial);
+    if(allKnown&&oldScale>low+1e-8&&oldScale<high-1e-8)attempt(oldScale);
+    // Establish a close feasible lower bound before refining. Starting a
+    // crowded insertion halfway to zero would waste most of the screen.
+    for(int step=0;best.boxes.empty()&&step<8;++step)attempt(high*.9);
+    int refinements=src.size()<=12?6:src.size()<=24?4:src.size()<=64?3:src.size()<=128?1:0;
+    for(int step=0;step<refinements&&high-low>std::max(.001,high*.01);++step)attempt((low+high)*.5);
+    for(int step=0;best.boxes.empty()&&step<8;++step)attempt(high*.5);
+    if(!best.boxes.empty()&&best.cost==1e100){auto fit=FreePositions(src,seed,area,gap,caption,low,anchors,history);if(!fit.boxes.empty())best=std::move(fit);}
     if(next)*next=SavePositions(src,area);
-    return fit.boxes.empty()?Layout(src,area,gap,caption,next):fit.boxes;
+    return best.boxes.empty()?Layout(src,area,gap,caption,next):best.boxes;
 }
 
 static double Curve(double t) {
@@ -852,8 +894,6 @@ public:
     std::map<float,TitleStyle> titleStyles;
     ComPtr<IWICImagingFactory> imageFactory;
     std::vector<DesktopCache> desktopCache;
-    struct LayoutMemory{HWND source;DWORD process;HMONITOR monitor;RECT bounds;float dpi;bool minimized;Box target;LayoutSlot slot;};
-    std::vector<LayoutMemory> layoutMemory;
     TaskbarOrder taskbarOrder;
     PrivateDwm api;
     std::vector<std::unique_ptr<View>> views;
@@ -916,6 +956,22 @@ public:
         // let Windows reclaim also the now-unused DLL/allocator resident pages.
         // This trims physical residency; it does not pretend to remove commit.
         SetProcessWorkingSetSize(GetCurrentProcess(),SIZE_T(-1),SIZE_T(-1));
+    }
+    void TrimIdleResources(){
+        if(building||phase!=Phase::Hidden)return;
+        idleTimer=false;taskbarOrder.Stop();
+        if(ShouldReleaseGraphics()){ReleaseInactiveGraphics();return;}
+        // Re-decoding and uploading full wallpapers on the next keypress is
+        // much slower than retaining a bounded set of immutable surfaces.
+        // This is a one-shot cleanup, with no polling or background rendering.
+        uint64_t remaining=64ull*1024*1024;
+        std::erase_if(desktopCache,[&](const auto&cached){
+            uint64_t bytes=uint64_t(std::max<LONG>(0,cached.bounds.right-cached.bounds.left))*
+                           uint64_t(std::max<LONG>(0,cached.bounds.bottom-cached.bounds.top))*4;
+            if(bytes>remaining)return true;remaining-=bytes;return false;
+        });
+        if(d2dDevice)d2dDevice->ClearResources(0);
+        if(device)device->Commit();
     }
     void MemoryBecameLow(){
         if(settings.memoryMode!=MemoryMode::Automatic)return;
@@ -1353,6 +1409,7 @@ public:
             for(auto&i:v->items)if(i.source==source)v->windows->RemoveVisual(i.position.Get());
             std::erase_if(v->items,[&](const Item&i){return i.source==source;});remaining+=v->items.size();
             if(v->items.empty())continue;
+            AnchorCurrentLayout(*v);
             auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){End(false);return;}
             for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
@@ -1382,7 +1439,7 @@ public:
             DWORD timeout=watch&&!lowMemoryEvent?5000:INFINITE;
             DWORD r=MsgWaitForMultipleObjectsEx(count,handles,timeout,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
             if(r==WAIT_OBJECT_0||r==WAIT_FAILED)break;
-            if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden){idleTimer=false;desktopCache.clear();taskbarOrder.Stop();if(d2dDevice)d2dDevice->ClearResources(0);if(device)device->Commit();}else FinishTransition();}
+            if(r==WAIT_OBJECT_0+1){if(idleTimer&&phase==Phase::Hidden)TrimIdleResources();else FinishTransition();}
             if((count==3&&r==WAIT_OBJECT_0+2)||(r==WAIT_TIMEOUT&&LowMemory()))MemoryBecameLow();
             MSG msg;for(int n=0;n<64&&PeekMessage(&msg,nullptr,0,0,PM_REMOVE);++n){if(msg.message==WM_QUIT)return;TranslateMessage(&msg);DispatchMessage(&msg);}
         }
@@ -1402,9 +1459,6 @@ public:
         else if(!(GetWindowLongPtr(hwnd,GWL_EXSTYLE)&WS_EX_TOOLWINDOW))
             OffsetRect(&r,monitor.rcWork.left-monitor.rcMonitor.left,monitor.rcWork.top-monitor.rcMonitor.top);
         return r.right>r.left&&r.bottom>r.top;
-    }
-    void RecallLayout(View&v){
-        for(auto&i:v.items)for(const auto&m:layoutMemory)if(m.source==i.source&&m.process==i.sourceProcess&&m.monitor==v.monitor&&EqualRect(&m.bounds,&v.bounds)&&m.dpi==v.dpi){i.layoutAnchor=m.target;i.anchorMinimized=m.minimized;i.anchorSlot=m.slot;break;}
     }
     static void AssignTaskbarOrder(View&v,const std::vector<TaskbarEntry>&order){
         for(auto&i:v.items){i.taskbarRank=INT_MAX;
@@ -1426,7 +1480,7 @@ public:
         ++layoutPasses;
 #endif
         progress=CurrentProgress();CaptureMotion();ClearSelection();BuildGuard guard(*this);
-        for(auto&v:views){auto layout=Arrange(*v);if(layout.size()!=v->items.size()){End(false);return;}
+        for(auto&v:views){AnchorCurrentLayout(*v);auto layout=Arrange(*v);if(layout.size()!=v->items.size()){End(false);return;}
             for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();if(!CreateTitle(*v,i)){End(false);return;}}}
         RememberLayout();FollowNativeZOrder();Animate(1,true,true);
     }
@@ -1457,9 +1511,23 @@ public:
         if(added){taskbarOrder.Refresh();Relayout();if(phase!=Phase::Hidden){device->WaitForCommitCompletion();for(auto&v:views)if(v->hwnd&&!IsWindowVisible(v->hwnd))ShowWindow(v->hwnd,SW_SHOWNOACTIVATE);}}
     }
     void RememberLayout(){
-        layoutMemory.clear();
-        for(auto&v:views)for(auto&i:v->items){i.layoutAnchor=i.target;i.anchorMinimized=i.minimized;i.anchorSlot=i.layoutSlot;
-            layoutMemory.push_back({i.source,i.sourceProcess,v->monitor,v->bounds,v->dpi,i.minimized,i.target,i.layoutSlot});}
+        for(auto&v:views)for(auto&i:v->items){i.layoutAnchor=i.target;i.anchorMinimized=i.minimized;i.anchorSlot=i.layoutSlot;}
+    }
+    void AnchorCurrentLayout(View&v){
+        if(phase!=Phase::Opening)return;
+        int count=0;for(auto&i:v.items)count+=!i.minimized;
+        bool changed=false;std::vector<Item*> retained;double caption=26*v.dpi;
+        for(auto&i:v.items)if(!i.minimized){
+            if(i.anchorMinimized||i.layoutAnchor.w<=0){changed=true;continue;}
+            const auto&p=i.anchorSlot;
+            changed|=p.count!=count||std::abs(p.original.w-i.original.w)>.01||std::abs(p.original.h-i.original.h)>.01;
+            // Initial expansion can still contain overlapping source windows.
+            // Only use a captured pose once its retained previews are separated.
+            auto a=i.motionFrom;a.h+=caption;
+            for(auto*j:retained){auto b=j->motionFrom;b.h+=caption;if(Overlap(a,b))return;}
+            retained.push_back(&i);
+        }
+        if(changed)for(auto*i:retained)i->layoutAnchor=i->motionFrom;
     }
     static std::vector<Box> Arrange(View&v,bool liveReflow=true){
         double pad=28*v.dpi,gap=12*v.dpi,caption=26*v.dpi;
@@ -1467,7 +1535,7 @@ public:
         std::vector<int> normal,small;std::vector<Box> sources,anchors,result(v.items.size());
         for(size_t n=0;n<v.items.size();++n)(v.items[n].minimized?small:normal).push_back(int(n));
         std::stable_sort(small.begin(),small.end(),[&](int a,int b){
-            const auto&x=v.items[a];const auto&y=v.items[b];bool oldX=x.anchorMinimized&&x.layoutAnchor.w>0,oldY=y.anchorMinimized&&y.layoutAnchor.w>0;
+            const auto&x=v.items[a];const auto&y=v.items[b];bool oldX=liveReflow&&x.anchorMinimized&&x.layoutAnchor.w>0,oldY=liveReflow&&y.anchorMinimized&&y.layoutAnchor.w>0;
             if(x.taskbarRank!=y.taskbarRank)return x.taskbarRank<y.taskbarRank;
             if(x.groupKey!=y.groupKey)return x.groupKey<y.groupKey;
             if(oldX!=oldY)return oldX;return oldX&&x.layoutAnchor.x<y.layoutAnchor.x;
@@ -1641,7 +1709,7 @@ public:
                 if(a.original.h!=b.original.h)return a.original.h>b.original.h;
                 return reinterpret_cast<ULONG_PTR>(a.source)<reinterpret_cast<ULONG_PTR>(b.source);
             });
-            RecallLayout(*v);ApplyTaskbarOrder(*v);auto layout=Arrange(*v,false);
+            ApplyTaskbarOrder(*v);auto layout=Arrange(*v,false);
             if(layout.size()!=v->items.size()){building=false;End(false);return false;}
             for(size_t j=0;j<layout.size();++j){v->items[j].target=layout[j];if(!CreateTitle(*v,v->items[j])){building=false;End(false);return false;}}
             count+=v->items.size();
@@ -1835,12 +1903,20 @@ public:
         }
         return rebound;
     }
-    bool ReconcileWindowStates(bool captured=false){
+    bool ReconcileWindowStates(bool freshLayout=false){
         bool changed=false;
-        for(auto&v:views)for(auto&i:v->items)if(IsWindow(i.source)&&i.minimized!=(IsIconic(i.source)!=FALSE)){
+        for(auto&v:views)for(auto&i:v->items)if(IsWindow(i.source)&&(freshLayout||i.minimized!=(IsIconic(i.source)!=FALSE))){
             bool minimized=IsIconic(i.source)!=FALSE;
             RECT r{};if(!Bounds(i.source,r))continue;
-            if(!changed&&!captured){progress=CurrentProgress();CaptureMotion();}
+            if(i.minimized==minimized){
+                if(freshLayout&&!minimized){
+                    Box current{double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+                    if(std::abs(current.w-i.original.w)>.5||std::abs(current.h-i.original.h)>.5)RebindRestoredSample(*v,i,r);
+                    i.original=current;i.nativeRadius=SystemCornerRadius(i.source,v->dpi);
+                }
+                continue;
+            }
+            if(!changed&&!freshLayout){progress=CurrentProgress();CaptureMotion();}
             changed=true;
             if(!minimized){
                 RebindRestoredSample(*v,i,r);
@@ -1849,19 +1925,27 @@ public:
             }else i.restoredSampleValid=false;
             i.minimized=minimized;
         }
-        if(!changed)return false;
+        if(!changed&&!freshLayout)return false;
         if(restoreSource&&!IsIconic(restoreSource)){
             if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}restoreSource=nullptr;
         }
-        ClearSelection();BuildGuard guard(*this);
+        ClearSelection();BuildGuard guard(*this);bool targetsChanged=false;
         for(auto&v:views){
-            auto layout=Arrange(*v);
+            if(freshLayout)ApplyTaskbarOrder(*v);
+            else AnchorCurrentLayout(*v);
+            auto layout=Arrange(*v,!freshLayout);
             if(layout.size()!=v->items.size()){End(false);return true;}
-            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
+            for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];auto target=layout[n];
+                targetsChanged|=std::abs(target.x-i.target.x)>.01||std::abs(target.y-i.target.y)>.01||std::abs(target.w-i.target.w)>.01||std::abs(target.h-i.target.h)>.01;
+                i.target=target;if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
                 if(!CreateTitle(*v,i)){End(false);return true;}
             }
         }
-        RememberLayout();FollowNativeZOrder();Animate(1,true,true);return true;
+        RememberLayout();FollowNativeZOrder();
+        // Layout and title preparation may take time while DWM keeps closing.
+        // Capture afterwards so the new animation never rewinds to an old pose.
+        if(freshLayout){progress=CurrentProgress();CaptureMotion();}
+        Animate(1,true,changed||targetsChanged);return true;
     }
     void RefreshRestoredGeometry(bool animate=true){
         if(phase==Phase::Opening||phase==Phase::Settled){ReconcileWindowStates();return;}
@@ -1907,12 +1991,10 @@ public:
         if(phase==Phase::Closing){ActivateWindow(target,chosen!=nullptr);RefreshRestoredGeometry();}
     }
     void Reopen(){
+        BuildGuard guard(*this);
         chosen=nullptr;previous=GetForegroundWindow();
         SetProp(controller,kOverviewProperty,reinterpret_cast<HANDLE>(kShellAck));FocusOverview();
-        // Native focus transfer can take time. Sample geometry and progress
-        // together afterwards, then continue from that pose without resetting it.
-        progress=CurrentProgress();CaptureMotion();
-        if(!ReconcileWindowStates(true))Animate(1,true);
+        ReconcileWindowStates(true);
     }
     void End(bool restore,bool idle=true){
         ResetGesture();RemoveProp(controller,kOverviewProperty);
