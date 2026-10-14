@@ -507,6 +507,15 @@ static PositionFit FreePositions(const std::vector<Box>&src,const std::vector<Bo
     for(int i=0;i<count;++i)for(int j=i+1;j<count;++j){
         bool retained=anchors.size()==src.size()&&anchors[i].w>0&&anchors[j].w>0;
         unsigned allowed=retained?SeparationDirections(anchors[i],anchors[j],0,caption):15u;
+        // Identical physical windows are interchangeable before live reflow.
+        // Order them by normalized diagonal position in the seed: every
+        // arrangement has such a labeling, so this removes duplicate window
+        // permutations without restricting its occupied shape or coordinates.
+        if(!retained&&std::abs(src[i].x-src[j].x)<.01&&std::abs(src[i].y-src[j].y)<.01&&std::abs(src[i].w-src[j].w)<.01&&std::abs(src[i].h-src[j].h)<.01){
+            double dx=src[i].w*scale+gap,dy=src[i].h*scale+caption+gap;
+            double first=seed[i].cx()/dx+seed[i].cy()/dy,second=seed[j].cx()/dx+seed[j].cy()/dy;
+            allowed&=first<=second?5u:10u;
+        }
         if(!allowed)return {};pairs.push_back({i,j,allowed});
         // Preserve a clearly dominant physical direction without imposing an
         // alignment or requiring separation along that particular axis.
@@ -539,7 +548,7 @@ static PositionFit FreePositions(const std::vector<Box>&src,const std::vector<Bo
     std::vector<Node> pending;auto root=project({});if(!root.boxes.empty())pending.push_back({{},std::move(root)});
     // Branch only on an actual conflict. The budget is deterministic, so many
     // windows cannot turn this into an unbounded combinatorial search.
-    const int budget=count<=4?256:count<=10?96:count<=24?32:8;
+    const int budget=count<=4?256:count<=8?512:count<=10?96:count<=24?32:8;
     for(int step=0;step<budget&&!pending.empty();++step){
         auto chosen=std::min_element(pending.begin(),pending.end(),[](const Node&a,const Node&b){return a.fit.cost<b.fit.cost;});
         Node node=std::move(*chosen);pending.erase(chosen);if(node.fit.cost>=best.cost-1e-6)continue;
@@ -570,7 +579,7 @@ static std::vector<Box> Layout(const std::vector<Box>&src,Box area,double gap,do
     return fit.boxes.empty()?seed:fit.boxes;
 }
 static std::vector<Box> StableLayout(const std::vector<Box>&src,const std::vector<Box>&anchors,Box area,double gap,double caption,
-        const std::vector<LayoutSlot>&previous={},std::vector<LayoutSlot>*next=nullptr){
+        const std::vector<LayoutSlot>&previous={},std::vector<LayoutSlot>*next=nullptr,bool liveReflow=true){
     if(src.empty()||area.w<=0||area.h<=0)return {};
     if(anchors.size()!=src.size()||previous.size()!=src.size())return Layout(src,area,gap,caption,next);
     bool unchanged=true,removed=false;int known=0;
@@ -581,6 +590,9 @@ static std::vector<Box> StableLayout(const std::vector<Box>&src,const std::vecto
     }
     if(!known)return Layout(src,area,gap,caption,next);
     if(unchanged){if(next)*next=previous;return anchors;}
+    // Between overview sessions no previews travel from the old arrangement.
+    // Changed desktop scenes therefore need no inherited separation paths.
+    if(!liveReflow)return Layout(src,area,gap,caption,next);
     auto seed=PackedLayout(src,area,gap,caption);if(seed.empty())return seed;
     gap=std::min(gap,std::sqrt(area.w*area.h/src.size())*.10);
     double scale=seed[0].w/src[0].w;PositionFit fit;
@@ -1349,7 +1361,7 @@ public:
         for(auto&v:views)for(auto&i:v->items){i.layoutAnchor=i.target;i.anchorMinimized=i.minimized;i.anchorSlot=i.layoutSlot;
             layoutMemory.push_back({i.source,i.sourceProcess,v->monitor,v->bounds,v->dpi,i.minimized,i.target,i.layoutSlot});}
     }
-    static std::vector<Box> Arrange(View&v){
+    static std::vector<Box> Arrange(View&v,bool liveReflow=true){
         double pad=28*v.dpi,gap=12*v.dpi,caption=26*v.dpi;
         Box area{pad,pad,std::max(1.,double(v.bounds.right-v.bounds.left)-2*pad),std::max(1.,double(v.bounds.bottom-v.bounds.top)-2*pad)};
         std::vector<int> normal,small;std::vector<Box> sources,anchors,result(v.items.size());
@@ -1379,7 +1391,7 @@ public:
         }
         std::vector<LayoutSlot> previous,next;
         for(int id:normal){sources.push_back(v.items[id].original);anchors.push_back(v.items[id].anchorMinimized?Box{}:v.items[id].layoutAnchor);previous.push_back(v.items[id].anchorSlot);}
-        auto layout=StableLayout(sources,anchors,area,22*v.dpi,caption,previous,&next);if(layout.size()!=normal.size())return {};
+        auto layout=StableLayout(sources,anchors,area,22*v.dpi,caption,previous,&next,liveReflow);if(layout.size()!=normal.size())return {};
         for(size_t n=0;n<normal.size();++n){result[normal[n]]=layout[n];v.items[normal[n]].layoutSlot=next[n];}
         return result;
     }
@@ -1539,7 +1551,7 @@ public:
                 if(a.original.h!=b.original.h)return a.original.h>b.original.h;
                 return reinterpret_cast<ULONG_PTR>(a.source)<reinterpret_cast<ULONG_PTR>(b.source);
             });
-            RecallLayout(*v);ApplyTaskbarOrder(*v);auto layout=Arrange(*v);
+            RecallLayout(*v);ApplyTaskbarOrder(*v);auto layout=Arrange(*v,false);
             if(layout.size()!=v->items.size()){building=false;End(false);return false;}
             for(size_t j=0;j<layout.size();++j){v->items[j].target=layout[j];if(!CreateTitle(*v,v->items[j])){building=false;End(false);return false;}}
             count+=v->items.size();

@@ -11,6 +11,10 @@ static bool Valid(const std::vector<Box>&boxes,Box area,double caption){
     return true;
 }
 static double Distance(const Box&a,const Box&b){return std::hypot(a.cx()-b.cx(),a.cy()-b.cy());}
+static double AreaDisplacement(const std::vector<Box>&src,const std::vector<Box>&boxes){
+    double largest=0,cost=0;for(auto b:src)largest=std::max(largest,b.w*b.h);
+    for(size_t i=0;i<src.size();++i)cost+=src[i].w*src[i].h/largest*std::pow(Distance(src[i],boxes[i]),2);return cost;
+}
 int main(int argc,char**argv){
     if(argc>1&&std::string(argv[1])=="--taskbar"){
         CoInitialize(nullptr);
@@ -105,6 +109,30 @@ int main(int argc,char**argv){
     aligned=StableLayout(maximized,skewed,maxArea,33,39,maxSlots);
     Check(Valid(aligned,maxArea,39)&&ClearReflow(skewed,aligned,39)&&std::abs(aligned[0].cy()-aligned[1].cy())<.001,
         "side-by-side maximized previews lose stale vertical offsets without changing their order");
+    std::vector<Box> sixSources(3,Box{0,0,3840,2112});for(int i=0;i<3;++i)sixSources.push_back({1189.+i*20,610.+i*20,2039,1235});
+    std::vector<LayoutSlot> sixSlots;auto six=Layout(sixSources,weightedArea,33,39,&sixSlots);
+    printf("Six-window search: scale %.8f, area-weighted displacement %.3f\n",six[0].w/3840,AreaDisplacement(sixSources,six));
+    Check(Valid(six,weightedArea,39)&&std::abs(six[0].w/3840-.3796686909)<1e-8&&AreaDisplacement(sixSources,six)<2.6e6,
+        "three maximized and three floating sources escape the old packing seed at the same window sizes");
+    auto betweenSources=sixSources,betweenAnchors=six;auto betweenSlots=sixSlots;
+    betweenSources.erase(betweenSources.begin()+1);betweenAnchors.erase(betweenAnchors.begin()+1);betweenSlots.erase(betweenSlots.begin()+1);
+    std::vector<LayoutSlot> freshSlots;auto freshOpen=StableLayout(betweenSources,betweenAnchors,weightedArea,33,39,betweenSlots,&freshSlots,false);
+    auto uncached=Layout(betweenSources,weightedArea,33,39);bool unconstrained=freshOpen.size()==uncached.size();
+    for(size_t i=0;i<freshOpen.size();++i)unconstrained&=Distance(freshOpen[i],uncached[i])<.001&&std::abs(freshOpen[i].w-uncached[i].w)<.001;
+    Check(unconstrained,"a changed scene reopened from the desktop does not inherit obsolete preview separation directions");
+    auto unchangedOpen=StableLayout(betweenSources,freshOpen,weightedArea,33,39,freshSlots,nullptr,false);bool sameOpen=true;
+    for(size_t i=0;i<freshOpen.size();++i)sameOpen&=Distance(freshOpen[i],unchangedOpen[i])<.001;
+    Check(sameOpen,"reopening the corrected unchanged scene keeps every preview in place");
+    std::vector<Box> restoreScene(3,Box{0,0,3840,2112});restoreScene.insert(restoreScene.end(),{{1189,610,2039,1235},{1227,648,2039,1235},{1809,314,2039,1235}});
+    auto restoredSix=Layout(restoreScene,weightedArea,33,39);
+    Check(Valid(restoredSix,weightedArea,39)&&AreaDisplacement(restoreScene,restoredSix)<2.3e6,
+        "the six-window restore-geometry fixture reduces area-weighted displacement without stacking every small window on one line");
+    View openingView;openingView.bounds={0,0,3840,2112};openingView.dpi=1.5f;
+    auto openingAnchors=PackedLayout(restoreScene,weightedArea,33,39);auto openingSlots=SavePositions(restoreScene,weightedArea);
+    for(size_t i=0;i<restoreScene.size();++i){Item item;item.original=restoreScene[i];item.layoutAnchor=openingAnchors[i];item.anchorSlot=openingSlots[i];item.anchorSlot.count=7;openingView.items.push_back(std::move(item));}
+    auto openingResult=App::Arrange(openingView,false);
+    Check(Valid(openingResult,weightedArea,39)&&AreaDisplacement(restoreScene,openingResult)<2.3e6,
+        "the real overview-opening layout entry releases cached packing after a desktop scene change");
     std::vector<Box> observed{{601,188,1297,714},{1935,41,1297,714},{802,975,1099,414},{1935,829,1297,714},{1214,1466,688,414},{1935,1609,688,414}};
     std::vector<Box> reconstructed;for(auto b:observed){double w=b.w/.337,h=b.h/.337;reconstructed.push_back({b.cx()-w*.5,b.cy()-h*.5,w,h});}
     Box approvedArea{42,42,3835-84,2100-84};std::vector<LayoutSlot> approvedSlots;auto approved=Layout(reconstructed,approvedArea,33,39,&approvedSlots);
