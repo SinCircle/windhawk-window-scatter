@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.12
+// @version         0.4.13
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -29,6 +29,8 @@ selection outline with a 4 DIP transparent gap. Preview brightness is unchanged.
 No instruction footer is drawn.
 
 Ordinary windows use one common scale per monitor, preserving their relative dimensions.
+Their source positions use the same scale around the available area's center,
+so the placement solver does not pull smaller previews toward unscaled coordinates.
 Every new opening computes a fresh layout, including an interrupted closing animation.
 The initial layout compares compact stacks with mixed horizontal/vertical
 subgroups and centers the complete footprint within each monitor. Later changes
@@ -174,6 +176,11 @@ struct Box {
 static bool Overlap(const Box&a,const Box&b){return a.x<b.right()-.01&&a.right()>b.x+.01&&a.y<b.bottom()-.01&&a.bottom()>b.y+.01;}
 static bool Contains(const Box&a,const Box&b){return b.x>=a.x-.01&&b.y>=a.y-.01&&b.right()<=a.right()+.01&&b.bottom()<=a.bottom()+.01;}
 static Box Mix(const Box&a,const Box&b,double t){return {a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.w+(b.w-a.w)*t,a.h+(b.h-a.h)*t};}
+// Scale source positions and dimensions in the same coordinate system. Scaling
+// around the available area's center preserves translations between monitors.
+static Box ScaledSource(const Box&source,Box area,double scale){
+    return {area.cx()+(source.x-area.cx())*scale,area.cy()+(source.y-area.cy())*scale,source.w*scale,source.h*scale};
+}
 
 // Packing candidates establish a feasible common size. Final positions are
 // optimized independently; history stores CPU geometry, never grid membership.
@@ -209,9 +216,11 @@ static double SourceRelationCost(const std::vector<Box>&src,const std::vector<Bo
 static double LayoutQuality(const std::vector<Box>&src,const std::vector<Box>&boxes,Box area,double caption,double cutoff=-1e100,const SourceRelationCache*relations=nullptr){
     if(boxes.empty())return -1e100;
     double left=1e100,top=1e100,right=-1e100,bottom=-1e100,occupied=0,movement=0,spread=0,scale=.85;int count=0;
-    for(size_t i=0;i<boxes.size();++i){auto b=boxes[i];if(b.w<=0)continue;++count;scale=std::min(scale,b.w/src[i].w);
+    for(size_t i=0;i<boxes.size();++i)if(boxes[i].w>0)scale=std::min(scale,boxes[i].w/src[i].w);
+    for(size_t i=0;i<boxes.size();++i){auto b=boxes[i];if(b.w<=0)continue;++count;
         left=std::min(left,b.x);right=std::max(right,b.right());top=std::min(top,b.y);bottom=std::max(bottom,b.bottom()+caption);occupied+=b.w*(b.h+caption);
-        double dx=(b.cx()-std::clamp(src[i].cx(),area.x,area.right()))/area.w,dy=(b.cy()-std::clamp(src[i].cy(),area.y,area.bottom()))/area.h;movement+=dx*dx+dy*dy;
+        auto target=ScaledSource(src[i],area,scale);
+        double dx=(b.cx()-std::clamp(target.cx(),area.x,area.right()))/area.w,dy=(b.cy()-std::clamp(target.cy(),area.y,area.bottom()))/area.h;movement+=dx*dx+dy*dy;
         double cx=(b.cx()-area.cx())/area.w,cy=(b.cy()+caption*.5-area.cy())/area.h;spread+=b.w*(b.h+caption)*(cx*cx+cy*cy);}
     if(!count||scale<=0)return -1e100;
     double waste=1-occupied/std::max(1.,(right-left)*(bottom-top));
@@ -472,7 +481,7 @@ static std::vector<Box> PackedLayout(const std::vector<Box>&src,Box area,double 
 }
 // For a fixed common scale, a separation chooses which side of another window
 // to use, not a row or column. The remaining coordinates solve a weighted
-// convex projection. Window area is its resistance to leaving the real center.
+// convex projection. Window area is its resistance to leaving the scaled center.
 struct PositionEdge {int first,second;double distance;};
 // Retain the same feasible region while removing constraints already implied
 // by a longer path. Cyclic graphs are left to the existing infeasibility check.
@@ -550,14 +559,15 @@ static PositionFit FreePositions(const std::vector<Box>&src,const std::vector<Bo
         bool retained=anchors.size()==src.size()&&anchors[i].w>0;
         // A maximized (or larger) source covers the available work area. Its
         // previous preview still preserves separating motion paths below,
-        // but an obsolete offset must not pull it away from its real center.
+        // but an obsolete offset must not pull it away from its scaled center.
         bool fullArea=retained&&Contains(src[i],area);
         double past=retained&&!fullArea?history:0;
         // The tiny seed term breaks ties between identical maximized windows;
         // it does not constrain the independently solved coordinates.
         double tie=fullArea?0:.002;weight[i]=mass*(1+past)+tie;
-        tx[i]=(mass*src[i].cx()+mass*past*(past?anchors[i].cx():0)+tie*seed[i].cx())/weight[i];
-        ty[i]=(mass*src[i].cy()+mass*past*(past?anchors[i].cy():0)+tie*seed[i].cy())/weight[i];
+        auto target=ScaledSource(src[i],area,scale);
+        tx[i]=(mass*target.cx()+mass*past*(past?anchors[i].cx():0)+tie*seed[i].cx())/weight[i];
+        ty[i]=(mass*target.cy()+mass*past*(past?anchors[i].cy():0)+tie*seed[i].cy())/weight[i];
         lx[i]=area.x+src[i].w*scale*.5;hx[i]=area.right()-src[i].w*scale*.5;
         ly[i]=area.y+src[i].h*scale*.5;hy[i]=area.bottom()-caption-src[i].h*scale*.5;
         if(lx[i]>hx[i]||ly[i]>hy[i])return {};
