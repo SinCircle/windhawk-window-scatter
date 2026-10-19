@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
-// @version         0.4.13
+// @version         0.4.14
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -154,6 +154,228 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <array>
 #include <unordered_map>
 #include <vector>
+
+#ifndef SCATTER_STANDALONE
+// Shared implementation embedded in each single-file Windhawk mod.
+// Cache only successful lookups, keyed by the PE/PDB identity and symbol schema.
+#include <windows.h>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <algorithm>
+#include <iterator>
+#include <type_traits>
+
+namespace StartupSupport {
+struct SymbolHook {
+    std::vector<std::wstring> names;
+    void** original = nullptr;
+    void* replacement = nullptr;
+    bool optional = false;
+    void* address = nullptr;
+    template<class T>
+    SymbolHook(std::initializer_list<std::wstring_view> symbols, T** output,
+               std::type_identity_t<T*> hook = nullptr, bool allowMissing = false)
+        : original(reinterpret_cast<void**>(output)),
+          replacement(reinterpret_cast<void*>(hook)), optional(allowMissing) {
+        for (auto name : symbols) names.emplace_back(name);
+    }
+};
+template<size_t N>
+void Append(std::vector<SymbolHook>& target, SymbolHook (&items)[N]) {
+    target.insert(target.end(), std::make_move_iterator(std::begin(items)),
+                  std::make_move_iterator(std::end(items)));
+}
+inline bool Cancelled(HANDLE stop) {
+    return stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
+}
+
+inline std::vector<uint64_t> CacheIdentity(HMODULE module,
+        const std::vector<SymbolHook>& hooks, bool decorated) {
+    const auto* base = reinterpret_cast<const BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return {};
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return {};
+    DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+    auto debug = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    if (!debug.VirtualAddress || debug.VirtualAddress >= imageSize ||
+        debug.Size > imageSize - debug.VirtualAddress) return {};
+    uint64_t guid[2]{}; DWORD age = 0; bool hasPdb = false;
+    for (DWORD offset = 0; offset + sizeof(IMAGE_DEBUG_DIRECTORY) <= debug.Size;
+         offset += sizeof(IMAGE_DEBUG_DIRECTORY)) {
+        const auto* entry = reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(base + debug.VirtualAddress + offset);
+        if (entry->Type != IMAGE_DEBUG_TYPE_CODEVIEW || entry->SizeOfData < 24 ||
+            entry->AddressOfRawData >= imageSize ||
+            entry->SizeOfData > imageSize - entry->AddressOfRawData) continue;
+        const BYTE* data = base + entry->AddressOfRawData;
+        if (memcmp(data, "RSDS", 4)) continue;
+        memcpy(guid, data + 4, sizeof(guid)); memcpy(&age, data + 20, sizeof(age));
+        hasPdb = true; break;
+    }
+    if (!hasPdb) return {};
+    uint64_t schema = 14695981039346656037ULL;
+    auto hash = [&](uint64_t value) { schema = (schema ^ value) * 1099511628211ULL; };
+    hash(decorated); hash(hooks.size());
+    for (const auto& hook : hooks) {
+        hash(hook.optional); hash(hook.names.size());
+        for (const auto& name : hook.names) { hash(name.size()); for (wchar_t ch : name) hash(ch); }
+    }
+    return {1, nt->FileHeader.Machine, nt->FileHeader.TimeDateStamp, imageSize,
+            guid[0], guid[1], age, schema, hooks.size()};
+}
+
+// Resolve all entries before registering any hook. A failed download does not
+// leave partial hooks or Windhawk's hours-long negative symbol-cache entry.
+inline bool Resolve(HMODULE module, PCWSTR cacheKey, std::vector<SymbolHook>& hooks,
+                    bool decorated, HANDLE stop) {
+    if (hooks.empty()) return true;
+    if (!module || Cancelled(stop)) return false;
+    for (auto& hook : hooks) hook.address = nullptr;
+    const auto identity = CacheIdentity(module, hooks, decorated);
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+    if (!identity.empty()) {
+        std::vector<uint64_t> cached(identity.size() + hooks.size());
+        const size_t bytes = cached.size() * sizeof(uint64_t);
+        if (Wh_GetBinaryValue(cacheKey, cached.data(), bytes) == bytes &&
+            std::equal(identity.begin(), identity.end(), cached.begin())) {
+            bool valid = true;
+            for (size_t i = 0; i < hooks.size(); ++i) {
+                const auto rva = cached[identity.size() + i];
+                if (rva >= imageSize || (!rva && !hooks[i].optional)) { valid = false; break; }
+            }
+            if (valid) {
+                for (size_t i = 0; i < hooks.size(); ++i) {
+                    auto rva = cached[identity.size() + i];
+                    hooks[i].address = rva ? reinterpret_cast<void*>(base + rva) : nullptr;
+                }
+                Wh_Log(L"Startup symbol cache hit: %s (%zu entries)", cacheKey, hooks.size());
+                return !Cancelled(stop);
+            }
+        }
+    }
+    WH_FIND_SYMBOL symbol{};
+    // First try the on-disk PDB without contacting a symbol server.
+    WH_FIND_SYMBOL_OPTIONS options{sizeof(options), L"", decorated};
+    HANDLE search = Wh_FindFirstSymbol(module, &options, &symbol);
+    if (!search && !Cancelled(stop)) {
+        options.symbolServer = nullptr;
+        search = Wh_FindFirstSymbol(module, &options, &symbol);
+    }
+    if (!search) return false;
+    size_t remaining = hooks.size();
+    do {
+        if (Cancelled(stop)) break;
+        PCWSTR name = decorated ? symbol.symbolDecorated : symbol.symbol;
+        if (!name) continue;
+        for (auto& hook : hooks) {
+            if (hook.address || std::find(hook.names.begin(), hook.names.end(), name) == hook.names.end()) continue;
+            auto address = reinterpret_cast<uintptr_t>(symbol.address);
+            if (address <= base || address - base >= imageSize) continue;
+            hook.address = symbol.address; --remaining;
+        }
+        if (!remaining) break;
+    } while (Wh_FindNextSymbol(search, &symbol));
+    Wh_FindCloseSymbol(search);
+    if (Cancelled(stop)) return false;
+    for (const auto& hook : hooks) if (!hook.address && !hook.optional) {
+        Wh_Log(L"Startup symbol not available yet: %s", hook.names.front().c_str());
+        return false;
+    }
+    if (!identity.empty()) {
+        auto record = identity;
+        for (const auto& hook : hooks) record.push_back(hook.address ? reinterpret_cast<uintptr_t>(hook.address) - base : 0);
+        Wh_SetBinaryValue(cacheKey, record.data(), record.size() * sizeof(uint64_t));
+    }
+    return true;
+}
+
+inline bool Install(std::vector<SymbolHook>& hooks, HANDLE stop) {
+    std::vector<void*> queued;
+    auto rollback = [&] {
+        for (void* address : queued) Wh_RemoveFunctionHook(address);
+        if (!queued.empty()) Wh_ApplyHookOperations();
+    };
+    for (auto& hook : hooks) {
+        if (Cancelled(stop)) { rollback(); return false; }
+        if (!hook.address) { if (hook.original) *hook.original = nullptr; continue; }
+        if (!hook.replacement) { if (hook.original) *hook.original = hook.address; continue; }
+        if (!Wh_SetFunctionHook(hook.address, hook.replacement, hook.original)) {
+            rollback(); return false;
+        }
+        queued.push_back(hook.address);
+    }
+    if (Cancelled(stop) || (!queued.empty() && !Wh_ApplyHookOperations())) { rollback(); return false; }
+    return true;
+}
+
+enum class Result { Waiting, Retry, Ready };
+class Worker {
+    HANDLE stop_ = nullptr, begin_ = nullptr, thread_ = nullptr;
+    Result (*attempt_)(HANDLE) = nullptr;
+    PCWSTR prefix_ = nullptr;
+    static DWORD WINAPI Entry(void* data) { return static_cast<Worker*>(data)->Run(); }
+    DWORD Run() {
+        HANDLE events[]{stop_, begin_};
+        if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) return 0;
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        ULONGLONG started = GetTickCount64(); unsigned failures = 0, attempts = 0;
+        int lastState = -1;
+        const std::wstring stateKey = std::wstring(prefix_) + L"-state";
+        Wh_SetIntValue((std::wstring(prefix_) + L"-pid").c_str(), GetCurrentProcessId());
+        while (!Cancelled(stop_)) {
+            Result result = Result::Retry;
+            try { result = attempt_(stop_); } catch (...) { Wh_Log(L"Deferred startup failed; retry scheduled"); }
+            if (Cancelled(stop_)) break;
+            if (result != Result::Waiting) ++attempts;
+            if (lastState != int(result)) {
+                Wh_SetStringValue(stateKey.c_str(), result == Result::Ready ? L"ready" :
+                                  result == Result::Waiting ? L"waiting-for-shell" : L"retrying");
+                lastState = int(result);
+            }
+            if (result == Result::Ready) {
+                Wh_SetIntValue((std::wstring(prefix_) + L"-elapsed-ms").c_str(),
+                    static_cast<int>(std::min<ULONGLONG>(GetTickCount64() - started, INT_MAX)));
+                Wh_SetIntValue((std::wstring(prefix_) + L"-attempts").c_str(), attempts);
+                break;
+            }
+            DWORD delay = result == Result::Waiting ? 200 :
+                std::min<DWORD>(60000, 1000u << std::min<unsigned>(failures++, 6));
+            if (WaitForSingleObject(stop_, delay) != WAIT_TIMEOUT) break;
+        }
+        if (SUCCEEDED(co)) CoUninitialize();
+        return 0;
+    }
+public:
+    bool Prepare(Result (*attempt)(HANDLE), PCWSTR prefix) {
+        attempt_ = attempt; prefix_ = prefix;
+        stop_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        begin_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (stop_ && begin_) thread_ = CreateThread(nullptr, 0, Entry, this, 0, nullptr);
+        if (!thread_) { Stop(); return false; }
+        return true;
+    }
+    void Begin() { if (begin_) SetEvent(begin_); }
+    void Stop() {
+        if (stop_) SetEvent(stop_);
+        if (thread_) { WaitForSingleObject(thread_, INFINITE); CloseHandle(thread_); thread_ = nullptr; }
+        if (begin_) { CloseHandle(begin_); begin_ = nullptr; }
+        if (stop_) { CloseHandle(stop_); stop_ = nullptr; }
+    }
+};
+inline HWND OwnedTaskbar() {
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr); DWORD process = 0;
+    return taskbar && GetWindowThreadProcessId(taskbar, &process) &&
+        process == GetCurrentProcessId() ? taskbar : nullptr;
+}
+} // namespace StartupSupport
+
+#endif
 
 namespace scatter {
 using Microsoft::WRL::ComPtr;
@@ -2256,12 +2478,33 @@ public:
 };
 App* App::instance=nullptr;
 static DWORD WINAPI ThreadMain(void*){
-    HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);App app;App::instance=&app;
-    bool ok=app.Initialize();g_ready.store(ok);SetEvent(g_readyEvent);if(ok)app.Loop();app.Cleanup();App::instance=nullptr;if(SUCCEEDED(co))CoUninitialize();return ok?0:1;
+    HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    unsigned failures=0;bool ok=false;
+    while(WaitForSingleObject(g_stopEvent,0)!=WAIT_OBJECT_0){
+        App app;App::instance=&app;
+        try{ok=app.Initialize();}catch(...){ok=false;}
+        g_ready.store(ok);SetEvent(g_readyEvent);
+#ifndef SCATTER_STANDALONE
+        Wh_SetStringValue(L"renderer-startup-state",ok?L"ready":L"retrying");
+        Wh_SetIntValue(L"renderer-startup-pid",GetCurrentProcessId());
+#endif
+        if(ok)app.Loop();app.Cleanup();App::instance=nullptr;
+        if(ok)break;
+#ifdef SCATTER_STANDALONE
+        break;
+#else
+        DWORD delay=std::min<DWORD>(30000,1000u<<std::min<unsigned>(failures++,5));
+        if(WaitForSingleObject(g_stopEvent,delay)!=WAIT_TIMEOUT)break;
+#endif
+    }
+    if(SUCCEEDED(co))CoUninitialize();return ok?0:1;
+}
+static bool StartAsync(){
+    g_stopEvent=CreateEvent(nullptr,TRUE,FALSE,nullptr);g_readyEvent=CreateEvent(nullptr,TRUE,FALSE,nullptr);if(!g_stopEvent||!g_readyEvent)return false;
+    g_ready=false;g_thread=CreateThread(nullptr,0,ThreadMain,nullptr,0,nullptr);return g_thread!=nullptr;
 }
 static bool Start(){
-    g_stopEvent=CreateEvent(nullptr,TRUE,FALSE,nullptr);g_readyEvent=CreateEvent(nullptr,TRUE,FALSE,nullptr);if(!g_stopEvent||!g_readyEvent)return false;
-    g_ready=false;g_thread=CreateThread(nullptr,0,ThreadMain,nullptr,0,nullptr);if(!g_thread)return false;HANDLE waits[]{g_readyEvent,g_thread};return WaitForMultipleObjects(2,waits,FALSE,10000)==WAIT_OBJECT_0&&g_ready;
+    if(!StartAsync())return false;HANDLE waits[]{g_readyEvent,g_thread};return WaitForMultipleObjects(2,waits,FALSE,10000)==WAIT_OBJECT_0&&g_ready;
 }
 static void Stop(){if(g_stopEvent)SetEvent(g_stopEvent);if(g_thread){WaitForSingleObject(g_thread,INFINITE);CloseHandle(g_thread);g_thread=nullptr;}if(g_readyEvent){CloseHandle(g_readyEvent);g_readyEvent=nullptr;}if(g_stopEvent){CloseHandle(g_stopEvent);g_stopEvent=nullptr;}}
 } // namespace scatter
@@ -2369,53 +2612,54 @@ static HRESULT WINAPI GestureHook(void*self,int action,HWND const*window){
 }
 #ifndef SCATTER_STANDALONE
 static HWND taskbar=nullptr;
+static StartupSupport::Worker startupWorker;
+static StartupSupport::Result AttemptInitialize(HANDLE stop){
+    using namespace StartupSupport;
+#ifndef _WIN64
+    return Result::Retry;
+#else
+    HWND shellWindow=OwnedTaskbar();
+    HMODULE module=GetModuleHandleW(L"twinui.pcshell.dll");
+    if(!shellWindow||!module)return Result::Waiting;
+    void*target=nullptr;void*gesture=nullptr;void*determine=nullptr;void*start=nullptr;void*update=nullptr;void*finish=nullptr;void*cancel=nullptr;
+    std::vector<SymbolHook> symbols{
+        {{L"?ToggleAllUpView@CAllUpViewService@@UEAAJPEAUHMONITOR__@@W4ALL_UP_VIEW_FLAGS@@@Z"},&target},
+        {{L"?ActivateGestureAction@MultitaskingViewGestureHandler@@AEAAJW4GestureAction@MultitaskingViewGestureHandlerHelpers@@PEBQEAUHWND__@@@Z"},&gesture,nullptr,true},
+        {{L"?DetermineTouchpadGestureAction@MultitaskingViewGestureHandlerHelpers@@YA?AW4GestureAction@1@W4GestureDirection@1@_NW4MULTITASKING_VIEW_TYPES@@@Z"},&determine,nullptr,true},
+        {{L"?StartSwipe@MultitaskingViewGestureHandler@@UEAAJHHIUTOUCHPAD_GESTURE_CONTEXT@@@Z"},&start,nullptr,true},
+        {{L"?ContinueSwipe@MultitaskingViewGestureHandler@@UEAAJHHHHI@Z"},&update,nullptr,true},
+        {{L"?FinishSwipe@MultitaskingViewGestureHandler@@UEAAJHHHHI@Z"},&finish,nullptr,true},
+        {{L"?CancelSwipe@MultitaskingViewGestureHandler@@UEAAJXZ"},&cancel,nullptr,true},
+    };
+    if(!Resolve(module,L"startup-symbols-taskview-v1",symbols,true,stop))return Result::Retry;
+    for(auto&symbol:symbols)if(symbol.original)*symbol.original=symbol.address;
+    std::vector<SymbolHook> hooks;
+    auto add=[&](void*address,auto**original,auto hook){
+        hooks.emplace_back(std::initializer_list<std::wstring_view>{},original,hook);hooks.back().address=address;
+    };
+    using Determine=int(WINAPI*)(int,bool,int);
+    auto action=reinterpret_cast<Determine>(determine);
+    if(gesture&&action&&action(1,false,0)==1&&action(1,true,0)==4){
+        if(!start||!update||!finish||!cancel)return Result::Retry;
+        add(start,&originalStart,StartHook);add(update,&originalContinue,ContinueHook);
+        add(finish,&originalFinish,FinishHook);add(cancel,&originalCancel,CancelHook);
+        add(gesture,&originalGesture,GestureHook);
+    }else Wh_Log(L"Native Task View gesture mapping unavailable; preserving native gestures");
+    add(target,&originalToggle,ToggleHook);
+    if(!Install(hooks,stop))return Result::Retry;
+    taskbar=shellWindow;SetProp(taskbar,kBridgeProperty,reinterpret_cast<HANDLE>(kShellAck));
+    return Result::Ready;
+#endif
+}
 static bool Initialize(){
 #ifndef _WIN64
     return false;
 #else
-    stopping=false;DWORD process=0;taskbar=FindWindow(L"Shell_TrayWnd",nullptr);
-    if(!taskbar||!GetWindowThreadProcessId(taskbar,&process)||process!=GetCurrentProcessId())return false;
-    HMODULE module=GetModuleHandle(L"twinui.pcshell.dll");
-    if(!module)module=LoadLibraryEx(L"twinui.pcshell.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if(!module)return false;
-    void*target=nullptr;void*gesture=nullptr;void*determine=nullptr;void*start=nullptr;void*update=nullptr;void*finish=nullptr;void*cancel=nullptr;
-    constexpr wchar_t request[]=L"?ToggleAllUpView@CAllUpViewService@@UEAAJPEAUHMONITOR__@@W4ALL_UP_VIEW_FLAGS@@@Z";
-    constexpr wchar_t gestureRequest[]=L"?ActivateGestureAction@MultitaskingViewGestureHandler@@AEAAJW4GestureAction@MultitaskingViewGestureHandlerHelpers@@PEBQEAUHWND__@@@Z";
-    constexpr wchar_t determineRequest[]=L"?DetermineTouchpadGestureAction@MultitaskingViewGestureHandlerHelpers@@YA?AW4GestureAction@1@W4GestureDirection@1@_NW4MULTITASKING_VIEW_TYPES@@@Z";
-    constexpr wchar_t startRequest[]=L"?StartSwipe@MultitaskingViewGestureHandler@@UEAAJHHIUTOUCHPAD_GESTURE_CONTEXT@@@Z";
-    constexpr wchar_t updateRequest[]=L"?ContinueSwipe@MultitaskingViewGestureHandler@@UEAAJHHHHI@Z";
-    constexpr wchar_t finishRequest[]=L"?FinishSwipe@MultitaskingViewGestureHandler@@UEAAJHHHHI@Z";
-    constexpr wchar_t cancelRequest[]=L"?CancelSwipe@MultitaskingViewGestureHandler@@UEAAJXZ";
-    WH_FIND_SYMBOL_OPTIONS options{sizeof(options),nullptr,TRUE};WH_FIND_SYMBOL symbol{};
-    HANDLE search=Wh_FindFirstSymbol(module,&options,&symbol);if(!search)return false;
-    do{
-        if(!symbol.symbolDecorated)continue;
-        if(!wcscmp(symbol.symbolDecorated,request))target=symbol.address;
-        if(!wcscmp(symbol.symbolDecorated,gestureRequest))gesture=symbol.address;
-        if(!wcscmp(symbol.symbolDecorated,determineRequest))determine=symbol.address;
-        if(!wcscmp(symbol.symbolDecorated,startRequest))start=symbol.address;
-        if(!wcscmp(symbol.symbolDecorated,updateRequest))update=symbol.address;
-        if(!wcscmp(symbol.symbolDecorated,finishRequest))finish=symbol.address;
-        if(!wcscmp(symbol.symbolDecorated,cancelRequest))cancel=symbol.address;
-        if(target&&gesture&&determine&&start&&update&&finish&&cancel)break;
-    }while(Wh_FindNextSymbol(search,&symbol));
-    Wh_FindCloseSymbol(search);
-    if(!target){Wh_Log(L"Native Task View toggle symbol unavailable");return false;}
-    using Determine=int(WINAPI*)(int,bool,int);
-    auto action=reinterpret_cast<Determine>(determine);
-    if(gesture&&action&&action(1,false,0)==1&&action(1,true,0)==4){
-        if(!start||!update||!finish||!cancel){Wh_Log(L"Native swipe lifecycle symbols unavailable");return false;}
-        if(!Wh_SetFunctionHook(start,reinterpret_cast<void*>(StartHook),reinterpret_cast<void**>(&originalStart))||
-           !Wh_SetFunctionHook(update,reinterpret_cast<void*>(ContinueHook),reinterpret_cast<void**>(&originalContinue))||
-           !Wh_SetFunctionHook(finish,reinterpret_cast<void*>(FinishHook),reinterpret_cast<void**>(&originalFinish))||
-           !Wh_SetFunctionHook(cancel,reinterpret_cast<void*>(CancelHook),reinterpret_cast<void**>(&originalCancel)))return false;
-        if(!Wh_SetFunctionHook(gesture,reinterpret_cast<void*>(GestureHook),reinterpret_cast<void**>(&originalGesture)))return false;
-    }else Wh_Log(L"Native Task View gesture symbols or action mapping unavailable; preserving native gestures");
-    return Wh_SetFunctionHook(target,reinterpret_cast<void*>(ToggleHook),reinterpret_cast<void**>(&originalToggle));
+    stopping=false;return startupWorker.Prepare(AttemptInitialize,L"shell-startup");
 #endif
 }
-static void AfterInit(){if(taskbar)SetProp(taskbar,kBridgeProperty,reinterpret_cast<HANDLE>(kShellAck));}
-static void BeforeUninit(){stopping=true;std::lock_guard lock(swipeMutex);for(auto&[self,swipe]:swipes)EndSwipe(swipe,false);}
+static void AfterInit(){startupWorker.Begin();}
+static void BeforeUninit(){stopping=true;startupWorker.Stop();std::lock_guard lock(swipeMutex);for(auto&[self,swipe]:swipes)EndSwipe(swipe,false);}
 static void Uninit(){if(taskbar)RemoveProp(taskbar,kBridgeProperty);taskbar=nullptr;std::lock_guard lock(swipeMutex);swipes.clear();}
 #endif
 } // namespace scatter::shell
@@ -2428,7 +2672,7 @@ static void ReadSettings(){
     scatter::g_memoryMode=mode&&!wcscmp(mode,L"resident")?1:mode&&!wcscmp(mode,L"saver")?2:0;
     if(mode)Wh_FreeStringSetting(mode);
 }
-BOOL WhTool_ModInit(){GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&WhTool_ModInit),&scatter::g_instance);ReadSettings();if(!scatter::Start()){scatter::Stop();return FALSE;}return TRUE;}
+BOOL WhTool_ModInit(){GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&WhTool_ModInit),&scatter::g_instance);ReadSettings();if(!scatter::StartAsync()){scatter::Stop();return FALSE;}return TRUE;}
 void WhTool_ModSettingsChanged(){ReadSettings();if(auto hwnd=scatter::g_controller.load())PostMessage(hwnd,scatter::kSettings,0,0);}
 void WhTool_ModUninit(){scatter::Stop();}
 // Keep the official launcher for windhawk.exe; explorer.exe only hosts the
@@ -2453,6 +2697,9 @@ void WhTool_ModUninit(){scatter::Stop();}
 
 bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
+static StartupSupport::Worker g_launcherWorker;
+static HANDLE g_launchedProcess=nullptr;
+static StartupSupport::Result LaunchToolAttempt(HANDLE stop);
 
 void WINAPI EntryPoint_Hook() {
     Wh_Log(L">");
@@ -2535,12 +2782,21 @@ BOOL Wh_ModInit() {
     }
 
     g_isToolModProcessLauncher = true;
-    return TRUE;
+    return g_launcherWorker.Prepare(LaunchToolAttempt,L"launcher-startup");
 }
 
-void Wh_ModAfterInit() {
-    if (!g_isToolModProcessLauncher) {
-        return;
+static StartupSupport::Result LaunchToolAttempt(HANDLE stop) {
+    using StartupSupport::Result;
+    if(StartupSupport::Cancelled(stop))return Result::Waiting;
+    HWND controller=FindWindowW(scatter::kController,L"Window Scatter Controller");
+    if(controller&&reinterpret_cast<ULONG_PTR>(GetPropW(controller,scatter::kShellReadyProperty))==scatter::kShellAck){
+        if(g_launchedProcess){CloseHandle(g_launchedProcess);g_launchedProcess=nullptr;}
+        return Result::Ready;
+    }
+    if(g_launchedProcess){
+        if(WaitForSingleObject(g_launchedProcess,0)==WAIT_TIMEOUT)return Result::Waiting;
+        CloseHandle(g_launchedProcess);g_launchedProcess=nullptr;
+        return Result::Retry;
     }
 
     WCHAR currentProcessPath[MAX_PATH];
@@ -2549,7 +2805,7 @@ void Wh_ModAfterInit() {
         case 0:
         case ARRAYSIZE(currentProcessPath):
             Wh_Log(L"GetModuleFileName failed");
-            return;
+            return Result::Retry;
     }
 
     WCHAR
@@ -2563,7 +2819,7 @@ void Wh_ModAfterInit() {
         kernelModule = GetModuleHandle(L"kernel32.dll");
         if (!kernelModule) {
             Wh_Log(L"No kernelbase.dll/kernel32.dll");
-            return;
+            return Result::Retry;
         }
     }
 
@@ -2580,7 +2836,7 @@ void Wh_ModAfterInit() {
                                                  "CreateProcessInternalW");
     if (!pCreateProcessInternalW) {
         Wh_Log(L"No CreateProcessInternalW");
-        return;
+        return Result::Retry;
     }
 
     STARTUPINFO si{
@@ -2592,11 +2848,16 @@ void Wh_ModAfterInit() {
                                  nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
                                  nullptr, nullptr, &si, &pi, nullptr)) {
         Wh_Log(L"CreateProcess failed");
-        return;
+        return Result::Retry;
     }
 
-    CloseHandle(pi.hProcess);
+    g_launchedProcess=pi.hProcess;
     CloseHandle(pi.hThread);
+    return Result::Waiting;
+}
+
+void Wh_ModAfterInit() {
+    if(g_isToolModProcessLauncher)g_launcherWorker.Begin();
 }
 
 void Wh_ModSettingsChanged() {
@@ -2609,6 +2870,8 @@ void Wh_ModSettingsChanged() {
 
 void Wh_ModUninit() {
     if (g_isToolModProcessLauncher) {
+        g_launcherWorker.Stop();
+        if(g_launchedProcess){CloseHandle(g_launchedProcess);g_launchedProcess=nullptr;}
         return;
     }
 
@@ -2630,7 +2893,7 @@ BOOL Wh_ModInit(){
 }
 void Wh_ModAfterInit(){if(g_shellProcess)scatter::shell::AfterInit();else ToolLauncher_ModAfterInit();}
 void Wh_ModSettingsChanged(){if(g_shellProcess)ReadSettings();else ToolLauncher_ModSettingsChanged();}
-void Wh_ModBeforeUninit(){if(g_shellProcess)scatter::shell::BeforeUninit();}
+void Wh_ModBeforeUninit(){if(g_shellProcess)scatter::shell::BeforeUninit();else if(g_isToolModProcessLauncher)g_launcherWorker.Stop();}
 void Wh_ModUninit(){if(g_shellProcess)scatter::shell::Uninit();else ToolLauncher_ModUninit();}
 #elif !defined(SCATTER_TEST)
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
