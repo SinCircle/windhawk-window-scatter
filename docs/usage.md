@@ -32,6 +32,6 @@
 
 ## 如何校验下载文件或报告问题？
 
-[Release](https://github.com/SinCircle/windhawk-window-scatter/releases/latest) 附件提供 EXE 的 SHA-256 校验值。
+[Release](https://github.com/SinCircle/windhawk-window-scatter/releases/latest) 附件中的 `SHA256SUMS.txt` 提供独立版 EXE 和模组源码的 SHA-256 校验值。
 
 [报告问题](https://github.com/SinCircle/windhawk-window-scatter/issues)时，请附上 Windows 版本、显示器布局与缩放比例、程序版本和复现步骤。
