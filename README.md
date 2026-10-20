@@ -4,7 +4,7 @@
 
 <h1 align="center">Window Scatter</h1>
 
-<p align="center">Windows 11 窗口总览，支持鼠标和触摸板操作。</p>
+<p align="center">面向 Windows 11 独立设计的窗口总览工具。</p>
 
 <p align="center">
   <a href="https://github.com/SinCircle/windhawk-window-scatter/releases/latest"><img src="https://img.shields.io/github/v/release/SinCircle/windhawk-window-scatter?style=flat-square&amp;color=3878df" alt="Latest release"></a>
@@ -24,6 +24,8 @@
 </p>
 
 ## 快速开始
+
+Window Scatter 围绕窗口的空间关系和连续操作设计布局与交互，保留窗口之间的大小关系，用实时预览和连续动画衔接展开、选窗与恢复。支持鼠标、三指手势和多显示器，提供独立应用和 Windhawk 模组。
 
 1. 下载 [WindowScatter.exe](https://github.com/SinCircle/windhawk-window-scatter/releases/latest/download/WindowScatter.exe)，双击启动。程序在后台运行，没有托盘图标，无需安装额外运行库。
 2. 按 <kbd>Win</kbd> + <kbd>Tab</kbd> 打开总览，点击窗口切换。
@@ -93,6 +95,10 @@
 | **自动 · 默认** | 缓存绘图资源以便快速打开，内存不足时释放 |
 | **常驻** | 保留绘图资源，优先打开速度 |
 | **省内存** | 关闭总览后释放绘图资源，下次打开重新加载 |
+
+## 设计与参考
+
+macOS 和 Linux 桌面的多任务总览界面是本项目的交互参考。Window Scatter 根据自身的设计目标，独立探索窗口的空间布局、手势选窗、连续重排与最小化恢复，让窗口管理适应 Windows 上的实际使用方式。
 
 ## 更多说明
 

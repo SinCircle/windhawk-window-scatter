@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              window-scatter
 // @name            Window Scatter
-// @description     Win+Tab persistent overview with natural packing, rounded windows and compositor animations.
+// @description     An independent window overview for Windows 11, with spatial layouts, live previews and touchpad navigation.
 // @version         0.4.14
 // @author          SinCircle
 // @include         windhawk.exe
@@ -12,6 +12,11 @@
 // ==WindhawkModReadme==
 /*
 # Window Scatter
+
+Window Scatter is an independently designed window overview for Windows 11.
+Multitasking overviews on macOS and Linux desktops serve as interaction references.
+The project develops its own spatial layout, gesture selection, continuous reflow,
+and minimize/restore interactions around its design goals and Windows workflows.
 
 Win+Tab and the system Task View touchpad gesture open this overview through
 Explorer's native Task View request. No global keyboard hook is installed.
