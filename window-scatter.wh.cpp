@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     An independent window overview for Windows 11, with spatial layouts, live previews and touchpad navigation.
-// @version         0.4.14
+// @version         1.0.2
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -26,7 +26,9 @@ including diagonally; lift after selecting to activate the window. A downward
 swipe while the overview is open cancels.
 The selected outline follows the gesture without moving the system mouse cursor.
 Click a window to switch; hover a preview and click its close button to ask the
-application to close normally. Escape or a background click cancels. Tab does not
+application to close it. Arrow keys select nearby previews, including minimized
+windows and other monitors; Enter switches to the selection. Moving the mouse
+resumes hover selection. Escape or a background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
 this overview is already open. Alt+Tab retains its native behavior.
 No tray icon is created. Window titles are shown, with a system-accent
@@ -1138,6 +1140,7 @@ public:
     HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedButtonSource=nullptr,restoreSource=nullptr;
     WindowButton pressedButton=WindowButton::None;
     POINT lastPointer{};
+    bool keyboardSelection=false;
     UINT gestureToken=0;
     double gestureOriginX=0,gestureOriginY=0,gestureWidth=1,gestureHeight=1;
     ULONGLONG gestureStarted=0;
@@ -1640,6 +1643,7 @@ public:
         if(phase==Phase::Closing){End(false);return;}
         bool found=false;for(auto&v:views)for(auto&i:v->items)if(i.source==source)found=true;
         if(!found)return;
+        HWND candidate=keyboardSelection?selectedSource:nullptr;
         CaptureMotion();ClearSelection();if(pressedButtonSource==source){pressedButtonSource=nullptr;pressedButton=WindowButton::None;}
         BuildGuard guard(*this);size_t remaining=0;
         for(auto&v:views){
@@ -1655,6 +1659,7 @@ public:
         }
         if(!remaining){End(true);return;}
         RememberLayout();FollowNativeZOrder();progress=1;Animate(1,true,true);
+        RestoreKeyboardSelection(candidate);
     }
     void Cleanup(){
         taskbarOrder.Stop();
@@ -1716,10 +1721,12 @@ public:
 #ifdef SCATTER_TEST
         ++layoutPasses;
 #endif
+        HWND candidate=keyboardSelection?selectedSource:nullptr;
         progress=CurrentProgress();CaptureMotion();ClearSelection();BuildGuard guard(*this);
         for(auto&v:views){AnchorCurrentLayout(*v);auto layout=Arrange(*v);if(layout.size()!=v->items.size()){End(false);return;}
             for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();if(!CreateTitle(*v,i)){End(false);return;}}}
         RememberLayout();FollowNativeZOrder();Animate(1,true,true);
+        RestoreKeyboardSelection(candidate);
     }
     void SceneChanged(HWND source,bool deferLayout=false){
         if(phase!=Phase::Opening&&phase!=Phase::Settled)return;
@@ -1954,7 +1961,7 @@ public:
         if(!count){building=false;End(false);return false;}
         RememberLayout();
         FollowNativeZOrder();
-        selectedSource=nullptr; // Mouse hover/click chooses; no keyboard candidate.
+        selectedSource=nullptr;keyboardSelection=false;
         GetCursorPos(&lastPointer);
         for(auto&v:views)if(v->hwnd&&!CreateDesktop(*v)){building=false;End(false);return false;}
         StaticPose(0);
@@ -2166,6 +2173,7 @@ public:
         if(restoreSource&&!IsIconic(restoreSource)){
             if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}restoreSource=nullptr;
         }
+        HWND candidate=keyboardSelection?selectedSource:nullptr;
         ClearSelection();BuildGuard guard(*this);bool targetsChanged=false;
         for(auto&v:views){
             if(freshLayout)ApplyTaskbarOrder(*v);
@@ -2182,7 +2190,7 @@ public:
         // Layout and title preparation may take time while DWM keeps closing.
         // Capture afterwards so the new animation never rewinds to an old pose.
         if(freshLayout){progress=CurrentProgress();CaptureMotion();}
-        Animate(1,true,changed||targetsChanged);return true;
+        Animate(1,true,changed||targetsChanged);RestoreKeyboardSelection(candidate);return true;
     }
     void RefreshRestoredGeometry(bool animate=true){
         if(phase==Phase::Opening||phase==Phase::Settled){ReconcileWindowStates();return;}
@@ -2263,7 +2271,7 @@ public:
         // Shared visuals own their private thumbnail references. Release visual
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
-        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;progress=0;
+        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;keyboardSelection=false;progress=0;
         if(device)device->Commit(); // Submit the filter-input detachments from Item destruction.
         if(idle&&timer&&device){
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
@@ -2294,6 +2302,75 @@ public:
         }
         return result;
     }
+    HWND KeyboardStart()const{
+        for(HWND candidate:{selectedSource,previous})if(candidate)
+            for(auto&v:views)for(auto&i:v->items)if(i.source==candidate)return candidate;
+        return GestureChoice(lastPointer.x,lastPointer.y);
+    }
+    HWND KeyboardChoice(UINT key)const{
+        HWND initial=KeyboardStart();if(!initial)return nullptr;
+        Box origin{};bool minimized=false;
+        for(auto&v:views)for(auto&i:v->items)if(i.source==initial){
+            origin=i.target;origin.x+=v->bounds.left;origin.y+=v->bounds.top;minimized=i.minimized;
+        }
+        bool horizontal=key==VK_LEFT||key==VK_RIGHT;
+        double direction=key==VK_LEFT||key==VK_UP?-1.:1.;
+        HWND result=initial;double best=std::numeric_limits<double>::infinity();
+        double firstEnd=std::numeric_limits<double>::infinity();
+        // Use final preview coordinates across all monitors. The choice stays
+        // stable during motion, and the minimized shelf is part of navigation.
+        auto candidates=[&](auto visit){for(auto&v:views)for(auto&i:v->items){
+            if(i.source==initial)continue;
+            if(horizontal&&i.minimized!=minimized)continue;
+            Box b=i.target;b.x+=v->bounds.left;b.y+=v->bounds.top;
+            double forward=direction*(horizontal?b.cx()-origin.cx():b.cy()-origin.cy());
+            if(forward<=.5)continue;
+            double cross=horizontal?b.cy()-origin.cy():b.cx()-origin.cx();
+            double overlap=horizontal?std::min(b.bottom(),origin.bottom())-std::max(b.y,origin.y):
+                                      std::min(b.right(),origin.right())-std::max(b.x,origin.x);
+            bool aligned=overlap>.5;
+            // Prefer the same row/column before comparing distances. A diagonal
+            // fallback must lie mainly in the requested direction, and only
+            // up/down may move between ordinary previews and the minimized shelf.
+            if(!aligned&&std::abs(cross)>forward)continue;
+            double gap=horizontal?std::max({b.y-origin.bottom(),origin.y-b.bottom(),0.}):
+                                  std::max({b.x-origin.right(),origin.x-b.right(),0.});
+            double score=forward*forward+4*gap*gap+.25*cross*cross;
+            double leading=direction*(horizontal?(direction>0?b.x:b.right()):(direction>0?b.y:b.bottom()));
+            double trailing=direction*(horizontal?(direction>0?b.right():b.x):(direction>0?b.bottom():b.y));
+            visit(i.source,leading,trailing,overlap,score);
+        }};
+        candidates([&](HWND source,double,double trailing,double overlap,double score){
+            if(overlap>.5)firstEnd=std::min(firstEnd,trailing);
+            else if(score<best){best=score;result=source;}
+        });
+        if(!std::isfinite(firstEnd))return result;
+        // Only compare the first group of overlapping axis intervals. A window
+        // entirely beyond a nearer preview belongs to the next column/row.
+        // Within this group, projected overlap takes precedence over distance.
+        double bestOverlap=-1,bestLeading=std::numeric_limits<double>::infinity();
+        result=initial;best=std::numeric_limits<double>::infinity();
+        candidates([&](HWND source,double leading,double,double overlap,double score){
+            if(overlap<=.5||leading>=firstEnd-.5)return;
+            bool sameOverlap=std::abs(overlap-bestOverlap)<=.5;
+            if(overlap>bestOverlap+.5||(sameOverlap&&(leading<bestLeading-.5||
+               (std::abs(leading-bestLeading)<=.5&&score<best)))){
+                bestOverlap=overlap;bestLeading=leading;best=score;result=source;
+            }
+        });
+        return result;
+    }
+    void NavigateKeyboard(UINT key){
+        if(building||gestureToken||pressedButtonSource||
+           (phase!=Phase::Opening&&phase!=Phase::Settled))return;
+        GetCursorPos(&lastPointer);keyboardSelection=true;
+        Select(KeyboardChoice(key));
+    }
+    void RestoreKeyboardSelection(HWND candidate){
+        if(!keyboardSelection)return;
+        for(auto&v:views)for(auto&i:v->items)if(i.source==candidate){Select(candidate);return;}
+        Select(KeyboardStart());
+    }
     void CountGesture(LPCWSTR property){if(controller)SetProp(controller,property,reinterpret_cast<HANDLE>(reinterpret_cast<ULONG_PTR>(GetProp(controller,property))+1));}
     void ResetGesture(){gestureToken=0;gestureNavigating=false;gestureReady=false;if(controller)RemoveProp(controller,kGestureProperty);}
     void BeginGesture(UINT token,bool alreadyOpen=false){
@@ -2305,6 +2382,7 @@ public:
         bool found=false;for(auto&v:views)for(auto&i:v->items)if(i.source==initial)found=true;
         if(!found){POINT p{};GetCursorPos(&p);initial=GestureChoice(p.x,p.y);}
         if(!initial)return;
+        keyboardSelection=false;
         for(auto&v:views)for(auto&i:v->items)if(i.source==initial){
             gestureOriginX=v->bounds.left+i.target.cx();gestureOriginY=v->bounds.top+i.target.cy();
             gestureWidth=std::max(1L,v->bounds.right-v->bounds.left);gestureHeight=std::max(1L,v->bounds.bottom-v->bounds.top);
@@ -2444,10 +2522,12 @@ public:
         case WM_ENDSESSION:if(wp)SetEvent(g_stopEvent);return 0;
         case WM_ERASEBKGND:return 1;
         case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);if(!building&&d3d&&FAILED(d3d->GetDeviceRemovedReason())){End(false,false);ReleaseDevice();PostMessage(controller,kWarmup,0,0);}return 0;}
-        case WM_MOUSEMOVE:if(!gestureToken&&v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)},screen=point;ClientToScreen(hwnd,&screen);lastPointer=screen;
+        case WM_MOUSEMOVE:if(!gestureToken&&v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)},screen=point;ClientToScreen(hwnd,&screen);
+            if(keyboardSelection&&screen.x==lastPointer.x&&screen.y==lastPointer.y)return 0;
+            keyboardSelection=false;lastPointer=screen;
             int i=Hit(*v,point);HWND hover=i>=0?v->items[i].source:nullptr;if(selectedSource!=hover)Select(hover);
             if(phase!=Phase::Hidden)HoverButtons(*v,i,point);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
-        case WM_MOUSELEAVE:if(!gestureToken&&v&&v->selected>=0)Select(nullptr);return 0;
+        case WM_MOUSELEAVE:if(!gestureToken&&!keyboardSelection&&v&&v->selected>=0)Select(nullptr);return 0;
         case WM_LBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
             auto button=ButtonAt(*v,i,point);if(button!=WindowButton::None){pressedButtonSource=v->items[i].source;pressedButton=button;SetCapture(hwnd);}}return 0;
         case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
@@ -2457,8 +2537,13 @@ public:
         case WM_CAPTURECHANGED:pressedButtonSource=nullptr;pressedButton=WindowButton::None;return 0;
         case WM_RBUTTONUP:Close(nullptr);return 0;
         case WM_SYSKEYDOWN:case WM_KEYDOWN:
+            if(building)return 0;
             if(wp==VK_ESCAPE){Close(nullptr);return 0;}
-            if(v&&(phase==Phase::Settled||phase==Phase::Opening)){if(wp==VK_TAB)return 0;if(wp==VK_RETURN){Close(selectedSource);return 0;}}break;
+            if(v&&(phase==Phase::Settled||phase==Phase::Opening)){
+                if(wp==VK_LEFT||wp==VK_RIGHT||wp==VK_UP||wp==VK_DOWN){NavigateKeyboard(UINT(wp));return 0;}
+                if(wp==VK_TAB)return 0;
+                if(wp==VK_RETURN){Close(KeyboardStart());return 0;}
+            }break;
         case WM_SYSCOMMAND:if((wp&0xFFF0)==SC_KEYMENU)return 0;break;
         case WM_CLOSE:if(v)Close(nullptr);else SetEvent(g_stopEvent);return 0;
         }return DefWindowProc(hwnd,msg,wp,lp);
