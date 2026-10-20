@@ -52,6 +52,9 @@
 
 <table>
   <tr>
+    <td><img src="docs/media/workflow-new-windows.gif" width="520" alt="新增两个窗口后自动重排，选中刚打开的阅读笔记"></td>
+    <td><img src="docs/media/workflow-close-windows.gif" width="520" alt="连续关闭两个窗口，再切回编辑器"></td>
+    <td><img src="docs/media/workflow-minimize-many.gif" width="520" alt="连续最小化三个窗口，清出空间后切回编辑器"></td>
     <td><img src="docs/media/layout-fullscreen.gif" width="520" alt="从最大化编辑器后面找回阅读笔记"></td>
     <td><img src="docs/media/layout-halves.gif" width="520" alt="左右分屏时恢复项目文件"></td>
     <td><img src="docs/media/layout-quarters.gif" width="520" alt="找到被四分屏覆盖的笔记"></td>
