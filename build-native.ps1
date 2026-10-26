@@ -50,8 +50,8 @@ $rc = @"
 201 RCDATA "$(ResourcePath $payload)"
 202 RCDATA "$(ResourcePath $noticePath)"
 1 VERSIONINFO
-FILEVERSION 1,0,2,0
-PRODUCTVERSION 1,0,2,0
+FILEVERSION 1,0,3,0
+PRODUCTVERSION 1,0,3,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -64,11 +64,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "SinCircle\0"
       VALUE "FileDescription", "Window Scatter\0"
-      VALUE "FileVersion", "1.0.2.0\0"
+      VALUE "FileVersion", "1.0.3.0\0"
       VALUE "InternalName", "WindowScatter\0"
       VALUE "OriginalFilename", "WindowScatter.exe\0"
       VALUE "ProductName", "Window Scatter\0"
-      VALUE "ProductVersion", "1.0.2\0"
+      VALUE "ProductVersion", "1.0.3\0"
     END
   END
   BLOCK "VarFileInfo"

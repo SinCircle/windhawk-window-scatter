@@ -34,4 +34,8 @@ Preferences LoadPreferences(const wchar_t*key=kRegistry);
 bool SavePreferences(const Preferences&prefs,const wchar_t*key=kRegistry);
 bool StartupEnabled(std::wstring*registeredPath=nullptr,const wchar_t*key=kRunKey,const wchar_t*value=kRunValue);
 bool SetStartup(bool enabled,const wchar_t*key=kRunKey,const wchar_t*value=kRunValue);
+enum class StartupLocation { Permanent, Downloads, Temporary };
+StartupLocation ClassifyStartupLocation(const std::filesystem::path&executable,
+    const std::filesystem::path&downloads,const std::vector<std::filesystem::path>&temporaryDirectories);
+StartupLocation CurrentStartupLocation();
 }

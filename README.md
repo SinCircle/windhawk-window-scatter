@@ -27,9 +27,9 @@
 
 将打开的窗口按原比例展开，提供实时预览、鼠标选窗和触摸板手势。支持多显示器，可使用独立应用或 Windhawk 模组。
 
-1. 下载 [WindowScatter.exe](https://github.com/SinCircle/windhawk-window-scatter/releases/latest/download/WindowScatter.exe)，双击启动。程序在后台运行，没有托盘图标，无需安装额外运行库。
+1. 下载 [WindowScatter.exe](https://github.com/SinCircle/windhawk-window-scatter/releases/latest/download/WindowScatter.exe)，双击后直接打开设置。关闭设置面板后继续在后台运行，无需安装额外运行库。
 2. 按 <kbd>Win</kbd> + <kbd>Tab</kbd> 打开总览，点击窗口预览即可切换；也可以用方向键选择后按 <kbd>Enter</kbd>。
-3. 再次双击 EXE 打开设置，可调整动画、内存模式和开机启动。退出程序也在这里操作。
+3. 在设置中调整动画、内存模式和开机启动；各项说明点击旁边的「?」查看。再次双击 EXE 可返回设置，也可在这里退出程序。
 
 > 使用独立版前，请先停用 Windhawk 中的同名模组。
 

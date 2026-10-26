@@ -98,7 +98,8 @@ static bool BundledSymbols(const ModuleIdentity&id,SymbolTable&table){
 }
 struct InternetHandle{HINTERNET h=nullptr;~InternetHandle(){if(h)WinHttpCloseHandle(h);}};
 static bool DownloadPdb(const std::wstring&id,const std::filesystem::path&path,HANDLE stop,std::wstring&error){
-    InternetHandle session{WinHttpOpen(L"WindowScatter/1.0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
+    std::wstring agent=std::wstring(L"WindowScatter/")+kVersion;
+    InternetHandle session{WinHttpOpen(agent.c_str(),WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
     if(!session.h){error=ErrorText(GetLastError());return false;}
     WinHttpSetTimeouts(session.h,5000,5000,5000,5000);
     InternetHandle connection{WinHttpConnect(session.h,L"msdl.microsoft.com",INTERNET_DEFAULT_HTTPS_PORT,0)};
@@ -237,5 +238,60 @@ bool SetStartup(bool enabled,const wchar_t*path,const wchar_t*value){
     if(enabled){std::wstring command=L"\""+ExecutablePath()+L"\" --startup";status=RegSetValueEx(key,value,0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),DWORD((command.size()+1)*sizeof(wchar_t)));}
     else {status=RegDeleteValue(key,value);if(status==ERROR_FILE_NOT_FOUND)status=ERROR_SUCCESS;}
     RegCloseKey(key);return status==ERROR_SUCCESS;
+}
+namespace {
+std::wstring StartupPath(const std::filesystem::path&path,bool physical){
+    if(path.empty())return {};
+    std::wstring result(32768,L'\0');
+    DWORD length=GetFullPathName(path.c_str(),DWORD(result.size()),result.data(),nullptr);
+    if(!length||length>=result.size())return {};
+    result.resize(length);
+    result=std::filesystem::path(result).lexically_normal().make_preferred().wstring();
+    if(physical){
+        Handle file(CreateFile(result.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                               nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr));
+        if(file){
+            std::wstring resolved(32768,L'\0');
+            length=GetFinalPathNameByHandle(file.value,resolved.data(),DWORD(resolved.size()),FILE_NAME_NORMALIZED|VOLUME_NAME_DOS);
+            if(length&&length<resolved.size()){resolved.resize(length);result=std::move(resolved);}
+        }
+    }
+    if(result.rfind(L"\\\\?\\UNC\\",0)==0)result=L"\\\\"+result.substr(8);
+    else if(result.rfind(L"\\\\?\\",0)==0)result.erase(0,4);
+    while(!result.empty()&&result.back()==L'\\')result.pop_back();
+    return result;
+}
+bool WithinStartupDirectory(const std::filesystem::path&executable,const std::filesystem::path&directory){
+    if(executable.empty()||directory.empty())return false;
+    for(bool physical:{false,true}){
+        auto file=StartupPath(executable,physical),root=StartupPath(directory,physical);
+        if(root.empty()||file.size()<=root.size()||file[root.size()]!=L'\\')continue;
+        if(CompareStringOrdinal(file.data(),int(root.size()),root.data(),int(root.size()),TRUE)==CSTR_EQUAL)return true;
+    }
+    return false;
+}
+std::filesystem::path KnownStartupDirectory(REFKNOWNFOLDERID id){
+    PWSTR value=nullptr;std::filesystem::path path;
+    if(SUCCEEDED(SHGetKnownFolderPath(id,KF_FLAG_DONT_VERIFY,nullptr,&value))){path=value;CoTaskMemFree(value);}
+    return path;
+}
+}
+StartupLocation ClassifyStartupLocation(const std::filesystem::path&executable,
+    const std::filesystem::path&downloads,const std::vector<std::filesystem::path>&temporaryDirectories){
+    for(const auto&directory:temporaryDirectories)
+        if(WithinStartupDirectory(executable,directory))return StartupLocation::Temporary;
+    return WithinStartupDirectory(executable,downloads)?StartupLocation::Downloads:StartupLocation::Permanent;
+}
+StartupLocation CurrentStartupLocation(){
+    std::vector<std::filesystem::path>temporary;
+    wchar_t buffer[32768]{};DWORD length=GetTempPath(ARRAYSIZE(buffer),buffer);
+    if(length&&length<ARRAYSIZE(buffer))temporary.emplace_back(buffer);
+    auto local=KnownStartupDirectory(FOLDERID_LocalAppData);
+    if(!local.empty())temporary.push_back(local/L"Temp");
+    auto cache=KnownStartupDirectory(FOLDERID_InternetCache);
+    if(!cache.empty())temporary.push_back(cache);
+    length=GetWindowsDirectory(buffer,ARRAYSIZE(buffer));
+    if(length&&length<ARRAYSIZE(buffer))temporary.push_back(std::filesystem::path(buffer)/L"Temp");
+    return ClassifyStartupLocation(ExecutablePath(),KnownStartupDirectory(FOLDERID_Downloads),temporary);
 }
 }

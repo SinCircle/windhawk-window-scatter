@@ -32,7 +32,7 @@ public:
         if(showSettings)window.Show();
         MSG message;
         while(GetMessage(&message,nullptr,0,0)>0){
-            if(window.IsVisible()&&IsDialogMessage(window.Handle(),&message))continue;
+            if(window.ProcessDialogMessage(message))continue;
             TranslateMessage(&message);DispatchMessage(&message);
         }
         SetEvent(stop.value);if(worker.joinable())worker.join();
@@ -129,6 +129,22 @@ int SelfTest(const std::wstring&report){
     std::wstring run=key+L"\\Run";
     success=check(SetStartup(true,run.c_str(),L"Entry")&&StartupEnabled(nullptr,run.c_str(),L"Entry"),"autostart command uses quoted EXE path and --startup")&&success;
     success=check(SetStartup(false,run.c_str(),L"Entry")&&!StartupEnabled(nullptr,run.c_str(),L"Entry"),"autostart can be disabled without changing other values")&&success;
+    const std::filesystem::path downloads=L"Z:\\ScatterTest\\Downloads";
+    const std::vector<std::filesystem::path>temporary={L"Z:\\ScatterTest\\Temp",L"Z:\\Windows\\Temp"};
+    const std::pair<const wchar_t*,StartupLocation>locations[]={
+        {L"z:\\scattertest\\DOWNLOADS\\WindowScatter.exe",StartupLocation::Downloads},
+        {L"Z:\\ScatterTest\\Downloads\\Unpacked\\WindowScatter.exe",StartupLocation::Downloads},
+        {L"Z:\\ScatterTest\\Temp\\archive\\WindowScatter.exe",StartupLocation::Temporary},
+        {L"Z:\\Windows\\Temp\\WindowScatter.exe",StartupLocation::Temporary},
+        {L"Z:\\ScatterTest\\Downloads-old\\WindowScatter.exe",StartupLocation::Permanent},
+        {L"Z:\\ScatterTest\\Templates\\WindowScatter.exe",StartupLocation::Permanent},
+        {L"Z:\\ScatterTest\\Downloads\\..\\Apps\\WindowScatter.exe",StartupLocation::Permanent},
+        {L"Z:\\Apps\\WindowScatter.exe",StartupLocation::Permanent},
+    };
+    bool locationsCorrect=true;for(const auto&[path,expected]:locations)
+        locationsCorrect=locationsCorrect&&ClassifyStartupLocation(path,downloads,temporary)==expected;
+    locationsCorrect=locationsCorrect&&ClassifyStartupLocation(L"Z:\\Apps\\WindowScatter.exe",L"",{})==StartupLocation::Permanent;
+    success=check(locationsCorrect,"startup location warnings respect folder boundaries, case, nesting and normalized paths")&&success;
     RegDeleteTree(HKEY_CURRENT_USER,key.c_str());
     std::filesystem::path dll;std::wstring error;
     success=check(ExtractBridge(GetModuleHandle(nullptr),dll,error),"embedded bridge extraction and hash verification")&&success;
@@ -159,7 +175,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     native::Handle ready(CreateEvent(nullptr,TRUE,FALSE,L"Local\\WindowScatter.Standalone.Ready.v1"));
     if(!existing&&ready)ResetEvent(ready.value);
     if(existing||exit){
-        if(startup)return 0;
+        if(startup&&!settings&&!exit)return 0;
         if(existing&&ready)WaitForSingleObject(ready.value,5000);
         HWND manager=FindWindow(native::kManagerClass,nullptr);
         if(manager){DWORD process=0;GetWindowThreadProcessId(manager,&process);AllowSetForegroundWindow(process);SendMessageTimeout(manager,exit?native::kExitApplication:native::kOpenSettings,0,0,SMTO_ABORTIFHUNG,3000,nullptr);}
@@ -168,6 +184,6 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     Gdiplus::GdiplusStartupInput input;ULONG_PTR token=0;if(Gdiplus::GdiplusStartup(&token,&input,nullptr)!=Gdiplus::Ok){if(SUCCEEDED(com))CoUninitialize();return 3;}
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_BAR_CLASSES};InitCommonControlsEx(&controls);
-    native::Application app(instance);int result=app.Run(settings);
+    native::Application app(instance);int result=app.Run(settings||!startup);
     Gdiplus::GdiplusShutdown(token);if(SUCCEEDED(com))CoUninitialize();return result;
 }
