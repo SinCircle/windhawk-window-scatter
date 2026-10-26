@@ -28,7 +28,7 @@ private:
     HBRUSH backgroundBrush=nullptr,cardBrush=nullptr;
     Preferences preferences;
     WindowCallbacks callbacks;
-    int width=560,height=408,popupTopic=0,popupHeight=180;
+    int width=560,height=408,popupTopic=0,popupHeight=180,hoveredHelpRow=-1;
     float scale=1;
     bool dark=false,highContrast=false,loading=false,arranging=false;
     UINT taskbarMessage=0;
@@ -45,6 +45,7 @@ private:
     void ShowLicenses();bool ConfirmStartupLocation();
     void ShowHelp(int topic,HWND anchor);void CloseHelp(bool restoreFocus=true);
     void UpdateHelp();void PaintHelp(HDC dc);void RefreshStatus();
+    void SetHoveredHelpRow(int row);void TrackHelpHover(HWND control,LPARAM position);void RefreshHelpHover();
     HWND Button(const wchar_t*label,int id,DWORD style=BS_OWNERDRAW,HWND parent=nullptr);
     LRESULT Message(UINT message,WPARAM wp,LPARAM lp);
     static LRESULT CALLBACK Procedure(HWND,UINT,WPARAM,LPARAM);

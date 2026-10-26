@@ -71,6 +71,7 @@ bool SettingsWindow::Create(HINSTANCE handle,const Preferences&values,WindowCall
     connection=Button(L"查看连接状态",Connection);about=Button(L"关于",About);exitButton=Button(L"退出程序",Exit);
     SetWindowSubclass(startup,ToggleProcedure,1,reinterpret_cast<DWORD_PTR>(this));SetWindowSubclass(enabled,ToggleProcedure,1,reinterpret_cast<DWORD_PTR>(this));
     SetWindowSubclass(memory,ComboProcedure,1,reinterpret_cast<DWORD_PTR>(this));SetWindowSubclass(duration,SliderProcedure,1,reinterpret_cast<DWORD_PTR>(this));
+    for(HWND control:{memory,duration})SetWindowSubclass(control,ActionProcedure,2,reinterpret_cast<DWORD_PTR>(this));
     COMBOBOXINFO combo{sizeof(combo)};
     if(GetComboBoxInfo(memory,&combo)&&combo.hwndList)SetWindowSubclass(combo.hwndList,MenuProcedure,1,reinterpret_cast<DWORD_PTR>(this));
     AccessibleName(memory,L"内存模式");AccessibleName(duration,L"动画时长，单位毫秒");
@@ -111,7 +112,7 @@ void SettingsWindow::Layout(){
     place(enabled,right-44,99,44,26);place(startup,right-44,155,44,26);
     place(memory,right-156,226,156,180);SendMessage(memory,CB_SETITEMHEIGHT,WPARAM(-1),Px(28));SendMessage(memory,CB_SETITEMHEIGHT,0,Px(32));
     place(duration,right-250,291,184,30);
-    const float centers[]={112,168,242,306};for(size_t i=0;i<help.size();++i)place(help[i],128,centers[i]-13,26,26);
+    const float centers[]={112,168,242,306};for(size_t i=0;i<help.size();++i)place(help[i],102,centers[i]-13,20,26);
     place(connection,width-136,28,112,28);place(about,28,height-54,60,30);place(exitButton,width-116,height-54,92,30);
     if(license&&IsWindow(license))SendMessage(GetDlgItem(license,1),WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
     if(popup)UpdateHelp();if(old)DeleteObject(old);InvalidateRect(hwnd,nullptr,FALSE);arranging=false;
@@ -123,7 +124,28 @@ void SettingsWindow::Show(){
     // its requested show mode, whereas SWP_SHOWWINDOW does not.
     if(IsIconic(hwnd))ShowWindow(hwnd,SW_RESTORE);
     SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
-    SetForegroundWindow(hwnd);SetFocus(enabled);
+    SetForegroundWindow(hwnd);SetFocus(enabled);RefreshHelpHover();
+}
+void SettingsWindow::SetHoveredHelpRow(int row){
+    if(hoveredHelpRow==row)return;
+    int previous=hoveredHelpRow;hoveredHelpRow=row;
+    for(int index:{previous,row})if(index>=0&&index<int(help.size())&&help[index])InvalidateRect(help[index],nullptr,FALSE);
+}
+void SettingsWindow::TrackHelpHover(HWND control,LPARAM position){
+    if(control!=hwnd&&!IsChild(hwnd,control)){SetHoveredHelpRow(-1);return;}
+    POINT point{static_cast<short>(LOWORD(position)),static_cast<short>(HIWORD(position))};
+    if(control!=hwnd)MapWindowPoints(control,hwnd,&point,1);
+    float x=point.x/scale,y=point.y/scale;int row=-1;
+    if(x>=24&&x<width-24){
+        if(y>=84&&y<196)row=y<140?0:1;
+        else if(y>=210&&y<338)row=y<274?2:3;
+    }
+    SetHoveredHelpRow(row);
+}
+void SettingsWindow::RefreshHelpHover(){
+    POINT point{};GetCursorPos(&point);HWND under=WindowFromPoint(point);
+    if(IsVisible()&&(under==hwnd||IsChild(hwnd,under))){ScreenToClient(hwnd,&point);TrackHelpHover(hwnd,MAKELPARAM(point.x,point.y));}
+    else SetHoveredHelpRow(-1);
 }
 bool SettingsWindow::ProcessDialogMessage(MSG&message){
     if(message.message==WM_KEYDOWN&&(message.wParam==VK_TAB||message.wParam==VK_LEFT||message.wParam==VK_RIGHT||message.wParam==VK_UP||message.wParam==VK_DOWN||message.wParam==VK_SPACE))
@@ -169,11 +191,12 @@ void SettingsWindow::DrawButton(const DRAWITEMSTRUCT&item){
     FillRect(item.hDC,&bounds,question||inPopup?cardBrush:backgroundBrush);
     Graphics g(item.hDC);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);g.ScaleTransform(scale,scale);
     SolidBrush base(C(question||inPopup?colors.card:colors.background));g.FillRectangle(&base,0.f,0.f,w,h);
-    if(hovered||pressed)FillRounded(g,colors.selection,1,1,w-2,h-2,question?12:7);
-    COLORREF foreground=highContrast&&(hovered||pressed)?GetSysColor(COLOR_HIGHLIGHTTEXT):colors.secondary;
+    if(!question&&(hovered||pressed))FillRounded(g,colors.selection,1,1,w-2,h-2,7);
+    bool keyboardFocus=(item.itemState&ODS_FOCUS)&&!(SendMessage(item.hwndItem,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS);
+    COLORREF foreground=highContrast&&!question&&(hovered||pressed)?GetSysColor(COLOR_HIGHLIGHTTEXT):colors.secondary;
     if(question){
-        Pen edge(C(hovered?colors.accent:colors.secondary),1.f);g.DrawEllipse(&edge,(w-16)/2,(h-16)/2,16.f,16.f);
-        Text(g,L"?",hovered?colors.accent:foreground,12,{0,0,w,h},false,StringAlignmentCenter);
+        if(hoveredHelpRow==id-HelpEnabled||keyboardFocus)
+            Text(g,L"?",hovered?colors.accent:foreground,14,{0,0,w,h},false,StringAlignmentCenter);
     }else if(id==PopupClose){
         Pen line(C(foreground),1.4f);line.SetStartCap(LineCapRound);line.SetEndCap(LineCapRound);
         g.DrawLine(&line,w/2-3.5f,h/2-3.5f,w/2+3.5f,h/2+3.5f);g.DrawLine(&line,w/2+3.5f,h/2-3.5f,w/2-3.5f,h/2+3.5f);
@@ -182,18 +205,21 @@ void SettingsWindow::DrawButton(const DRAWITEMSTRUCT&item){
         COLORREF dot=highContrast?foreground:current==1?RGB(44,163,103):current==3?RGB(212,133,39):colors.accent;
         SolidBrush indicator(C(dot));g.FillEllipse(&indicator,10.f,h/2-3,6.f,6.f);
         Text(g,current==1?L"已连接":current==3?L"未连接":L"连接中",foreground,12,{24,0,56,h});
-        Pen edge(C(foreground),1.f);g.DrawEllipse(&edge,w-23,h/2-7,14.f,14.f);Text(g,L"?",foreground,10,{w-23,0,14,h},false,StringAlignmentCenter);
+        if(hovered||keyboardFocus)Text(g,L"?",foreground,12,{66,0,14,h},false,StringAlignmentCenter);
     }else{
         wchar_t label[100]{};GetWindowText(item.hwndItem,label,ARRAYSIZE(label));
         Text(g,label,inPopup&&!highContrast?colors.accent:foreground,13,{8,0,w-16,h},false,StringAlignmentCenter);
     }
     g.Flush();if((item.itemState&ODS_FOCUS)&&!(SendMessage(item.hwndItem,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){RECT focus=bounds;InflateRect(&focus,-3,-3);DrawFocusRect(item.hDC,&focus);}
 }
-LRESULT CALLBACK SettingsWindow::ActionProcedure(HWND control,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR){
+LRESULT CALLBACK SettingsWindow::ActionProcedure(HWND control,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data){
+    auto*self=reinterpret_cast<SettingsWindow*>(data);
+    if(message==WM_MOUSEMOVE)self->TrackHelpHover(control,lp);
     if(message==WM_MOUSEMOVE&&!GetProp(control,L"WindowScatter.ButtonHover.v1")){
         SetProp(control,L"WindowScatter.ButtonHover.v1",reinterpret_cast<HANDLE>(1));TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,control,0};TrackMouseEvent(&track);InvalidateRect(control,nullptr,FALSE);
     }
-    if(message==WM_MOUSELEAVE){RemoveProp(control,L"WindowScatter.ButtonHover.v1");InvalidateRect(control,nullptr,FALSE);}
+    if(message==WM_MOUSELEAVE){RemoveProp(control,L"WindowScatter.ButtonHover.v1");InvalidateRect(control,nullptr,FALSE);self->RefreshHelpHover();}
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_UPDATEUISTATE)InvalidateRect(control,nullptr,FALSE);
     if(message==WM_NCDESTROY){RemoveProp(control,L"WindowScatter.ButtonHover.v1");RemoveWindowSubclass(control,ActionProcedure,id);}
     return DefSubclassProc(control,message,wp,lp);
 }
@@ -422,7 +448,10 @@ LRESULT SettingsWindow::Message(UINT message,WPARAM wp,LPARAM lp){
     case kExitApplication:if(callbacks.exit)callbacks.exit();return 1;
     case kStatusChanged:if(callbacks.bridgeStatus)callbacks.bridgeStatus(wp,lp);return 0;
     case kRefresh:RefreshStatus();return 0;
-    case WM_CLOSE:CloseHelp(false);ShowWindow(hwnd,SW_HIDE);return 0;
+    case WM_CLOSE:CloseHelp(false);SetHoveredHelpRow(-1);ShowWindow(hwnd,SW_HIDE);return 0;
+    case WM_ACTIVATE:if(LOWORD(wp)==WA_INACTIVE)SetHoveredHelpRow(-1);break;
+    case WM_MOUSEMOVE:{TrackHelpHover(hwnd,lp);TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,hwnd,0};TrackMouseEvent(&tracking);return 0;}
+    case WM_MOUSELEAVE:RefreshHelpHover();return 0;
     case WM_DESTROY:PostQuitMessage(0);return 0;
     case WM_ERASEBKGND:return 1;
     case WM_PAINT:{PAINTSTRUCT paint;HDC dc=BeginPaint(hwnd,&paint);Paint(dc);EndPaint(hwnd,&paint);return 0;}

@@ -29,7 +29,7 @@
 
 1. 下载 [WindowScatter.exe](https://github.com/SinCircle/windhawk-window-scatter/releases/latest/download/WindowScatter.exe)，双击后直接打开设置。关闭设置面板后继续在后台运行，无需安装额外运行库。
 2. 按 <kbd>Win</kbd> + <kbd>Tab</kbd> 打开总览，点击窗口预览即可切换；也可以用方向键选择后按 <kbd>Enter</kbd>。
-3. 在设置中调整动画、内存模式和开机启动；各项说明点击旁边的「?」查看。再次双击 EXE 可返回设置，也可在这里退出程序。
+3. 在设置中调整动画、内存模式和开机启动；鼠标移到设置行时，点击文字旁出现的「?」查看说明。再次双击 EXE 可返回设置，也可在这里退出程序。
 
 > 使用独立版前，请先停用 Windhawk 中的同名模组。
 
