@@ -32,6 +32,15 @@ void AppMark(Graphics&g,float x,float y,float size,COLORREF accent){
     auto back=Rounded(x+23*unit,y+29*unit,52*unit,40*unit,7*unit);g.FillPath(&glass,back.get());g.DrawPath(&pen,back.get());
     auto front=Rounded(x+45*unit,y+51*unit,52*unit,40*unit,7*unit);SolidBrush fill(Color(255,255,255,255));g.FillPath(&fill,front.get());
 }
+template<class Painter>void BufferedDraw(HDC target,RECT bounds,const Painter&paint){
+    int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;if(width<=0||height<=0)return;
+    HDC buffer=CreateCompatibleDC(target);HBITMAP bitmap=CreateCompatibleBitmap(target,width,height);
+    if(!buffer||!bitmap){if(buffer)DeleteDC(buffer);if(bitmap)DeleteObject(bitmap);paint(target);return;}
+    HGDIOBJ previous=SelectObject(buffer,bitmap);SetViewportOrgEx(buffer,-bounds.left,-bounds.top,nullptr);
+    paint(buffer);
+    BitBlt(target,bounds.left,bounds.top,width,height,buffer,bounds.left,bounds.top,SRCCOPY);
+    SelectObject(buffer,previous);DeleteObject(bitmap);DeleteDC(buffer);
+}
 void AccessibleName(HWND hwnd,const wchar_t*name){
     IAccPropServices*service=nullptr;
     if(SUCCEEDED(CoCreateInstance(CLSID_AccPropServices,nullptr,CLSCTX_INPROC_SERVER,IID_IAccPropServices,reinterpret_cast<void**>(&service)))){
@@ -113,7 +122,7 @@ void SettingsWindow::Layout(){
     place(memory,right-156,226,156,180);SendMessage(memory,CB_SETITEMHEIGHT,WPARAM(-1),Px(28));SendMessage(memory,CB_SETITEMHEIGHT,0,Px(32));
     place(duration,right-250,291,184,30);
     const float centers[]={112,168,242,306};for(size_t i=0;i<help.size();++i)place(help[i],102,centers[i]-13,20,26);
-    place(connection,width-136,28,112,28);place(about,28,height-54,60,30);place(exitButton,width-116,height-54,92,30);
+    place(connection,width-112,28,88,28);place(about,28,height-54,60,30);place(exitButton,width-116,height-54,92,30);
     if(license&&IsWindow(license))SendMessage(GetDlgItem(license,1),WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
     if(popup)UpdateHelp();if(old)DeleteObject(old);InvalidateRect(hwnd,nullptr,FALSE);arranging=false;
 }
@@ -185,11 +194,12 @@ void SettingsWindow::Paint(HDC dc){
     BitBlt(dc,0,0,client.right,client.bottom,buffer,0,0,SRCCOPY);SelectObject(buffer,old);DeleteObject(bitmap);DeleteDC(buffer);
 }
 void SettingsWindow::DrawButton(const DRAWITEMSTRUCT&item){
+    BufferedDraw(item.hDC,item.rcItem,[&](HDC dc){
     int id=GetDlgCtrlID(item.hwndItem);RECT bounds=item.rcItem;float w=(bounds.right-bounds.left)/scale,h=(bounds.bottom-bounds.top)/scale;
     bool question=id>=HelpEnabled&&id<=HelpDuration,inPopup=GetParent(item.hwndItem)==popup;
     bool hovered=GetProp(item.hwndItem,L"WindowScatter.ButtonHover.v1")!=nullptr,pressed=item.itemState&ODS_SELECTED;
-    FillRect(item.hDC,&bounds,question||inPopup?cardBrush:backgroundBrush);
-    Graphics g(item.hDC);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);g.ScaleTransform(scale,scale);
+    FillRect(dc,&bounds,question||inPopup?cardBrush:backgroundBrush);
+    {Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);g.ScaleTransform(scale,scale);
     SolidBrush base(C(question||inPopup?colors.card:colors.background));g.FillRectangle(&base,0.f,0.f,w,h);
     if(!question&&(hovered||pressed))FillRounded(g,colors.selection,1,1,w-2,h-2,7);
     bool keyboardFocus=(item.itemState&ODS_FOCUS)&&!(SendMessage(item.hwndItem,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS);
@@ -204,49 +214,58 @@ void SettingsWindow::DrawButton(const DRAWITEMSTRUCT&item){
         int current;{std::lock_guard lock(statusMutex);current=status;}
         COLORREF dot=highContrast?foreground:current==1?RGB(44,163,103):current==3?RGB(212,133,39):colors.accent;
         SolidBrush indicator(C(dot));g.FillEllipse(&indicator,10.f,h/2-3,6.f,6.f);
-        Text(g,current==1?L"已连接":current==3?L"未连接":L"连接中",foreground,12,{24,0,56,h});
+        Text(g,current==1?L"已连接":current==3?L"未连接":L"连接中",foreground,12,{24,0,42,h});
         if(hovered||keyboardFocus)Text(g,L"?",foreground,12,{66,0,14,h},false,StringAlignmentCenter);
     }else{
         wchar_t label[100]{};GetWindowText(item.hwndItem,label,ARRAYSIZE(label));
         Text(g,label,inPopup&&!highContrast?colors.accent:foreground,13,{8,0,w-16,h},false,StringAlignmentCenter);
     }
-    g.Flush();if((item.itemState&ODS_FOCUS)&&!(SendMessage(item.hwndItem,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){RECT focus=bounds;InflateRect(&focus,-3,-3);DrawFocusRect(item.hDC,&focus);}
+    }
+    if((item.itemState&ODS_FOCUS)&&!(SendMessage(item.hwndItem,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){RECT focus=bounds;InflateRect(&focus,-3,-3);DrawFocusRect(dc,&focus);}
+    });
 }
 LRESULT CALLBACK SettingsWindow::ActionProcedure(HWND control,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data){
     auto*self=reinterpret_cast<SettingsWindow*>(data);
+    if(message==WM_ERASEBKGND)return 1;
+    int identifier=GetDlgCtrlID(control);bool hoverPaint=identifier!=Enabled&&identifier!=Startup&&identifier!=Memory&&identifier!=Duration;
     if(message==WM_MOUSEMOVE)self->TrackHelpHover(control,lp);
     if(message==WM_MOUSEMOVE&&!GetProp(control,L"WindowScatter.ButtonHover.v1")){
-        SetProp(control,L"WindowScatter.ButtonHover.v1",reinterpret_cast<HANDLE>(1));TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,control,0};TrackMouseEvent(&track);InvalidateRect(control,nullptr,FALSE);
+        SetProp(control,L"WindowScatter.ButtonHover.v1",reinterpret_cast<HANDLE>(1));TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,control,0};TrackMouseEvent(&track);if(hoverPaint)InvalidateRect(control,nullptr,FALSE);
     }
-    if(message==WM_MOUSELEAVE){RemoveProp(control,L"WindowScatter.ButtonHover.v1");InvalidateRect(control,nullptr,FALSE);self->RefreshHelpHover();}
+    if(message==WM_MOUSELEAVE){if(RemoveProp(control,L"WindowScatter.ButtonHover.v1")&&hoverPaint)InvalidateRect(control,nullptr,FALSE);self->RefreshHelpHover();}
     if(message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_UPDATEUISTATE)InvalidateRect(control,nullptr,FALSE);
     if(message==WM_NCDESTROY){RemoveProp(control,L"WindowScatter.ButtonHover.v1");RemoveWindowSubclass(control,ActionProcedure,id);}
     return DefSubclassProc(control,message,wp,lp);
 }
 void SettingsWindow::DrawCombo(const DRAWITEMSTRUCT&item){
+    BufferedDraw(item.hDC,item.rcItem,[&](HDC dc){
     bool selected=(item.itemState&ODS_SELECTED)&&!(item.itemState&ODS_COMBOBOXEDIT);COLORREF bg=selected?colors.selection:colors.card;
-    HBRUSH brush=CreateSolidBrush(bg);FillRect(item.hDC,&item.rcItem,brush);DeleteObject(brush);SetBkMode(item.hDC,TRANSPARENT);SetTextColor(item.hDC,selected?(highContrast?GetSysColor(COLOR_HIGHLIGHTTEXT):colors.accent):colors.text);
-    HGDIOBJ old=SelectObject(item.hDC,font);wchar_t text[100]{};
+    HBRUSH brush=CreateSolidBrush(bg);FillRect(dc,&item.rcItem,brush);DeleteObject(brush);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,selected?(highContrast?GetSysColor(COLOR_HIGHLIGHTTEXT):colors.accent):colors.text);
+    HGDIOBJ old=SelectObject(dc,font);wchar_t text[100]{};
     if(item.itemID!=UINT(-1))SendMessage(item.hwndItem,CB_GETLBTEXT,item.itemID,reinterpret_cast<LPARAM>(text));
-    RECT box=item.rcItem;box.left+=Px(9);DrawText(item.hDC,text,-1,&box,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);SelectObject(item.hDC,old);
-    if(item.itemState&ODS_FOCUS)DrawFocusRect(item.hDC,&item.rcItem);
+    RECT box=item.rcItem;box.left+=Px(9);DrawText(dc,text,-1,&box,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);SelectObject(dc,old);
+    if(item.itemState&ODS_FOCUS)DrawFocusRect(dc,&item.rcItem);
+    });
 }
 LRESULT CALLBACK SettingsWindow::ComboProcedure(HWND control,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data){
     auto*self=reinterpret_cast<SettingsWindow*>(data);
     if(message==WM_PAINT||message==WM_PRINTCLIENT||message==WM_PRINT){
-        PAINTSTRUCT paint{};HDC dc=message==WM_PAINT?BeginPaint(control,&paint):reinterpret_cast<HDC>(wp);
+        PAINTSTRUCT paint{};HDC destination=message==WM_PAINT?BeginPaint(control,&paint):reinterpret_cast<HDC>(wp);
         RECT r{};GetClientRect(control,&r);float w=r.right/self->scale,h=r.bottom/self->scale;
+        BufferedDraw(destination,r,[&](HDC dc){
         FillRect(dc,&r,self->cardBrush);
-        Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.ScaleTransform(self->scale,self->scale);
+        {Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.ScaleTransform(self->scale,self->scale);
         SolidBrush base(C(self->colors.card));g.FillRectangle(&base,0.f,0.f,w,h);
         bool focused=GetFocus()==control&&!(SendMessage(control,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS);
         auto outline=Rounded(.5f,.5f,w-1,h-1,7);Pen border(C(focused?self->colors.accent:self->colors.line),1.f);g.DrawPath(&border,outline.get());
         Pen chevron(C(self->colors.secondary),1.2f);chevron.SetStartCap(LineCapRound);chevron.SetEndCap(LineCapRound);
         g.DrawLine(&chevron,w-19,h/2-1.5f,w-15,h/2+2.5f);g.DrawLine(&chevron,w-15,h/2+2.5f,w-11,h/2-1.5f);g.Flush();
+        }
         wchar_t label[100]{};LRESULT selected=SendMessage(control,CB_GETCURSEL,0,0);
         if(selected!=CB_ERR)SendMessage(control,CB_GETLBTEXT,selected,reinterpret_cast<LPARAM>(label));
         auto old=SelectObject(dc,self->font);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,self->colors.text);
         r.left+=self->Px(11);r.right-=self->Px(30);DrawText(dc,label,-1,&r,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);SelectObject(dc,old);
+        });
         if(message==WM_PAINT)EndPaint(control,&paint);return 0;
     }
     if(message==WM_ERASEBKGND)return 1;
@@ -279,14 +298,17 @@ LRESULT CALLBACK SettingsWindow::MenuProcedure(HWND control,UINT message,WPARAM 
 LRESULT CALLBACK SettingsWindow::ToggleProcedure(HWND control,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data){
     auto*self=reinterpret_cast<SettingsWindow*>(data);
     if(message==WM_PAINT||message==WM_PRINTCLIENT||message==WM_PRINT){
-        PAINTSTRUCT paint{};HDC dc=message==WM_PAINT?BeginPaint(control,&paint):reinterpret_cast<HDC>(wp);RECT r;GetClientRect(control,&r);
+        PAINTSTRUCT paint{};HDC destination=message==WM_PAINT?BeginPaint(control,&paint):reinterpret_cast<HDC>(wp);RECT r;GetClientRect(control,&r);
+        BufferedDraw(destination,r,[&](HDC dc){
         FillRect(dc,&r,self->cardBrush);
-        Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.ScaleTransform(self->scale,self->scale);SolidBrush base(C(self->colors.card));g.FillRectangle(&base,0.f,0.f,r.right/self->scale,r.bottom/self->scale);
+        {Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.ScaleTransform(self->scale,self->scale);SolidBrush base(C(self->colors.card));g.FillRectangle(&base,0.f,0.f,r.right/self->scale,r.bottom/self->scale);
         bool checked=SendMessage(control,BM_GETCHECK,0,0)==BST_CHECKED;
         COLORREF track=checked?self->colors.accent:(self->highContrast?GetSysColor(COLOR_WINDOWTEXT):(self->dark?RGB(99,101,111):RGB(202,203,210)));
         FillRounded(g,track,1,2,42,23,11.5f);
         SolidBrush knob(C(self->highContrast?GetSysColor(checked?COLOR_HIGHLIGHTTEXT:COLOR_WINDOW):RGB(255,255,255)));g.FillEllipse(&knob,checked?22.f:3.f,4.f,19.f,19.f);g.Flush();
+        }
         if(GetFocus()==control&&!(SendMessage(control,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){InflateRect(&r,-1,-1);DrawFocusRect(dc,&r);}
+        });
         if(message==WM_PAINT)EndPaint(control,&paint);return 0;
     }
     if(message==WM_ERASEBKGND)return 1;
@@ -297,11 +319,12 @@ LRESULT CALLBACK SettingsWindow::ToggleProcedure(HWND control,UINT message,WPARA
 LRESULT CALLBACK SettingsWindow::SliderProcedure(HWND control,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data){
     auto*self=reinterpret_cast<SettingsWindow*>(data);
     if(message==WM_PAINT||message==WM_PRINTCLIENT||message==WM_PRINT){
-        PAINTSTRUCT paint{};HDC dc=message==WM_PAINT?BeginPaint(control,&paint):reinterpret_cast<HDC>(wp);
+        PAINTSTRUCT paint{};HDC destination=message==WM_PAINT?BeginPaint(control,&paint):reinterpret_cast<HDC>(wp);
         RECT bounds{},channel{},thumb{};GetClientRect(control,&bounds);
+        BufferedDraw(destination,bounds,[&](HDC dc){
         FillRect(dc,&bounds,self->cardBrush);
         SendMessage(control,TBM_GETCHANNELRECT,0,reinterpret_cast<LPARAM>(&channel));SendMessage(control,TBM_GETTHUMBRECT,0,reinterpret_cast<LPARAM>(&thumb));
-        Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.ScaleTransform(self->scale,self->scale);
+        {Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.ScaleTransform(self->scale,self->scale);
         SolidBrush base(C(self->colors.card));g.FillRectangle(&base,0.f,0.f,bounds.right/self->scale,bounds.bottom/self->scale);
         float left=channel.left/self->scale,right=channel.right/self->scale,x=(thumb.left+thumb.right)/(2*self->scale),y=(thumb.top+thumb.bottom)/(2*self->scale);
         if(right>left){
@@ -311,12 +334,14 @@ LRESULT CALLBACK SettingsWindow::SliderProcedure(HWND control,UINT message,WPARA
         SolidBrush shadow(C(self->colors.text,25));g.FillEllipse(&shadow,x-8.5f,y-7.5f,17.f,17.f);
         SolidBrush knob(C(self->highContrast?self->colors.text:RGB(255,255,255)));g.FillEllipse(&knob,x-8,y-8,16.f,16.f);
         Pen edge(C(self->highContrast?self->colors.card:self->colors.line),.8f);g.DrawEllipse(&edge,x-8,y-8,16.f,16.f);g.Flush();
+        }
         if(GetFocus()==control&&!(SendMessage(control,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)){InflateRect(&bounds,-1,-1);DrawFocusRect(dc,&bounds);}
+        });
         if(message==WM_PAINT)EndPaint(control,&paint);return 0;
     }
     if(message==WM_ERASEBKGND)return 1;
     LRESULT result=DefSubclassProc(control,message,wp,lp);
-    if(message==TBM_SETPOS||message==WM_MOUSEMOVE||message==WM_LBUTTONDOWN||message==WM_LBUTTONUP||message==WM_KEYDOWN||message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_UPDATEUISTATE)InvalidateRect(control,nullptr,FALSE);
+    if(message==TBM_SETPOS||message==WM_LBUTTONDOWN||message==WM_LBUTTONUP||message==WM_KEYDOWN||message==WM_SETFOCUS||message==WM_KILLFOCUS||message==WM_UPDATEUISTATE)InvalidateRect(control,nullptr,FALSE);
     if(message==WM_NCDESTROY)RemoveWindowSubclass(control,SliderProcedure,id);
     return result;
 }
@@ -405,10 +430,14 @@ void SettingsWindow::UpdateHelp(){
     InvalidateRect(popup,nullptr,FALSE);
 }
 void SettingsWindow::PaintHelp(HDC dc){
-    Graphics g(dc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);g.ScaleTransform(scale,scale);
+    RECT bounds{0,0,Px(332),Px(popupHeight)};
+    BufferedDraw(dc,bounds,[&](HDC canvas){
+    FillRect(canvas,&bounds,cardBrush);
+    Graphics g(canvas);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);g.ScaleTransform(scale,scale);
     SolidBrush base(C(colors.card));g.FillRectangle(&base,0.f,0.f,332.f,float(popupHeight));
     auto outline=Rounded(.5f,.5f,331.f,float(popupHeight-1),12);Pen border(C(colors.line));g.DrawPath(&border,outline.get());
     Text(g,popupTitle.c_str(),colors.text,15,{20,16,264,26},true);
+    });
 }
 LRESULT CALLBACK SettingsWindow::PopupProcedure(HWND window,UINT message,WPARAM wp,LPARAM lp){
     auto*self=reinterpret_cast<SettingsWindow*>(GetWindowLongPtr(window,GWLP_USERDATA));
