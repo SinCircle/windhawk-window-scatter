@@ -22,6 +22,7 @@ if (!$ResourceCompiler) {
 }
 if (!$ResourceCompiler -or !(Test-Path -LiteralPath $ResourceCompiler)) { throw 'Windows SDK resource compiler was not found. Pass -ResourceCompiler with rc.exe.' }
 $utf8 = [Text.UTF8Encoding]::new($false)
+$webviewSdk = & (Join-Path $native 'restore-webview2.ps1') -CacheDirectory (Join-Path $root 'build\deps')
 $source = [IO.File]::ReadAllText((Join-Path $root 'window-scatter.wh.cpp'))
 $constants = [regex]::Match($source,'(?s)(constexpr wchar_t kController\[\].*?constexpr ULONG_PTR kShellAck=.*?;)').Groups[1].Value
 $bridge = [regex]::Match($source,'(?s)(namespace scatter::shell \{.*?\} // namespace scatter::shell)').Groups[1].Value
@@ -33,7 +34,7 @@ $bridge = $bridge.Replace($target,'HWND target=g_nativeTarget.load();')
 [IO.File]::WriteAllText((Join-Path $build 'shell-hooks.inc'),$bridge,$utf8)
 $common = @('-std=c++23','-target','x86_64-w64-mingw32','-O2','-static','-Wl,--no-insert-timestamp','-DUNICODE','-D_UNICODE',
     '-DWINVER=0x0A00','-D_WIN32_WINNT=0x0A00','-D_WIN32_IE=0x0A00','-DNTDDI_VERSION=0x0A000008',
-    '-D__USE_MINGW_ANSI_STDIO=0','-I',$native,'-I',$build,'-Wno-deprecated','-Wno-pragma-pack')
+    '-D__USE_MINGW_ANSI_STDIO=0','-fms-extensions','-I',(Join-Path $webviewSdk 'build\native\include'),'-I',$native,'-I',$build,'-Wno-deprecated','-Wno-pragma-pack')
 $payload = Join-Path $build 'window-scatter-bridge.dll'
 $hookSources = @('buffer.c','hook.c','trampoline.c','hde\hde64.c') | ForEach-Object { Join-Path $native "vendor\minhook\src\$_" }
 & $Compiler @common -shared (Join-Path $native 'bridge.cpp') @hookSources '-luser32' '-o' $payload
@@ -42,6 +43,7 @@ $icon = Join-Path $build 'window-scatter.ico'
 & (Join-Path $native 'create-icon.ps1') -OutputPath $icon
 $notice = "Window Scatter $([char]0x2014) third-party notices`r`n`r`nMinHook v1.3.4, commit c3fcafdc10146beb5919319d0683e44e3c30d537`r`nhttps://github.com/TsudaKageyu/minhook`r`n`r`n" + [IO.File]::ReadAllText((Join-Path $native 'vendor\minhook\LICENSE.txt'))
 $noticePath = Join-Path $build 'THIRD-PARTY-NOTICES.txt'
+$notice += "`r`n`r`nMicrosoft Edge WebView2 SDK 1.0.4314.35`r`nhttps://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.4314.35`r`n`r`n" + [IO.File]::ReadAllText((Join-Path $webviewSdk 'LICENSE.txt')) + "`r`n`r`n" + [IO.File]::ReadAllText((Join-Path $webviewSdk 'NOTICE.txt'))
 [IO.File]::WriteAllText($noticePath,$notice,$utf8)
 function ResourcePath([string]$path) { return $path.Replace('\','\\') }
 $rc = @"
@@ -49,6 +51,8 @@ $rc = @"
 1 24 "$(ResourcePath (Join-Path $native 'app.manifest'))"
 201 RCDATA "$(ResourcePath $payload)"
 202 RCDATA "$(ResourcePath $noticePath)"
+203 RCDATA "$(ResourcePath (Join-Path $native 'settings.html'))"
+204 RCDATA "$(ResourcePath (Join-Path $webviewSdk 'build\native\x64\WebView2Loader.dll'))"
 1 VERSIONINFO
 FILEVERSION 1,0,3,0
 PRODUCTVERSION 1,0,3,0
@@ -88,4 +92,4 @@ $output = Join-Path $build 'WindowScatter.exe'
 & $Compiler @common -municode -mwindows (Join-Path $native 'app.cpp') (Join-Path $native 'backend.cpp') (Join-Path $native 'settings-window.cpp') $resPath @libraries '-o' $output
 if ($LASTEXITCODE -ne 0) { throw 'Standalone application build failed.' }
 Write-Output "Built $output"
-Write-Output 'Single-file Windows 11 x64 application; no Windhawk or additional runtime is required.'
+Write-Output 'Single-file Windows 11 x64 application. Settings use the installed Microsoft Edge WebView2 Runtime; Windhawk is not required.'

@@ -14,13 +14,15 @@
 
 鼠标移到设置行时，文字旁会出现「?」，点击查看说明；也可用 Tab 聚焦后打开。右上角显示连接状态，点击可查看详情；连接异常时可在其中重新连接。
 
+设置页需要 Microsoft Edge WebView2 Runtime。若提示运行时缺失，请使用 [微软官方下载页](https://developer.microsoft.com/microsoft-edge/webview2/#download) 安装 Evergreen Runtime 后重新打开设置。程序不会自动下载或安装运行时。界面关闭后释放 WebView2 环境，下次打开时从原生后端重新读取设置。
+
 ## 如何退出？
 
 在设置中点击“退出程序”，或运行 `WindowScatter.exe --exit`。只关闭设置面板不会退出程序。
 
 ## 设置保存在哪里？
 
-设置位于 `HKCU\Software\SinCircle\WindowScatter`；运行组件与符号缓存位于 `%LOCALAPPDATA%\WindowScatter`。程序会将内置连接组件释放到该目录。
+设置位于 `HKCU\Software\SinCircle\WindowScatter`；运行组件与符号缓存位于 `%LOCALAPPDATA%\WindowScatter`。内置连接组件、WebView2 Loader 和独立的界面缓存均在该目录；界面使用 `Frontend\Profile`，不使用个人 Edge 浏览器配置。
 
 开机启动仅注册当前用户启动项。在下载目录、临时目录或浏览器缓存目录中开启时，会先提醒将程序移到固定位置，也可以确认后继续开启。取消提醒不会写入启动项。启用后若移动 EXE，请在新位置关闭并重新开启该选项。
 

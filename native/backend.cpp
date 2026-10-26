@@ -79,6 +79,20 @@ bool ExtractBridge(HINSTANCE instance,std::filesystem::path&path,std::wstring&er
     if(!MoveFileEx(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){error=L"无法部署内置系统组件："+ErrorText(GetLastError());DeleteFile(temporary.c_str());return false;}
     return ResolveBridgePath(path,error);
 }
+bool ExtractFrontendLoader(HINSTANCE instance,std::filesystem::path&path,std::wstring&error){
+    std::vector<BYTE>payload;if(!ReadResource(instance,204,payload)){error=L"设置界面组件缺失。";return false;}
+    auto hash=Hash(payload);auto root=DataDirectory();
+    if(hash.empty()||root.empty()){error=L"无法准备设置界面组件。";return false;}
+    auto directory=root/L"Frontend";std::error_code ec;std::filesystem::create_directories(directory,ec);
+    if(ec){error=L"无法创建设置界面缓存目录。";return false;}
+    path=directory/(L"WebView2Loader-"+hash+L".dll");
+    std::ifstream current(path,std::ios::binary);
+    if(current){std::vector<BYTE>existing{std::istreambuf_iterator<char>(current),{}};if(existing==payload)return true;}
+    current.close();auto temporary=path;temporary+=L"."+std::to_wstring(GetCurrentProcessId())+L".tmp";
+    {std::ofstream output(temporary,std::ios::binary|std::ios::trunc);output.write(reinterpret_cast<const char*>(payload.data()),payload.size());if(!output){error=L"无法写入设置界面组件。";return false;}}
+    if(!MoveFileEx(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){error=L"无法部署设置界面组件："+ErrorText(GetLastError());DeleteFile(temporary.c_str());return false;}
+    return true;
+}
 std::wstring SymbolIdentityText(const ModuleIdentity&identity){
     const auto&g=identity.guid;wchar_t text[80];
     swprintf_s(text,L"%08lX%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X%lX",g.Data1,g.Data2,g.Data3,

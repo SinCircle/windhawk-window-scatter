@@ -148,6 +148,13 @@ int SelfTest(const std::wstring&report){
     RegDeleteTree(HKEY_CURRENT_USER,key.c_str());
     std::filesystem::path dll;std::wstring error;
     success=check(ExtractBridge(GetModuleHandle(nullptr),dll,error),"embedded bridge extraction and hash verification")&&success;
+    std::filesystem::path loader;std::vector<BYTE>embedded;
+    bool frontend=ExtractFrontendLoader(GetModuleHandle(nullptr),loader,error)&&ReadResource(GetModuleHandle(nullptr),204,embedded);
+    if(frontend){std::ifstream input(loader,std::ios::binary);std::vector<BYTE>actual{std::istreambuf_iterator<char>(input),{}};frontend=actual==embedded;}
+    success=check(frontend,"embedded WebView2 loader extracts with exact resource bytes")&&success;
+    std::vector<BYTE>page;bool content=ReadResource(GetModuleHandle(nullptr),203,page);
+    std::string html(page.begin(),page.end());content=content&&html.find("/*NATIVE_STATE*/null")!=html.npos&&html.find("Content-Security-Policy")!=html.npos;
+    success=check(content,"embedded settings page includes native bootstrap and local content policy")&&success;
     SymbolTable symbols;
     bool resolved=ResolveSymbols(DataDirectory()/L"Symbols",symbols,nullptr,[](const std::wstring&){},error,false);
     success=check(resolved,"exact system symbol identity resolves offline")&&success;
@@ -182,8 +189,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         return manager||exit?0:2;
     }
     HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
-    Gdiplus::GdiplusStartupInput input;ULONG_PTR token=0;if(Gdiplus::GdiplusStartup(&token,&input,nullptr)!=Gdiplus::Ok){if(SUCCEEDED(com))CoUninitialize();return 3;}
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_BAR_CLASSES};InitCommonControlsEx(&controls);
     native::Application app(instance);int result=app.Run(settings||!startup);
-    Gdiplus::GdiplusShutdown(token);if(SUCCEEDED(com))CoUninitialize();return result;
+    if(SUCCEEDED(com))CoUninitialize();return result;
 }

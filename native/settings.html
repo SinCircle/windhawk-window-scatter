@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<title>Window Scatter 设置</title>
+<style>
+:root{color-scheme:light;--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#707078;--line:#e6e6ea;--accent:#0071e3;--accent-text:#fff;--hover:#e8e8ed;--track:#d7d7dd;--success:#248a3d;--danger:#c43a33;font-family:"Segoe UI","Microsoft YaHei UI",sans-serif;font-size:13px;color:var(--text);background:var(--bg)}
+:root[data-theme=dark]{color-scheme:dark;--bg:#1d1d1f;--card:#2a2a2d;--text:#f5f5f7;--muted:#a4a4ab;--line:#3e3e42;--accent:#509bff;--accent-text:#111;--hover:#3a3a3f;--track:#55555c;--success:#60d17b;--danger:#ff756b}
+:root[data-theme=contrast]{--bg:var(--system-background);--card:var(--system-background);--text:var(--system-text);--muted:var(--system-text);--line:var(--system-text);--accent:var(--system-accent);--accent-text:var(--system-accent-text);--hover:var(--system-background);--track:var(--system-text);--success:var(--system-text);--danger:var(--system-text);forced-color-adjust:none}
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{user-select:none}button,input,select{font:inherit}button{color:inherit;cursor:pointer}button:disabled{cursor:wait;opacity:.65}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button{border:0}main{height:100%;padding:24px;display:flex;flex-direction:column;min-width:440px;min-height:408px}header{height:36px;display:flex;align-items:center;gap:11px;flex-shrink:0;margin-bottom:24px}h1{font-size:19px;letter-spacing:-.45px;font-weight:650;margin:0;white-space:nowrap}.app-mark{width:36px;height:36px;flex:none}.status{margin-left:auto;display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:7px;background:transparent;white-space:nowrap;font-size:12px;color:var(--muted);line-height:14px}.status:hover{background:var(--hover)}.status .dot{width:6px;height:6px;flex:none;border-radius:50%;background:var(--muted)}.status[data-status="1"] .dot{background:var(--success)}.status[data-status="3"] .dot{background:var(--danger)}.status .question{font-size:13px;margin-left:1px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;flex:none;overflow:hidden}.card+.card{margin-top:14px}.row{height:55px;display:flex;align-items:center;justify-content:space-between;padding:0 19px;gap:16px}.card.secondary .row{height:63px}.row+.row{border-top:1px solid var(--line)}.field-name{display:inline-flex;align-items:center;flex:none;gap:3px}.help{background:transparent;color:var(--muted);padding:0;width:18px;height:26px;opacity:0;cursor:help;font-size:13px;line-height:26px;border-radius:3px}.row:hover .help,.help:focus-visible{opacity:1}.help:hover{color:var(--accent)}body:has(dialog[open]) .row .help{opacity:0}
+.switch{appearance:none;margin:0;width:38px;height:22px;border-radius:12px;background:var(--track);cursor:pointer;position:relative;flex:none;border:1px solid transparent}.switch:before{content:"";position:absolute;left:2px;top:2px;width:16px;height:16px;background:#fff;border-radius:50%;box-shadow:0 1px 3px #0002;transform:translateX(0)}.switch:checked{background:var(--accent)}.switch:checked:before{transform:translateX(16px)}.switch:disabled{cursor:wait;opacity:.65}select{width:156px;height:30px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);padding:0 10px;cursor:pointer}select:hover{border-color:var(--muted)}.duration-control{width:250px;display:flex;align-items:center;gap:14px}input[type=range]{appearance:none;min-width:0;flex:1;height:26px;margin:0;background:transparent;cursor:pointer;--fill:0%}input[type=range]::-webkit-slider-runnable-track{height:3px;border-radius:2px;background:linear-gradient(to right,var(--accent) var(--fill),var(--track) var(--fill))}input[type=range]::-webkit-slider-thumb{appearance:none;width:16px;height:16px;margin-top:-6.5px;border-radius:50%;background:#fff;border:1px solid #0002;box-shadow:0 1px 3px #0002}output{min-width:52px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}footer{display:flex;align-items:center;justify-content:space-between;margin-top:auto;padding-top:16px;height:46px;flex:none}.text-button{height:30px;padding:0 10px;border-radius:6px;background:transparent;color:var(--muted)}.text-button:hover{background:var(--hover);color:var(--text)}.exit:hover{color:var(--danger)}
+dialog{color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:12px;padding:19px;margin:0;box-shadow:0 8px 30px #0002;width:332px;max-height:calc(100% - 24px);overflow:auto}dialog::backdrop{background:transparent}.dialog-heading{display:flex;align-items:center;gap:14px;margin-bottom:13px}h2{font-size:14px;font-weight:650;margin:0;line-height:22px;flex:1;overflow-wrap:anywhere}.close{background:transparent;width:25px;height:25px;flex:none;border-radius:5px;padding:3px;color:var(--muted)}.close:hover{background:var(--hover);color:var(--text)}.close svg{display:block;width:18px;height:18px}.body{line-height:1.75;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;color:var(--muted)}.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.actions:empty{display:none}.action{border:1px solid var(--line);border-radius:6px;background:var(--bg);padding:6px 11px;line-height:18px}.action:hover{background:var(--hover)}#licenses{width:calc(100% - 40px);height:calc(100% - 40px);left:20px;top:20px}#licenses .body{font-size:11px;line-height:1.55;white-space:pre-wrap;font-family:Consolas,monospace}#licenses::backdrop{background:#0003}:root[data-theme=contrast] .switch{border-color:var(--text)}:root[data-theme=contrast] .switch:before{background:var(--text)}:root[data-theme=contrast] .switch:checked:before{background:var(--accent-text)}:root[data-theme=contrast] input[type=range]::-webkit-slider-thumb{background:var(--bg);border:2px solid var(--text)}
+@media(max-width:500px){main{padding-left:18px;padding-right:18px}.duration-control{width:212px}h1{font-size:17px}}
+</style>
+<script>
+'use strict';
+const initialState=/*NATIVE_STATE*/null;
+function applyTheme(s){const root=document.documentElement;root.dataset.theme=s.theme;for(const [key,value] of Object.entries({background:s.systemBackground,text:s.systemText,accent:s.systemAccent,'accent-text':s.systemAccentText}))root.style.setProperty('--system-'+key,value)}
+applyTheme(initialState);
+</script>
+</head>
+<body>
+<main>
+<header>
+<svg class="app-mark" viewBox="0 0 118 118" aria-hidden="true"><rect width="118" height="118" rx="29" fill="var(--accent)"/><rect x="23" y="29" width="52" height="40" rx="7" fill="#ffffff28" stroke="white" stroke-width="4"/><rect x="45" y="51" width="52" height="40" rx="7" fill="white"/></svg>
+<h1>Window Scatter</h1>
+<button class="status" id="connection" aria-haspopup="dialog" aria-label="查看连接状态"><span class="dot"></span><span id="status-label">连接中</span><span class="question" aria-hidden="true">?</span></button>
+</header>
+<section class="card" aria-label="常规设置">
+<div class="row"><div class="field-name"><label for="enabled">启用总览</label><button class="help" data-topic="enabled" aria-label="启用总览说明" aria-haspopup="dialog">?</button></div><input class="switch" id="enabled" type="checkbox" role="switch"></div>
+<div class="row"><div class="field-name"><label for="startup">开机启动</label><button class="help" data-topic="startup" aria-label="开机启动说明" aria-haspopup="dialog">?</button></div><input class="switch" id="startup" type="checkbox" role="switch"></div>
+</section>
+<section class="card secondary" aria-label="性能与动画">
+<div class="row"><div class="field-name"><label for="memory">内存模式</label><button class="help" data-topic="memory" aria-label="内存模式说明" aria-haspopup="dialog">?</button></div><select id="memory"><option value="0">自动</option><option value="1">常驻</option><option value="2">节省</option></select></div>
+<div class="row"><div class="field-name"><label for="duration">动画时长</label><button class="help" data-topic="duration" aria-label="动画时长说明" aria-haspopup="dialog">?</button></div><div class="duration-control"><input id="duration" type="range" min="0" max="900" step="1" aria-describedby="duration-value"><output id="duration-value" for="duration">666 ms</output></div></div>
+</section>
+<footer><button class="text-button" id="about" aria-haspopup="dialog">关于</button><button class="text-button exit" id="exit">退出程序</button></footer>
+</main>
+<dialog id="help-dialog" aria-labelledby="help-title"><div class="dialog-heading"><h2 id="help-title"></h2><button class="close" aria-label="关闭说明" autofocus><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div><div class="body" id="help-body"></div><div class="actions" id="help-actions"></div></dialog>
+<dialog id="licenses" aria-labelledby="licenses-title"><div class="dialog-heading"><h2 id="licenses-title">开源许可</h2><button class="close" aria-label="关闭许可" autofocus><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div><div class="body" id="license-text"></div></dialog>
+<script>
+const $=id=>document.getElementById(id);
+let state=initialState,sequence=0,topic='',anchor=null,dragging=false,rangeFrame=0,errorAck=-1;
+const pending={};
+function send(action,value=0){const seq=++sequence;window.chrome.webview.postMessage(seq+'|'+action+'|'+value);return seq}
+function change(key,value){pending[key]=send(key,Number(value));if(key==='startup')$('startup').disabled=true}
+function rangeLabel(){const value=Number($('duration').value);$('duration-value').textContent=value+' ms';$('duration').style.setProperty('--fill',(value/9)+'%');$('duration').setAttribute('aria-valuetext',value+' 毫秒')}
+function render(next){
+ state=next;applyTheme(state);
+ for(const key of ['enabled','startup','memory','duration']){
+  if((pending[key]||0)>state.ack||(key==='duration'&&(dragging||rangeFrame)))continue;
+  if(key==='enabled'||key==='startup')$(key).checked=state[key];else $(key).value=state[key];
+  delete pending[key];if(key==='startup')$(key).disabled=false;
+ }
+ rangeLabel();$('connection').dataset.status=state.status;$('status-label').textContent=state.status===1?'已连接':state.status===3?'未连接':'连接中';
+ $('connection').setAttribute('aria-label',$('status-label').textContent+'，查看连接详情');
+ if(topic==='connection'&&$('help-dialog').open){fillHelp();positionHelp()}
+ if(state.error&&errorAck!==state.ack){errorAck=state.ack;showHelp('error',document.activeElement)}
+}
+const helpText={
+ enabled:['启用总览','用 Win+Tab 或三指上滑打开总览，点击预览切换窗口。\n\n关闭此选项后恢复系统任务视图。Shift+Win+Tab 始终打开系统任务视图。'],
+ startup:['开机启动','登录 Windows 后在后台运行，不弹出设置。\n\n请把程序保存在固定位置。移动程序后，在新位置重新开启此选项。'],
+ memory:['内存模式','自动：内存紧张时释放图形资源。\n\n常驻：保留资源，优先打开速度。\n\n节省：关闭总览后释放图形资源。'],
+ duration:['动画时长','调整窗口展开、重排和收回的时长，单位为毫秒。\n\n设为 0 可关闭动画。修改会即时生效。']
+};
+function addAction(label,action){const button=document.createElement('button');button.className='action';button.textContent=label;button.addEventListener('click',action);$('help-actions').append(button)}
+function fillHelp(){
+ let content=helpText[topic];$('help-actions').replaceChildren();
+ if(topic==='about'){content=['Window Scatter','版本 '+state.version+'\n\n设置即时保存。关闭面板后继续在后台运行，再次打开程序可返回这里。'];addAction('GitHub',()=>send('github'));addAction('开源许可',()=>send('licenses'))}
+ if(topic==='connection'){content=[state.statusText,state.statusDetail||'连接状态更新后会显示在这里。'];if(state.status===3)addAction('重新连接',()=>send('reconnect'))}
+ if(topic==='error')content=['无法保存',state.error];
+ $('help-title').textContent=content[0];$('help-body').textContent=content[1];
+}
+function positionHelp(){
+ const dialog=$('help-dialog'),rect=anchor?.getBoundingClientRect()||{left:innerWidth/2,bottom:innerHeight/2,top:innerHeight/2};
+ const height=dialog.offsetHeight,width=dialog.offsetWidth;
+ dialog.style.left=Math.max(12,Math.min(rect.left,innerWidth-width-12))+'px';
+ let top=rect.bottom+8;if(top+height>innerHeight-12)top=rect.top-height-8;
+ dialog.style.top=Math.max(12,Math.min(top,innerHeight-height-12))+'px';
+}
+function showHelp(next,source){
+ const dialog=$('help-dialog');if(dialog.open)dialog.close();topic=next;anchor=source;fillHelp();dialog.showModal();positionHelp();
+}
+document.querySelectorAll('.help').forEach(button=>button.addEventListener('click',()=>showHelp(button.dataset.topic,button)));
+for(const key of ['enabled','startup'])$(key).addEventListener('change',()=>change(key,$(key).checked));
+$('memory').addEventListener('change',()=>change('memory',$('memory').value));
+$('duration').addEventListener('pointerdown',()=>{dragging=true});
+function flushRange(){if(rangeFrame){cancelAnimationFrame(rangeFrame);rangeFrame=0;change('duration',$('duration').value)}}
+$('duration').addEventListener('input',()=>{rangeLabel();if(!rangeFrame)rangeFrame=requestAnimationFrame(()=>{rangeFrame=0;change('duration',$('duration').value)})});
+$('duration').addEventListener('change',()=>{flushRange();dragging=false;render(state)});
+function finishDrag(){if(dragging){flushRange();dragging=false;render(state)}}
+document.addEventListener('pointerup',finishDrag);
+document.addEventListener('pointercancel',finishDrag);
+window.addEventListener('blur',()=>{flushRange();dragging=false});
+$('connection').addEventListener('click',()=>showHelp('connection',$('connection')));
+$('about').addEventListener('click',()=>showHelp('about',$('about')));
+$('exit').addEventListener('click',()=>{flushRange();send('exit')});
+for(const dialog of document.querySelectorAll('dialog')){
+ dialog.querySelector('.close').addEventListener('click',()=>dialog.close());
+ dialog.addEventListener('click',e=>{if(e.target===dialog){const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close()}});
+}
+$('help-dialog').addEventListener('close',()=>{if(!$('help-dialog').open){topic='';anchor?.focus({preventScroll:true})}});
+window.addEventListener('resize',()=>{if($('help-dialog').open)positionHelp()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!document.querySelector('dialog[open]')){e.preventDefault();flushRange();send('close')}});
+window.chrome.webview.addEventListener('message',event=>{
+ const message=event.data;
+ if(message.type==='state')render(message);
+ if(message.type==='licenses'){$('license-text').textContent=message.text;$('licenses').showModal()}
+});
+render(initialState);
+send('ready');
+</script>
+</body>
+</html>

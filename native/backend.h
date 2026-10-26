@@ -20,6 +20,7 @@ std::filesystem::path DataDirectory();
 void Log(const std::wstring&text);
 bool ReadResource(HINSTANCE instance,int id,std::vector<BYTE>&bytes);
 bool ExtractBridge(HINSTANCE instance,std::filesystem::path&path,std::wstring&error);
+bool ExtractFrontendLoader(HINSTANCE instance,std::filesystem::path&path,std::wstring&error);
 bool ResolveSymbols(const std::filesystem::path&directory,SymbolTable&table,HANDLE stop,
                     const std::function<void(const std::wstring&)>&progress,std::wstring&error,bool allowNetwork=true);
 bool AttachBridge(const std::filesystem::path&dll,const BridgeConfig&config,DWORD shellProcess,
