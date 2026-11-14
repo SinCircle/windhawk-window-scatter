@@ -20,10 +20,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/layout-mixed.gif" width="960" alt="原生总览展开真实应用并切换到项目仓库">
+  <img src="docs/media/layout-mixed.gif" width="1200" alt="展开真实应用窗口并切回编辑器">
 </p>
-
-<p align="center"><sub>动图由当前程序实录，使用浅色的真实应用窗口与公开内容。<a href="docs/media-sources.md">素材与演示说明</a></sub></p>
 
 ## 快速开始
 
@@ -64,9 +62,10 @@
 
 <table>
   <tr>
-    <td><img src="docs/media/layout-mixed.gif" width="480" alt="真实浏览器和编辑器混合布局"><br>浏览器与编辑器混合布局</td>
-    <td><img src="docs/media/layout-quarters.gif" width="480" alt="使用方向键选择真实网页窗口"><br>方向键选窗</td>
-    <td><img src="docs/media/layout-varied.gif" width="480" alt="不同大小的真实应用窗口"><br>不同大小的窗口</td>
+    <td><img src="docs/media/workflow-new-windows.gif" width="640" alt="打开真实网页窗口后自动重排"></td>
+    <td><img src="docs/media/workflow-close-windows.gif" width="640" alt="连续关闭网页窗口后切回编辑器"></td>
+    <td><img src="docs/media/workflow-minimize-many.gif" width="640" alt="最小化网页窗口，再从底部恢复"></td>
+    <td><img src="docs/media/layout-mixed.gif" width="640" alt="从交错窗口中选择编辑器"></td>
   </tr>
 </table>
 
@@ -136,10 +135,8 @@
 
 macOS 和 Linux 桌面的多任务总览界面是本项目的交互参考。Window Scatter 根据自身的设计目标，独立探索窗口的空间布局、手势选窗、连续重排与最小化恢复，让窗口管理适应 Windows 上的实际使用方式。
 
-预览录制了真实浏览器和 VS Code 窗口，展示公开网页与本项目源码。窗口内容由应用实时绘制，布局与动画由当前程序运行。录制说明见[预览素材说明](docs/media-sources.md)。
-
 ## 更多说明
 
-[常见问题](docs/usage.md) · [性能测试](docs/performance.md) · [编译说明](docs/development.md) · [更新记录](docs/CHANGELOG.md) · [反馈问题](https://github.com/SinCircle/windhawk-window-scatter/issues)
+[常见问题](docs/usage.md) · [性能测试](docs/performance.md) · [编译说明](docs/development.md) · [预览素材说明](docs/media-sources.md) · [更新记录](docs/CHANGELOG.md) · [反馈问题](https://github.com/SinCircle/windhawk-window-scatter/issues)
 
 作者 **SinCircle** · [来源与许可](docs/development.md#来源与许可)

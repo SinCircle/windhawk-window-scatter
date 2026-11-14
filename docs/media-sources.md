@@ -4,11 +4,11 @@
 
 1.0.6 的动图直接录制真实应用窗口：Microsoft Edge 打开公开网页，Visual Studio Code 打开本项目当前版本的 C++ 源码。全部使用浅色主题，应用图标来自相应窗口。没有把截图贴进示意窗口，也没有离线拼接窗口动画。
 
-应用在独立配置和隔离桌面中运行。录制只枚举这次打开的应用窗口；展开、选窗、收回、标题、圆角和阴影使用本版本的生产代码与 Windows 合成器。光标是录制提示层。录制结束后恢复原桌面。
+应用使用独立配置，在当前桌面限定的 1440×900 区域内运行，窗口宽度约 1100 像素，以正常桌面排版展示内容。录制不切换桌面，只枚举这次打开的应用窗口。展开、重排、关闭、最小化、恢复、标题、圆角和阴影由当前版本的生产代码与 Windows 合成器实时绘制；没有另写动画模型。鼠标是录制提示层。每段结束后关闭录制窗口，并恢复先前的前台窗口。
 
-公开内容包括 [Window Scatter 项目](https://github.com/SinCircle/windhawk-window-scatter)、Wikipedia 的 [Linear algebra](https://en.wikipedia.org/wiki/Linear_algebra)、[Matrix](https://en.wikipedia.org/wiki/Matrix_(mathematics))、[Euclidean geometry](https://en.wikipedia.org/wiki/Euclidean_geometry)，以及 [MDN Array 文档](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array)。网页内容、软件界面和商标按各自来源的许可与权利归属；本项目的 MIT 许可不扩展到第三方内容。
+公开内容包括 [Window Scatter 项目](https://github.com/SinCircle/windhawk-window-scatter)、Wikipedia 的 [Linear algebra](https://en.wikipedia.org/wiki/Linear_algebra)和 [Matrix](https://en.wikipedia.org/wiki/Matrix_(mathematics))。网页内容、软件界面和商标按各自来源的许可与权利归属；本项目的 MIT 许可不扩展到第三方内容。
 
-录制背景为 Windows 随附壁纸，其权利归 Microsoft。设置截图来自本项目实际的 WebView2 设置页。已裁去捕获初始化时尚未出画的开头空帧，后续按原始速度播放。GIF 以 50 fps 编码；产品性能测量范围见[性能与验证](performance.md)。
+录制背景为 Windows 随附壁纸，其权利归 Microsoft。设置截图来自本项目实际的 WebView2 设置页。录像按原始速度播放。GIF 保持 16∶10 比例，以 1200×750、50 fps 编码；产品性能测量范围见[性能与验证](performance.md)。
 
 <details>
 <summary>1.0.5 历史素材来源与许可</summary>
