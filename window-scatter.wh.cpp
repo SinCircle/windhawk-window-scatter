@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     An independent window overview for Windows 11, with spatial layouts, live previews and touchpad navigation.
-// @version         1.0.2
+// @version         1.0.4
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -26,7 +26,10 @@ including diagonally; lift after selecting to activate the window. A downward
 swipe while the overview is open cancels.
 The selected outline follows the gesture without moving the system mouse cursor.
 Click a window to switch; hover a preview and click its close button to ask the
-application to close it. Arrow keys select nearby previews, including minimized
+application to close it. Middle click also closes the clicked preview; Shift+
+middle click closes its application's taskbar windows across processes, monitors
+and virtual desktops, including minimized windows. Save prompts remain native.
+Arrow keys select nearby previews, including minimized
 windows and other monitors; Enter switches to the selection. Moving the mouse
 resumes hover selection. Escape or a background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
@@ -44,8 +47,8 @@ subgroups and centers the complete footprint within each monitor. Later changes
 preserve a feasible common scale and allow wider movement to use available space,
 while existing previews retain separated motion paths. Interrupted local changes
 use the current captured positions instead of their unfinished destinations. Minimized
-previews have a separate bottom-center shelf and slide from below the display
-with a subtle 94%-100% scale change, retaining their colors and opacity.
+previews have a separate bottom-center shelf and expand from the taskbar button's
+actual rectangle, retaining their colors and opacity while their aspect ratio changes.
 Size, compactness, visual balance and the original left/right
 and top/bottom relationships determine the arrangement. There are no equal-sized cells.
 
@@ -75,7 +78,7 @@ The outline follows the same circular corners at a constant 4 DIP gap and tracks
 the Windows accent color.
 Minimized windows remain selectable using DWM's retained surface at full source
 opacity, in smaller tiles with attached application titles and icons. They expand
-from below the display; selecting one restores its previous normal/maximized state.
+from their taskbar buttons; selecting one restores its previous normal/maximized state.
 The minimize button beside close moves a supported window to the bottom row while
 keeping overview open. Opening or canceling never restores minimized windows.
 If no retained surface is available, one small shared placeholder supplies a card.
@@ -91,12 +94,15 @@ Animated click targets follow the same front-to-back order as the previews.
 An opaque wallpaper background covers the original windows during the overview.
 The wallpaper is beneath all window previews, with the selection outline behind
 its preview and titles above it. This is a wallpaper-backed fullscreen overview.
-Overlays cover only monitor work areas, leaving the actual
-taskbar visible and interactive. Original windows are not moved, resized, hidden
+Overlays cover entire monitors; a shared taskbar surface folds away on entry and
+returns on exit. Original windows are not moved, resized, hidden
 or made transparent. Return animation follows the actual native Z order after
 activating the selected window. The last valid preview stays attached until all
 overlays have been hidden and DWM has presented the handoff. Overlay windows have
 native show/hide transitions disabled; DirectComposition owns the animation.
+Native exterior window shadows fade in during the last 35% of exit. Validated
+source geometry and equal delayed animations are reused; queued group-close
+notifications are removed in one batch before reflowing affected monitors.
 
 Requires Windows 11 and the private DWM shared-visual entry points (147,162).
 They are checked at runtime; API failures abort the overview without changing
@@ -160,6 +166,7 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <utility>
 #include <array>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifndef SCATTER_STANDALONE
@@ -390,7 +397,7 @@ constexpr wchar_t kController[]=L"WindowScatter.Controller.v2";
 constexpr wchar_t kOverlay[]=L"WindowScatter.Overview.v2";
 constexpr UINT kToggle=WM_APP+1,kSettings=WM_APP+2,kDismiss=WM_APP+3,kNativeTaskView=WM_APP+5,kWarmup=WM_APP+6,kSyncOrder=WM_APP+7,kReleaseInactive=WM_APP+8,kShellTaskView=WM_APP+10,kAccentChanged=WM_APP+11,kWindowGone=WM_APP+12,kNativeConsumed=WM_APP+13,kShow=WM_APP+14;
 constexpr UINT kGestureBegin=WM_APP+15,kGestureUpdate=WM_APP+16,kGestureEnd=WM_APP+17,kGestureCancel=WM_APP+18;
-constexpr UINT kWindowStateChanged=WM_APP+19,kTaskbarOrder=WM_APP+20,kSceneChanged=WM_APP+21;
+constexpr UINT kWindowStateChanged=WM_APP+19,kTaskbarOrder=WM_APP+20,kSceneChanged=WM_APP+21,kTitleChanged=WM_APP+22;
 constexpr ULONG_PTR kInputMarker=0x57534354;
 constexpr wchar_t kShellReadyProperty[]=L"WindowScatter.ShellReady.v4";
 constexpr wchar_t kNativeBypassProperty[]=L"WindowScatter.NativeTaskView.v4";
@@ -964,7 +971,7 @@ static std::wstring WindowGroupKey(HWND window){
         CloseHandle(process);}
     return key.empty()?L"pid:"+std::to_wstring(pid):key;
 }
-struct TaskbarEntry{HWND window;HMONITOR monitor;std::wstring group;double x,y;};
+struct TaskbarEntry{HWND window;HMONITOR monitor;std::wstring group;double x,y,w=0,h=0;};
 // UI Automation can take a shell round trip. Keep all of it on an event-driven
 // worker: the renderer only copies a small completed snapshot under a mutex.
 class TaskbarOrder {
@@ -994,7 +1001,7 @@ class TaskbarOrder {
                         if(FAILED(buttons->GetElement(n,&button)))continue;
                         button->get_CachedAutomationId(&id);button->get_CachedBoundingRectangle(&bounds);
                         if(id&&wcsncmp(id,L"Window: ",8)==0){HWND source=reinterpret_cast<HWND>(static_cast<UINT_PTR>(wcstoull(id+8,nullptr,0)));
-                            if(IsWindow(source))result.push_back({source,monitor,WindowGroupKey(source),double(bounds.left),double(bounds.top)});}
+                            if(IsWindow(source))result.push_back({source,monitor,WindowGroupKey(source),double(bounds.left),double(bounds.top),double(bounds.right-bounds.left),double(bounds.bottom-bounds.top)});}
                         SysFreeString(id);
                     }
                 }
@@ -1073,11 +1080,33 @@ struct Item {
     std::wstring groupKey;int taskbarRank=INT_MAX;
     bool minimized=false,canMinimize=false,iconQueried=false;
     ComPtr<IWICBitmap> iconBitmap;
-    Box original,target,minimizedOrigin;
+    Box original,target,minimizedOrigin,taskbarButton;
     Box layoutAnchor;bool anchorMinimized=false;LayoutSlot anchorSlot,layoutSlot;
     Box motionFrom,motionTo;
     float radiusFrom=0,radiusTo=0;
     double labelFrom=0,labelTo=0,labelSeconds=0;
+    double shadowFrom=0,shadowTo=0,shadowDelay=0,shadowSeconds=0;
+    struct MotionCapture {
+        Box from,to;float radiusFrom=0,radiusTo=0;
+        double labelFrom=0,labelTo=0,labelSeconds=0;
+        double shadowFrom=0,shadowTo=0,shadowDelay=0,shadowSeconds=0;
+        bool active=false;
+    } captured;
+    struct NativeShadow {
+        NativeShadow()=default;
+        NativeShadow(const NativeShadow&)=delete;
+        NativeShadow& operator=(const NativeShadow&)=delete;
+        NativeShadow(NativeShadow&&) noexcept=default;
+        NativeShadow& operator=(NativeShadow&& other) noexcept{
+            if(this!=&other){std::destroy_at(this);std::construct_at(this,std::move(other));}return *this;
+        }
+        ~NativeShadow(){if(plane){plane->SetTransformParent(nullptr);root->SetTransformParent(nullptr);}}
+        ComPtr<IDCompositionVisual2> root,plane;
+        ComPtr<IDCompositionScaleTransform> scale;
+        ComPtr<IDCompositionEffectGroup> opacity;
+        RECT sample{};SIZE pixels{};
+        bool attached=false;
+    } shadow;
     SIZE pixels{};
     RECT restoredSample{};
     bool restoredSampleValid=false;
@@ -1102,8 +1131,11 @@ struct View {
     std::vector<HWND> visualOrder;
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual2> root,windows,desktop;
+    ComPtr<IDCompositionRectangleClip> shadowClip;
     ComPtr<IDCompositionSurface> wallpaperSurface;
     ComPtr<IDCompositionSurface> buttonSurfaces[2][3];
+    struct Taskbar {HWND source=nullptr;HTHUMBNAIL thumbnail=nullptr;Box shown,hidden,from,to,capturedFrom,capturedTo;double delay=0,capturedDelay=0;
+        ComPtr<IDCompositionVisual2> surface,position;} taskbar;
 };
 struct DesktopCache {
     HMONITOR monitor=nullptr;RECT bounds{},display{};std::wstring path;
@@ -1139,11 +1171,15 @@ public:
     Settings settings;Phase phase=Phase::Hidden;
     HWND previous=nullptr,chosen=nullptr,selectedSource=nullptr,pressedButtonSource=nullptr,restoreSource=nullptr;
     WindowButton pressedButton=WindowButton::None;
+    struct LeftPress {HWND view=nullptr,source=nullptr;DWORD process=0;} leftPress;
+    struct MiddlePress {HWND source=nullptr;DWORD process=0;bool group=false;} middlePress;
     POINT lastPointer{};
     bool keyboardSelection=false;
     UINT gestureToken=0;
     double gestureOriginX=0,gestureOriginY=0,gestureWidth=1,gestureHeight=1;
-    ULONGLONG gestureStarted=0;
+    ULONGLONG gestureStarted=0,gestureNavigationStarted=0,gestureStepAt=0;
+    static constexpr double kGestureStep=.085;
+    static constexpr ULONGLONG kGestureCommitTime=220;
     bool gestureNavigating=false,gestureReady=false,gestureOpenedAlready=false;
     double gestureBaseX=0,gestureBaseY=0,gestureLastX=0,gestureLastY=0,gestureMinY=0,gestureReadyX=0,gestureReadyY=0;
     struct GestureMessage {UINT message;WPARAM token;LPARAM data;};
@@ -1153,7 +1189,8 @@ public:
     UINT deferredCommand=0;
     std::vector<HWND> deferredRemovals;
     std::vector<HWND> deferredSceneChanges;
-    bool sceneNeedsLayout=false;
+    std::vector<HWND> deferredTitleChanges;
+    bool sceneNeedsLayout=false,sceneAddedWindows=false;
 #ifdef SCATTER_TEST
     unsigned layoutPasses=0;
 #endif
@@ -1163,18 +1200,28 @@ public:
             if(std::exchange(a.deferredWindowState,false))PostMessage(a.controller,kWindowStateChanged,0,0);
             if(std::exchange(a.deferredTaskbar,false))PostMessage(a.controller,kTaskbarOrder,0,0);
             for(HWND source:a.deferredSceneChanges)PostMessage(a.controller,kSceneChanged,reinterpret_cast<WPARAM>(source),0);a.deferredSceneChanges.clear();
+            for(HWND source:a.deferredTitleChanges)PostMessage(a.controller,kTitleChanged,reinterpret_cast<WPARAM>(source),0);a.deferredTitleChanges.clear();
             for(HWND source:a.deferredRemovals)PostMessage(a.controller,kWindowGone,reinterpret_cast<WPARAM>(source),0);a.deferredRemovals.clear();
             for(auto event:a.deferredGestures)PostMessage(a.controller,event.message,event.token,event.data);a.deferredGestures.clear();}}
     };
     LARGE_INTEGER frequency{};
     double start=0,seconds=0,from=0,to=1,progress=0;
+    double captureStart=0,captureSeconds=0,captureFrom=0,captureTo=1,captureProgress=0;
+    bool captureActive=false,clockBoosted=false;
+    using BoostClock=HRESULT(WINAPI*)(BOOL);
+    BoostClock boostClock=nullptr;bool clockChecked=false;
     LONGLONG animationStart=0;
     struct AnimationEntry {double a,b,duration;ComPtr<IDCompositionAnimation> animation;};
     std::vector<AnimationEntry> animations;
-    std::map<std::array<double,3>,size_t> animationIndex;
+    std::map<std::array<double,4>,size_t> animationIndex;
     double frameSeconds=1./60;
 
     double Now()const{LARGE_INTEGER t;QueryPerformanceCounter(&t);return double(t.QuadPart)/frequency.QuadPart;}
+    void AnimationClock(bool active){
+        if(!clockChecked){clockChecked=true;boostClock=reinterpret_cast<BoostClock>(GetProcAddress(GetModuleHandle(L"dcomp.dll"),"DCompositionBoostCompositorClock"));}
+        if(active==clockBoosted||!boostClock)return;
+        if(SUCCEEDED(boostClock(active)))clockBoosted=active;
+    }
     void LoadSettings(){settings={g_winTab.load(),std::clamp(g_duration.load(),0,900),MemoryMode(std::clamp(g_memoryMode.load(),0,2))};}
     bool LowMemory()const{
         BOOL low=FALSE;if(lowMemoryEvent&&QueryMemoryResourceNotification(lowMemoryEvent,&low))return low!=FALSE;
@@ -1240,6 +1287,7 @@ public:
         bool stateEvent=event==EVENT_SYSTEM_MINIMIZESTART||event==EVENT_SYSTEM_MINIMIZEEND;
         if(!stateEvent&&(object!=OBJID_WINDOW||child!=0))return;
         for(auto&v:a->views)for(auto&i:v->items)if(i.source==hwnd){
+            if(event==EVENT_OBJECT_NAMECHANGE){PostMessage(a->controller,kTitleChanged,reinterpret_cast<WPARAM>(hwnd),0);return;}
             PostMessage(a->controller,stateEvent||i.minimized?kWindowStateChanged:kSceneChanged,stateEvent||i.minimized?0:reinterpret_cast<WPARAM>(hwnd),0);return;
         }
     }
@@ -1358,7 +1406,7 @@ public:
         return true;
     }
     static BOOL CALLBACK WarmMonitor(HMONITOR monitor,HDC,LPRECT,LPARAM data){
-        auto&a=*reinterpret_cast<App*>(data);MONITORINFO mi{sizeof(mi)};if(GetMonitorInfo(monitor,&mi)){View v;v.monitor=monitor;v.bounds=mi.rcWork;a.PrepareDesktop(v);}return TRUE;
+        auto&a=*reinterpret_cast<App*>(data);MONITORINFO mi{sizeof(mi)};if(GetMonitorInfo(monitor,&mi)){View v;v.monitor=monitor;v.bounds=mi.rcMonitor;a.PrepareDesktop(v);}return TRUE;
     }
     void Warmup(){
         if(phase!=Phase::Hidden||building||ShouldReleaseGraphics())return;BuildGuard guard(*this);
@@ -1375,6 +1423,48 @@ public:
         if(SUCCEEDED(hr))hr=v.root->AddVisual(v.desktop.Get(),FALSE,v.windows.Get());
         if(FAILED(hr)){Log(L"Opaque desktop",hr);return false;}
         return true;
+    }
+    struct TaskbarSearch {HMONITOR monitor;HWND source;};
+    static BOOL CALLBACK TaskbarWindow(HWND window,LPARAM data){
+        auto&s=*reinterpret_cast<TaskbarSearch*>(data);wchar_t name[64]{};GetClassName(window,name,64);
+        if((!wcscmp(name,L"Shell_TrayWnd")||!wcscmp(name,L"Shell_SecondaryTrayWnd"))&&IsWindowVisible(window)&&MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST)==s.monitor){s.source=window;return FALSE;}return TRUE;
+    }
+    static int TaskbarEdge(const View&v){
+        const auto&b=v.taskbar.shown;
+        return b.w>=b.h?(b.cy()<(v.bounds.bottom-v.bounds.top)*.5?0:1):(b.cx()<(v.bounds.right-v.bounds.left)*.5?2:3);
+    }
+    static double TaskbarShadowEdge(const View&v,const Box&b){
+        switch(TaskbarEdge(v)){case 0:return b.bottom();case 1:return b.y;case 2:return b.right();default:return b.x;}
+    }
+    template<class Value> static void SetTaskbarShadowEdge(View&v,Value value){
+        if(!v.shadowClip)return;
+        switch(TaskbarEdge(v)){case 0:v.shadowClip->SetTop(value);break;case 1:v.shadowClip->SetBottom(value);break;case 2:v.shadowClip->SetLeft(value);break;default:v.shadowClip->SetRight(value);break;}
+    }
+    bool CreateTaskbar(View&v,HWND fixture=nullptr){
+        auto&bar=v.taskbar;HWND source=fixture;
+        if(!source){
+            TaskbarSearch search{v.monitor,nullptr};EnumWindows(TaskbarWindow,reinterpret_cast<LPARAM>(&search));source=search.source;
+        }
+        if(!source)return true;
+        RECT bounds{},visible{};if(!GetWindowRect(source,&bounds)||!IntersectRect(&visible,&bounds,&v.bounds))return true;
+        // An already auto-hidden taskbar has only a thin reveal strip.
+        if(visible.right-visible.left<=3*v.dpi||visible.bottom-visible.top<=3*v.dpi)return true;
+        SIZE pixels{};if(FAILED(api.querySize(source,FALSE,&pixels))||pixels.cx<=0||pixels.cy<=0)return false;
+        DWM_THUMBNAIL_PROPERTIES p{};p.dwFlags=DWM_TNP_RECTDESTINATION|DWM_TNP_VISIBLE|DWM_TNP_OPACITY|DWM_TNP_SOURCECLIENTAREAONLY|0x04000000;
+        p.fVisible=TRUE;p.opacity=255;p.fSourceClientAreaOnly=FALSE;p.rcDestination={0,0,bounds.right-bounds.left,bounds.bottom-bounds.top};
+        HRESULT hr=api.createThumb(v.hwnd,source,2,&p,device.Get(),reinterpret_cast<void**>(bar.surface.GetAddressOf()),&bar.thumbnail);
+        if(SUCCEEDED(hr))hr=device->CreateVisual(&bar.position);
+        if(SUCCEEDED(hr))hr=bar.position->AddVisual(bar.surface.Get(),TRUE,nullptr);
+        if(SUCCEEDED(hr))hr=v.root->AddVisual(bar.position.Get(),TRUE,v.windows.Get());
+        if(FAILED(hr)){Log(L"Taskbar transition surface",hr);bar.position.Reset();bar.surface.Reset();return false;}
+        bar.source=source;bar.shown={double(bounds.left-v.bounds.left),double(bounds.top-v.bounds.top),double(bounds.right-bounds.left),double(bounds.bottom-bounds.top)};bar.hidden=bar.shown;
+        double width=v.bounds.right-v.bounds.left,height=v.bounds.bottom-v.bounds.top;
+        if(bar.shown.w>=bar.shown.h){bar.hidden.y=bar.shown.cy()<height*.5?-bar.shown.h:height;}
+        else {bar.hidden.x=bar.shown.cx()<width*.5?-bar.shown.w:width;}
+        bar.from=bar.to=bar.shown;
+        hr=device->CreateRectangleClip(&v.shadowClip);if(FAILED(hr))return false;
+        v.shadowClip->SetLeft(0.f);v.shadowClip->SetTop(0.f);v.shadowClip->SetRight(float(width));v.shadowClip->SetBottom(float(height));
+        SetTaskbarShadowEdge(v,float(TaskbarShadowEdge(v,bar.shown)));return true;
     }
     void InitializeAccent(){
         constexpr wchar_t name[]=L"Windows.UI.ViewManagement.UISettings";
@@ -1518,15 +1608,7 @@ public:
         if(SUCCEEDED(hr))imageFactory->CreateBitmapFromSource(converter.Get(),WICBitmapCacheOnLoad,&i.iconBitmap);
     }
     bool CreateTitle(View&v,Item&i){
-        if(i.minimized){
-            // Slide the whole tile from below its display, with only a subtle
-            // uniform scale change. Keep the off-screen pose at a useful size.
-            constexpr double scale=.94;
-            double y=v.bounds.bottom-v.bounds.top;
-            MONITORINFO monitor{sizeof(monitor)};
-            if(GetMonitorInfo(v.monitor,&monitor))y=std::max(y,double(monitor.rcMonitor.bottom-v.bounds.top));
-            i.minimizedOrigin={i.target.cx()-i.target.w*scale*.5,y+12*v.dpi,i.target.w*scale,i.target.h*scale};
-        }
+        if(i.minimized)i.minimizedOrigin=TaskbarOrigin(v,i);
         // Only the selected preview needs a border surface. Avoid allocating
         // and rasterizing one full-size transparent bitmap for every window.
         i.borderWidth=float(i.target.w)+2*i.Outset();i.borderHeight=float(i.target.h)+2*i.Outset();
@@ -1573,6 +1655,27 @@ public:
         if(SUCCEEDED(hr)){i.label->SetOffsetY(float(i.target.h-v.dpi));i.labelEffect->SetOpacity(0.f);
             i.titleText=title;i.titleWidth=i.target.w;i.titleRadius=OverviewRadius(v,i.target);i.titleDpi=v.dpi;}
         return SUCCEEDED(hr);
+    }
+    bool RefreshTitle(HWND source){
+        if((phase!=Phase::Opening&&phase!=Phase::Settled)||!IsWindow(source))return false;
+        for(auto&v:views)for(auto&i:v->items)if(i.source==source){
+            auto previousLabel=i.label;if(!CreateTitle(*v,i)){End(false);return false;}
+            if(previousLabel.Get()==i.label.Get())return false;
+            // Join the current compositor timeline without relaying out or
+            // restarting the scene when an application changes its title.
+            auto property=[&](double a,double b,double duration,auto setter){
+                if(phase==Phase::Settled||duration<=0||std::abs(a-b)<.00001){setter(float(b));return;}
+                auto animation=MakeAnimation(a,b,duration);if(!animation){setter(float(b));return;}
+                LARGE_INTEGER begin{};begin.QuadPart=animationStart;animation->SetAbsoluteBeginTime(begin);setter(animation.Get());
+            };
+            property((i.motionFrom.w-i.target.w)*.5,(i.motionTo.w-i.target.w)*.5,seconds,[&](auto value){i.label->SetOffsetX(value);});
+            property(i.motionFrom.h-v->dpi,i.motionTo.h-v->dpi,seconds,[&](auto value){i.label->SetOffsetY(value);});
+            property(i.labelFrom,i.labelTo,i.labelSeconds,[&](auto value){i.labelEffect->SetOpacity(value);});
+            if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();
+            if(i.borderAttached){if(!CreateOutline(*v,i)){End(false);return false;}SyncDecorations(*v,i);}
+            return true;
+        }
+        return false;
     }
     static float CloseSize(const View&v){return 28*v.dpi;}
     static float CloseInset(const View&v){return 6*v.dpi;}
@@ -1624,11 +1727,40 @@ public:
         }
         SetCursor(LoadCursor(nullptr,hand?IDC_HAND:IDC_ARROW));if(changed)device->Commit();
     }
-    static bool RequestClose(const Item&i){
-        DWORD process=0;GetWindowThreadProcessId(i.source,&process);
-        if(!IsWindow(i.source)||(i.sourceProcess&&process!=i.sourceProcess))return false;
+    static bool RequestClose(HWND source,DWORD expectedProcess){
+        DWORD process=0;GetWindowThreadProcessId(source,&process);
+        if(!IsWindow(source)||(expectedProcess&&process!=expectedProcess))return false;
         // Let the application handle save prompts and cancellation. Never kill it.
-        return PostMessage(i.source,WM_SYSCOMMAND,SC_CLOSE,0)!=FALSE;
+        return PostMessage(source,WM_SYSCOMMAND,SC_CLOSE,0)!=FALSE;
+    }
+    static bool RequestClose(const Item&i){return RequestClose(i.source,i.sourceProcess);}
+    static bool IsTaskWindow(HWND hwnd){
+        if(!IsWindowVisible(hwnd))return false;
+        DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);if(pid==GetCurrentProcessId())return false;
+        LONG_PTR ex=GetWindowLongPtr(hwnd,GWL_EXSTYLE);if(ex&(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE))return false;
+        if(!(ex&WS_EX_APPWINDOW)){
+            HWND walk=GetAncestor(hwnd,GA_ROOTOWNER);
+            for(int j=0;j<16;++j){HWND next=GetLastActivePopup(walk);if(walk==next)break;walk=next;if(IsWindowVisible(walk))break;}
+            if(walk!=hwnd)return false;
+        }
+        wchar_t title[2];if(!GetWindowText(hwnd,title,2))return false;
+        wchar_t cls[256];GetClassName(hwnd,cls,256);
+        return wcscmp(cls,L"Progman")&&wcscmp(cls,L"WorkerW")&&wcscmp(cls,L"Shell_TrayWnd")&&wcscmp(cls,L"Shell_SecondaryTrayWnd");
+    }
+    struct CloseGroup {std::wstring key;std::vector<std::pair<HWND,DWORD>> windows;};
+    static BOOL CALLBACK CollectCloseGroup(HWND source,LPARAM parameter){
+        auto&group=*reinterpret_cast<CloseGroup*>(parameter);
+        if(!IsTaskWindow(source)||WindowGroupKey(source)!=group.key)return TRUE;
+        DWORD process=0;GetWindowThreadProcessId(source,&process);if(process)group.windows.emplace_back(source,process);return TRUE;
+    }
+    static size_t RequestCloseGroup(HWND source,DWORD expectedProcess){
+        DWORD process=0;GetWindowThreadProcessId(source,&process);
+        if(!process||!IsWindow(source)||(expectedProcess&&process!=expectedProcess))return 0;
+        // Match taskbar application identity, not PID: separate instances and
+        // minimized windows can belong to one group. Do not limit the snapshot
+        // to the current monitor or virtual desktop's overview previews.
+        CloseGroup group{WindowGroupKey(source),{}};EnumWindows(CollectCloseGroup,reinterpret_cast<LPARAM>(&group));
+        size_t posted=0;for(const auto&[window,pid]:group.windows)posted+=RequestClose(window,pid);return posted;
     }
     static bool RequestMinimize(const Item&i){
         DWORD process=0;GetWindowThreadProcessId(i.source,&process);
@@ -1638,18 +1770,27 @@ public:
         return PostMessage(i.source,WM_SYSCOMMAND,SC_MINIMIZE,0)!=FALSE;
     }
     void RemoveWindowFromOverview(HWND source){
-        if(building){if(std::find(deferredRemovals.begin(),deferredRemovals.end(),source)==deferredRemovals.end())deferredRemovals.push_back(source);return;}
+        RemoveWindowsFromOverview({source});
+    }
+    void RemoveWindowsFromOverview(const std::vector<HWND>&sources){
+        if(building){for(HWND source:sources)if(std::find(deferredRemovals.begin(),deferredRemovals.end(),source)==deferredRemovals.end())deferredRemovals.push_back(source);return;}
         if(phase==Phase::Hidden)return;
         if(phase==Phase::Closing){End(false);return;}
-        bool found=false;for(auto&v:views)for(auto&i:v->items)if(i.source==source)found=true;
+        std::unordered_set<HWND> removed(sources.begin(),sources.end());
+        bool found=false;for(auto&v:views)for(auto&i:v->items)if(removed.contains(i.source))found=true;
         if(!found)return;
-        HWND candidate=keyboardSelection?selectedSource:nullptr;
-        CaptureMotion();ClearSelection();if(pressedButtonSource==source){pressedButtonSource=nullptr;pressedButton=WindowButton::None;}
+#ifdef SCATTER_TEST
+        ++layoutPasses;
+#endif
+        HWND candidate=keyboardSelection||gestureToken?selectedSource:nullptr;
+        CaptureMotion();ClearSelection();if(removed.contains(pressedButtonSource)){pressedButtonSource=nullptr;pressedButton=WindowButton::None;}
+        if(removed.contains(middlePress.source))middlePress={};
+        if(removed.contains(leftPress.source))leftPress={};
         BuildGuard guard(*this);size_t remaining=0;
         for(auto&v:views){
-            for(auto&i:v->items)if(i.source==source)v->windows->RemoveVisual(i.position.Get());
-            std::erase_if(v->items,[&](const Item&i){return i.source==source;});remaining+=v->items.size();
-            if(v->items.empty())continue;
+            for(auto&i:v->items)if(removed.contains(i.source))v->windows->RemoveVisual(i.position.Get());
+            size_t erased=std::erase_if(v->items,[&](const Item&i){return removed.contains(i.source);});remaining+=v->items.size();
+            if(!erased||v->items.empty())continue;
             AnchorCurrentLayout(*v);
             auto layout=Arrange(*v);
             if(layout.size()!=v->items.size()){End(false);return;}
@@ -1688,7 +1829,7 @@ public:
     }
     static BOOL CALLBACK AddMonitor(HMONITOR monitor,HDC,LPRECT,LPARAM param){
         auto&a=*reinterpret_cast<App*>(param);MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfo(monitor,&mi))return TRUE;
-        auto v=std::make_unique<View>();v->monitor=monitor;v->bounds=mi.rcWork;a.views.push_back(std::move(v));return TRUE;
+        auto v=std::make_unique<View>();v->monitor=monitor;v->bounds=mi.rcMonitor;a.views.push_back(std::move(v));return TRUE;
     }
     static bool Bounds(HWND hwnd,RECT&r){
         if(!IsIconic(hwnd))return SUCCEEDED(DwmGetWindowAttribute(hwnd,DWMWA_EXTENDED_FRAME_BOUNDS,&r,sizeof(r)))||GetWindowRect(hwnd,&r);
@@ -1702,26 +1843,56 @@ public:
             OffsetRect(&r,monitor.rcWork.left-monitor.rcMonitor.left,monitor.rcWork.top-monitor.rcMonitor.top);
         return r.right>r.left&&r.bottom>r.top;
     }
-    static void AssignTaskbarOrder(View&v,const std::vector<TaskbarEntry>&order){
-        for(auto&i:v.items){i.taskbarRank=INT_MAX;
-            // Prefer the taskbar on this monitor, then the main taskbar if it
-            // shows all monitors. Group rank keeps sibling windows together.
-            for(size_t n=0;n<order.size();++n)if(order[n].group==i.groupKey)
+    static bool AssignTaskbarOrder(View&v,const std::vector<TaskbarEntry>&order){
+        bool changed=false;
+        for(auto&i:v.items){int previousRank=i.taskbarRank;i.taskbarRank=INT_MAX;
+            // Uncombined sibling buttons have their own HWND and order. Group
+            // rank is a fallback only when no exact window button is present.
+            for(size_t n=0;n<order.size();++n)if(order[n].window==i.source)
                 i.taskbarRank=std::min(i.taskbarRank,int(n)+(order[n].monitor==v.monitor?0:10000));
+            if(i.taskbarRank==INT_MAX)for(size_t n=0;n<order.size();++n)if(order[n].group==i.groupKey)
+                i.taskbarRank=std::min(i.taskbarRank,int(n)+(order[n].monitor==v.monitor?0:10000));
+            const TaskbarEntry*best=nullptr;int rank=INT_MAX;
+            for(const auto&entry:order){
+                if(entry.w<=0||entry.h<=0||(entry.window!=i.source&&entry.group!=i.groupKey))continue;
+                int score=(entry.monitor==v.monitor?0:2)+(entry.window==i.source?0:1);
+                if(score<rank){rank=score;best=&entry;}
+            }
+            if(best)i.taskbarButton={best->x-v.bounds.left,best->y-v.bounds.top,best->w,best->h};
+            if(i.minimized){changed|=previousRank!=i.taskbarRank;i.minimizedOrigin=TaskbarOrigin(v,i);}
         }
+        return changed;
+    }
+    static Box TaskbarOrigin(const View&v,const Item&i){
+        Box button=i.taskbarButton;
+        if(button.w<=0||button.h<=0){
+            // No synchronous UIA query on the opening path. A cold/missing
+            // snapshot falls back to this monitor's taskbar edge.
+            MONITORINFO mi{sizeof(mi)};double width=v.bounds.right-v.bounds.left,height=v.bounds.bottom-v.bounds.top;
+            button={std::clamp(i.target.cx(),24.*v.dpi,std::max(24.*v.dpi,width-24*v.dpi))-24*v.dpi,height-48*v.dpi,48*v.dpi,48*v.dpi};
+            if(GetMonitorInfo(v.monitor,&mi)){
+                if(mi.rcWork.bottom<mi.rcMonitor.bottom)button.y=mi.rcWork.bottom-v.bounds.top;
+                else if(mi.rcWork.top>mi.rcMonitor.top)button.y=0;
+                else if(mi.rcWork.left>mi.rcMonitor.left){button.x=0;button.y=std::clamp(i.target.cy(),24.*v.dpi,height-24*v.dpi)-24*v.dpi;}
+                else if(mi.rcWork.right<mi.rcMonitor.right){button.x=mi.rcWork.right-v.bounds.left;button.y=std::clamp(i.target.cy(),24.*v.dpi,height-24*v.dpi)-24*v.dpi;}
+            }
+        }
+        return button;
     }
     void ApplyTaskbarOrder(View&v){AssignTaskbarOrder(v,taskbarOrder.Read());}
     void TaskbarChanged(){
         if(phase!=Phase::Opening&&phase!=Phase::Settled)return;
-        bool changed=false;for(auto&v:views){ApplyTaskbarOrder(*v);auto layout=Arrange(*v);
-            for(size_t n=0;n<layout.size();++n)if(std::abs(layout[n].x-v->items[n].target.x)>.1||std::abs(layout[n].y-v->items[n].target.y)>.1)changed=true;}
+        // Button geometry affects the exit destination, not the overview layout.
+        // Only a changed shelf rank requires solving the layout again.
+        auto order=taskbarOrder.Read();bool changed=false;
+        for(auto&v:views)changed|=AssignTaskbarOrder(*v,order);
         if(changed)Relayout();
     }
     void Relayout(){
 #ifdef SCATTER_TEST
         ++layoutPasses;
 #endif
-        HWND candidate=keyboardSelection?selectedSource:nullptr;
+        HWND candidate=keyboardSelection||gestureToken?selectedSource:nullptr;
         progress=CurrentProgress();CaptureMotion();ClearSelection();BuildGuard guard(*this);
         for(auto&v:views){AnchorCurrentLayout(*v);auto layout=Arrange(*v);if(layout.size()!=v->items.size()){End(false);return;}
             for(size_t n=0;n<layout.size();++n){auto&i=v->items[n];i.target=layout[n];if(i.borderFill)i.borderFill->SetContent(nullptr);i.borderSurface.Reset();if(!CreateTitle(*v,i)){End(false);return;}}}
@@ -1744,15 +1915,26 @@ public:
         BuildGuard guard(*this);std::vector<size_t> counts;for(auto&v:views)counts.push_back(v->items.size());AddWindow(source,reinterpret_cast<LPARAM>(this));
         bool added=false;
         for(size_t n=0;n<views.size();++n){auto&v=*views[n];if(v.items.size()==counts[n])continue;
-            if(!v.hwnd){if(!CreateView(v)||!CreateDesktop(v)){End(false);return;}}
+            if(!v.hwnd){if(!CreateView(v)||!CreateDesktop(v)||!CreateTaskbar(v)){End(false);return;}}
             auto&i=v.items.back();if(!CreateItem(v,i)){v.items.pop_back();continue;}
-            ApplyTaskbarOrder(v);auto layout=Arrange(v);if(layout.size()!=v.items.size()){End(false);return;}
-            i.target=layout.back();if(!CreateTitle(v,i)){End(false);return;}
+            ApplyTaskbarOrder(v);i.target=i.original;
+            if(i.minimized)i.minimizedOrigin=TaskbarOrigin(v,i);
             i.motionFrom=HiddenPose(i);i.radiusFrom=i.radiusTo=HiddenRadius(v,i);i.labelFrom=i.labelTo=0;i.labelSeconds=0;
             // CaptureMotion reads motion endpoints for the newly attached item.
             i.motionTo=i.motionFrom;i.target=i.motionFrom;added=true;
         }
-        if(added){taskbarOrder.Refresh();Relayout();if(phase!=Phase::Hidden){device->WaitForCommitCompletion();for(auto&v:views)if(v->hwnd&&!IsWindowVisible(v->hwnd))ShowWindow(v->hwnd,SW_SHOWNOACTIVATE);}}
+        if(added){sceneNeedsLayout=sceneAddedWindows=true;if(!deferLayout)FinishSceneChanges();}
+    }
+    void FinishSceneChanges(){
+        bool added=std::exchange(sceneAddedWindows,false);
+        if(!std::exchange(sceneNeedsLayout,false)||(phase!=Phase::Opening&&phase!=Phase::Settled))return;
+        // Bind the complete batch first. Titles, layout and animation are built
+        // once, so application startup cannot trigger one full reflow per HWND.
+        Relayout();if(phase==Phase::Hidden)return;
+        if(added){taskbarOrder.Refresh();
+            bool show=false;for(auto&v:views)show|=v->hwnd&&!IsWindowVisible(v->hwnd);
+            if(show){device->WaitForCommitCompletion();for(auto&v:views)if(v->hwnd&&!IsWindowVisible(v->hwnd))ShowWindow(v->hwnd,SW_SHOWNOACTIVATE);}
+        }
     }
     void RememberLayout(){
         for(auto&v:views)for(auto&i:v->items){i.layoutAnchor=i.target;i.anchorMinimized=i.minimized;i.anchorSlot=i.layoutSlot;}
@@ -1833,19 +2015,88 @@ public:
         if(valid&&knownSize)return {frame.left-outer.left,frame.top-outer.top,frame.right-outer.left,frame.bottom-outer.top};
         return {0,0,source.cx,source.cy};
     }
-    static BOOL CALLBACK AddWindow(HWND hwnd,LPARAM param){
-        auto&a=*reinterpret_cast<App*>(param);if(!IsWindowVisible(hwnd))return TRUE;
-        DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);if(pid==GetCurrentProcessId())return TRUE;
-        LONG_PTR ex=GetWindowLongPtr(hwnd,GWL_EXSTYLE);if(ex&(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE))return TRUE;
-        if(!(ex&WS_EX_APPWINDOW)){
-            HWND walk=GetAncestor(hwnd,GA_ROOTOWNER);
-            for(int j=0;j<16;++j){HWND next=GetLastActivePopup(walk);if(walk==next)break;walk=next;if(IsWindowVisible(walk))break;}
-            if(walk!=hwnd)return TRUE;
+    bool EnsureExitShadow(View&v,Item&i){
+        if(!IsWindow(i.source)||IsIconic(i.source))return false;
+        if(IsZoomed(i.source)){
+            if(i.shadow.root)i.position->RemoveVisual(i.shadow.root.Get());
+            i.shadow={};i.shadowFrom=i.shadowTo=0;return false;
         }
+        RECT outer{},frame{},sample{};
+        if(!GetWindowRect(i.source,&outer)||!Bounds(i.source,frame))return false;
+        RECT relative{frame.left-outer.left,frame.top-outer.top,frame.right-outer.left,frame.bottom-outer.top};
+        // The body already queried and validated this exact source rectangle.
+        // Reuse it while its geometry matches; a DWM size query is a costly
+        // synchronous round trip even when the shadow surfaces already exist.
+        if(i.restoredSampleValid&&EqualRect(&relative,&i.restoredSample))sample=i.restoredSample;
+        else if(i.shadow.root&&EqualRect(&relative,&i.shadow.sample))return AttachShadow(i);
+        else{SIZE size{};if(FAILED(api.querySize(i.source,FALSE,&size)))return false;sample=SourceRect(outer,frame,size);}
+        LONG w=sample.right-sample.left,h=sample.bottom-sample.top,pad=LONG(std::ceil(64*v.dpi));
+        if(w<=0||h<=0)return false;
+        if(i.shadow.root&&EqualRect(&sample,&i.shadow.sample))return AttachShadow(i);
+        // Sample the real DWM shadow outside the visible frame. Four disjoint
+        // strips leave the body empty, so translucent windows are not blended
+        // twice. These shared surfaces are created only when exiting.
+        RECT strips[]{
+            {sample.left-pad,sample.top-pad,sample.right+pad,sample.top},
+            {sample.left-pad,sample.bottom,sample.right+pad,sample.bottom+pad},
+            {sample.left-pad,sample.top,sample.left,sample.bottom},
+            {sample.right,sample.top,sample.right+pad,sample.bottom}};
+        Item::NativeShadow next;HRESULT hr=device->CreateVisual(&next.root);
+        if(SUCCEEDED(hr))hr=device->CreateScaleTransform(&next.scale);
+        if(SUCCEEDED(hr))hr=device->CreateEffectGroup(&next.opacity);
+        ComPtr<IDCompositionVisual2> stripeParent=next.root;
+        if(v.shadowClip){
+            // The clip stays in monitor coordinates while the child inherits
+            // the window's animated pose. One clip per monitor follows the
+            // taskbar, including translucent pixels, without per-window curves.
+            if(SUCCEEDED(hr))hr=device->CreateVisual(&next.plane);
+            if(SUCCEEDED(hr))hr=next.root->SetTransformParent(v.root.Get());
+            if(SUCCEEDED(hr))hr=next.root->SetClip(v.shadowClip.Get());
+            if(SUCCEEDED(hr))hr=next.plane->SetTransformParent(i.position.Get());
+            if(SUCCEEDED(hr))hr=next.plane->SetTransform(next.scale.Get());
+            if(SUCCEEDED(hr))hr=next.root->AddVisual(next.plane.Get(),TRUE,nullptr);
+            stripeParent=next.plane;
+        }else if(SUCCEEDED(hr))hr=next.root->SetTransform(next.scale.Get());
+        if(SUCCEEDED(hr))hr=next.root->SetEffect(next.opacity.Get());
+        // These four strips do not overlap. Apply opacity to each strip
+        // directly instead of blending a window-sized intermediate layer
+        // whose center is entirely transparent.
+        if(SUCCEEDED(hr))hr=next.root->SetOpacityMode(DCOMPOSITION_OPACITY_MODE_MULTIPLY);
+        if(SUCCEEDED(hr))hr=next.opacity->SetOpacity(float(i.shadowFrom));
+        for(const RECT&r:strips){
+            if(FAILED(hr))break;
+            DWM_THUMBNAIL_PROPERTIES p{};
+            p.dwFlags=DWM_TNP_RECTSOURCE|DWM_TNP_RECTDESTINATION|DWM_TNP_VISIBLE|DWM_TNP_OPACITY|DWM_TNP_SOURCECLIENTAREAONLY|0x04000000;
+            p.rcSource=r;p.rcDestination={0,0,r.right-r.left,r.bottom-r.top};p.fVisible=TRUE;p.opacity=255;
+            COLORREF key=0;BYTE alpha=255;DWORD flags=0;
+            if(GetLayeredWindowAttributes(i.source,&key,&alpha,&flags)&&(flags&LWA_ALPHA))p.opacity=alpha;
+            ComPtr<IDCompositionVisual2> surface,position;HTHUMBNAIL thumbnail=nullptr;
+            hr=api.createThumb(v.hwnd,i.source,2,&p,device.Get(),reinterpret_cast<void**>(surface.GetAddressOf()),&thumbnail);
+            if(SUCCEEDED(hr))hr=device->CreateVisual(&position);
+            if(SUCCEEDED(hr))hr=position->SetOffsetX(float(r.left-sample.left));
+            if(SUCCEEDED(hr))hr=position->SetOffsetY(float(r.top-sample.top));
+            if(SUCCEEDED(hr))hr=position->AddVisual(surface.Get(),TRUE,nullptr);
+            if(SUCCEEDED(hr))hr=stripeParent->AddVisual(position.Get(),TRUE,nullptr);
+        }
+        if(SUCCEEDED(hr))hr=i.position->AddVisual(next.root.Get(),FALSE,i.content.Get());
+        if(FAILED(hr)){Log(L"Create native exit shadow",hr);return false;}
+        if(i.shadow.root)i.position->RemoveVisual(i.shadow.root.Get());
+        next.sample=sample;next.pixels={w,h};next.attached=true;i.shadow=std::move(next);return true;
+    }
+    bool AttachShadow(Item&i){
+        if(i.shadow.attached)return true;
+        if(FAILED(i.position->AddVisual(i.shadow.root.Get(),FALSE,i.content.Get())))return false;
+        i.shadow.attached=true;return true;
+    }
+    void DetachHiddenShadows(){
+        for(auto&v:views)for(auto&i:v->items)if(i.shadow.attached&&i.shadowTo==0){
+            i.position->RemoveVisual(i.shadow.root.Get());i.shadow.attached=false;
+        }
+    }
+    static BOOL CALLBACK AddWindow(HWND hwnd,LPARAM param){
+        auto&a=*reinterpret_cast<App*>(param);if(!IsTaskWindow(hwnd))return TRUE;
         DWORD cloaked=0;if(SUCCEEDED(DwmGetWindowAttribute(hwnd,DWMWA_CLOAKED,&cloaked,sizeof(cloaked)))&&cloaked)return TRUE;
         if(a.desktops){BOOL current=TRUE;if(SUCCEEDED(a.desktops->IsWindowOnCurrentVirtualDesktop(hwnd,&current))&&!current)return TRUE;}
-        wchar_t title[2];if(!GetWindowText(hwnd,title,2))return TRUE;
-        wchar_t cls[256];GetClassName(hwnd,cls,256);if(!wcscmp(cls,L"Progman")||!wcscmp(cls,L"WorkerW")||!wcscmp(cls,L"Shell_TrayWnd"))return TRUE;
         RECT bounds{};if(!Bounds(hwnd,bounds)||bounds.right-bounds.left<32||bounds.bottom-bounds.top<32)return TRUE;
         HMONITOR mon=MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST);
         for(auto&v:a.views)if(v->monitor==mon){Item i;i.source=hwnd;i.minimized=IsIconic(hwnd)!=FALSE;i.original={double(bounds.left-v->bounds.left),double(bounds.top-v->bounds.top),double(bounds.right-bounds.left),double(bounds.bottom-bounds.top)};v->items.push_back(std::move(i));break;}return TRUE;
@@ -1913,6 +2164,7 @@ public:
             i.original={cx-i.pixels.cx*.5,cy-i.pixels.cy*.5,double(i.pixels.cx),double(i.pixels.cy)};
         }
         p.rcDestination={0,0,i.pixels.cx,i.pixels.cy};
+        if(!i.minimized&&validSize){i.restoredSample=p.rcSource;i.restoredSampleValid=true;}
         hr=validSize?api.createThumb(v.hwnd,i.source,2,&p,device.Get(),reinterpret_cast<void**>(i.surface.GetAddressOf()),&i.thumbnail):E_FAIL;
         if(FAILED(hr)&&i.minimized){i.surface.Reset();i.thumbnail=nullptr;hr=CreateMinimizedPlaceholder(i);}
         if(FAILED(hr)){Log(L"Create shared source",hr);return false;}
@@ -1963,7 +2215,7 @@ public:
         FollowNativeZOrder();
         selectedSource=nullptr;keyboardSelection=false;
         GetCursorPos(&lastPointer);
-        for(auto&v:views)if(v->hwnd&&!CreateDesktop(*v)){building=false;End(false);return false;}
+        for(auto&v:views)if(v->hwnd&&(!CreateDesktop(*v)||!CreateTaskbar(*v))){building=false;End(false);return false;}
         StaticPose(0);
         if(FAILED(device->Commit())){building=false;End(false);return false;}
         device->WaitForCommitCompletion();
@@ -1974,30 +2226,31 @@ public:
         foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT);
         destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         windowStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
-        geometryHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+        geometryHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_NAMECHANGE,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         building=false;Animate(1);return true;
     }
-    template<class Setter> void Property(double a,double b,Setter setter,double duration=-1){
+    template<class Setter> void Property(double a,double b,Setter setter,double duration=-1,double delay=0){
         if(duration<0)duration=seconds;
         if(duration<=0||std::abs(b-a)<.00001){setter(float(b));return;}
-        std::array<double,3> key{a,b,duration};
+        std::array<double,4> key{a,b,duration,delay};
         if(auto found=animationIndex.find(key);found!=animationIndex.end()){setter(animations[found->second].animation.Get());return;}
-        auto animation=MakeAnimation(a,b,duration);if(!animation){setter(float(b));return;}
+        auto animation=MakeAnimation(a,b,duration,delay);if(!animation){setter(float(b));return;}
         setter(animation.Get());animationIndex.emplace(key,animations.size());animations.push_back({a,b,duration,std::move(animation)});
     }
-    ComPtr<IDCompositionAnimation> MakeAnimation(double a,double b,double duration){
+    ComPtr<IDCompositionAnimation> MakeAnimation(double a,double b,double duration,double delay=0){
         ComPtr<IDCompositionAnimation> animation;if(FAILED(device->CreateAnimation(&animation)))return {};
         // Twelve Hermite cubics approximate critically damped motion. All share
         // an absolute QPC start so position, scale and rectangular bounds stay in sync.
         constexpr int parts=12;double dt=duration/parts,delta=b-a;
+        if(delay>0)animation->AddCubic(0,float(a),0,0,0);
         for(int j=0;j<parts;++j){
             double u=double(j)/parts,v=double(j+1)/parts;
             double f0=a+delta*Curve(u),f1=a+delta*Curve(v);
             double m0=delta*CurveDerivative(u)/duration,m1=delta*CurveDerivative(v)/duration;
             double c2=(3*(f1-f0)/dt-2*m0-m1)/dt,c3=(2*(f0-f1)/dt+m0+m1)/(dt*dt);
-            animation->AddCubic(j*dt,float(f0),float(m0),float(c2),float(c3));
+            animation->AddCubic(delay+j*dt,float(f0),float(m0),float(c2),float(c3));
         }
-        animation->End(duration,float(b));return animation;
+        animation->End(delay+duration,float(b));return animation;
     }
     void SyncDecorations(View&v,Item&i){
         Box a=phase==Phase::Settled?i.target:i.motionFrom,b=phase==Phase::Settled?i.target:i.motionTo;
@@ -2012,7 +2265,14 @@ public:
         property((a.h+TitleProtrusion(v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
         property(a.w-ButtonsWidth(v,i)-CloseInset(v),b.w-ButtonsWidth(v,i)-CloseInset(v),[&](auto value){i.buttons->SetOffsetX(value);});
     }
+    Box CurrentTaskbarBox(const View&v,double now)const{
+        const auto&bar=v.taskbar;if(phase==Phase::Hidden)return bar.shown;if(phase==Phase::Settled)return bar.hidden;
+        return Mix(bar.from,bar.to,Curve(seconds<=bar.delay?1:(now-start-bar.delay)/(seconds-bar.delay)));
+    }
+    Box CurrentTaskbarBox(const View&v)const{return CurrentTaskbarBox(v,Now());}
     void StaticPose(double p){
+        for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;bar.from=bar.to=Mix(bar.shown,bar.hidden,p);bar.delay=0;
+            bar.position->SetOffsetX(float(bar.to.x));bar.position->SetOffsetY(float(bar.to.y));SetTaskbarShadowEdge(*v,float(TaskbarShadowEdge(*v,bar.to)));}
         for(auto&v:views)for(auto&i:v->items){
             Box b=Mix(ExitPose(i),i.target,p);i.position->SetOffsetX(float(b.x));i.position->SetOffsetY(float(b.y));
             i.scale->SetScaleX(float(b.w/i.pixels.cx));i.scale->SetScaleY(float(b.h/i.pixels.cy));
@@ -2023,21 +2283,63 @@ public:
             i.labelFrom=i.labelTo=p;i.labelSeconds=0;
             float radius=float(ExitRadius(*v,i)+(OverviewRadius(*v,i.target)-ExitRadius(*v,i))*p);
             SetCorners(i,radius);i.radiusFrom=i.radiusTo=radius;i.motionFrom=i.motionTo=b;
+            i.shadowFrom=i.shadowTo=phase==Phase::Closing&&p==0&&(!i.minimized||i.source==chosen)?1:0;
+            i.shadowDelay=i.shadowSeconds=0;
+            if(i.shadow.root){i.shadow.opacity->SetOpacity(float(i.shadowTo));
+                i.shadow.scale->SetScaleX(float(b.w/i.shadow.pixels.cx));i.shadow.scale->SetScaleY(float(b.h/i.shadow.pixels.cy));}
         }
     }
-    double MotionFraction()const{return Curve(seconds<=0?1:(Now()-start)/seconds);}
-    double CurrentLabelOpacity(const Item&i)const{
-        return i.labelFrom+(i.labelTo-i.labelFrom)*Curve(i.labelSeconds<=0?1:(Now()-start)/i.labelSeconds);
+    double MotionFraction(double now)const{return Curve(seconds<=0?1:(now-start)/seconds);}
+    double MotionFraction()const{return MotionFraction(Now());}
+    double CurrentLabelOpacity(const Item&i,double now)const{
+        return i.labelFrom+(i.labelTo-i.labelFrom)*Curve(i.labelSeconds<=0?1:(now-start)/i.labelSeconds);
     }
-    Box CurrentBox(const Item&i)const{
+    double CurrentLabelOpacity(const Item&i)const{return CurrentLabelOpacity(i,Now());}
+    double CurrentShadowOpacity(const Item&i,double now)const{
+        return i.shadowFrom+(i.shadowTo-i.shadowFrom)*Curve(i.shadowSeconds<=0?1:(now-start-i.shadowDelay)/i.shadowSeconds);
+    }
+    double CurrentShadowOpacity(const Item&i)const{return CurrentShadowOpacity(i,Now());}
+    void AnimateShadow(Item&i,bool join=false){
+        if(!i.shadow.root)return;
+        auto property=[&](double a,double b,double duration,double delay,auto setter){
+            if(!join){Property(a,b,setter,duration,delay);return;}
+            if(duration<=0||std::abs(b-a)<.00001){setter(float(b));return;}
+            auto animation=MakeAnimation(a,b,duration,delay);if(!animation){setter(float(b));return;}
+            LARGE_INTEGER begin{};begin.QuadPart=animationStart;animation->SetAbsoluteBeginTime(begin);setter(animation.Get());
+        };
+        property(i.motionFrom.w/i.shadow.pixels.cx,i.motionTo.w/i.shadow.pixels.cx,seconds,0,[&](auto value){i.shadow.scale->SetScaleX(value);});
+        property(i.motionFrom.h/i.shadow.pixels.cy,i.motionTo.h/i.shadow.pixels.cy,seconds,0,[&](auto value){i.shadow.scale->SetScaleY(value);});
+        property(i.shadowFrom,i.shadowTo,i.shadowSeconds,i.shadowDelay,[&](auto value){i.shadow.opacity->SetOpacity(value);});
+    }
+    Box CurrentBox(const Item&i,double fraction)const{
         if(phase==Phase::Hidden)return HiddenPose(i);if(phase==Phase::Settled)return i.target;
-        return Mix(i.motionFrom,i.motionTo,MotionFraction());
+        return Mix(i.motionFrom,i.motionTo,fraction);
     }
+    Box CurrentBox(const Item&i)const{return CurrentBox(i,MotionFraction());}
     void CaptureMotion(){
-        double t=MotionFraction();
+        const double now=Now(),t=MotionFraction(now);
+        captureActive=phase==Phase::Opening||phase==Phase::Closing;
+        captureStart=start;captureSeconds=seconds;captureFrom=from;captureTo=to;captureProgress=progress;
+        for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;
+            bar.capturedFrom=bar.from;bar.capturedTo=bar.to;bar.capturedDelay=bar.delay;bar.from=CurrentTaskbarBox(*v,now);}
         for(auto&v:views)for(auto&i:v->items){
+            i.captured={i.motionFrom,i.motionTo,i.radiusFrom,i.radiusTo,i.labelFrom,i.labelTo,i.labelSeconds,i.shadowFrom,i.shadowTo,i.shadowDelay,i.shadowSeconds,captureActive};
             i.radiusFrom=phase==Phase::Hidden?HiddenRadius(*v,i):phase==Phase::Settled?OverviewRadius(*v,i.target):float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*t);
-            i.motionFrom=CurrentBox(i);i.labelFrom=CurrentLabelOpacity(i);
+            i.motionFrom=CurrentBox(i,t);i.labelFrom=CurrentLabelOpacity(i,now);i.shadowFrom=CurrentShadowOpacity(i,now);
+        }
+    }
+    void RefreshCapturedMotion(double now){
+        if(!std::exchange(captureActive,false))return;
+        const double elapsed=now-captureStart,t=Curve(captureSeconds<=0?1:elapsed/captureSeconds);
+        // The old compositor animation keeps playing while layout, captions
+        // and native shadow samples are prepared. Re-sample that original
+        // timeline once, immediately before constructing its replacement.
+        if(progress==captureProgress)progress=captureFrom+(captureTo-captureFrom)*t;
+        for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;bar.from=Mix(bar.capturedFrom,bar.capturedTo,Curve(captureSeconds<=bar.capturedDelay?1:(elapsed-bar.capturedDelay)/(captureSeconds-bar.capturedDelay)));}
+        for(auto&v:views)for(auto&i:v->items)if(std::exchange(i.captured.active,false)){const auto&c=i.captured;
+            i.motionFrom=Mix(c.from,c.to,t);i.radiusFrom=float(c.radiusFrom+(c.radiusTo-c.radiusFrom)*t);
+            i.labelFrom=c.labelFrom+(c.labelTo-c.labelFrom)*Curve(c.labelSeconds<=0?1:elapsed/c.labelSeconds);
+            i.shadowFrom=c.shadowFrom+(c.shadowTo-c.shadowFrom)*Curve(c.shadowSeconds<=0?1:(elapsed-c.shadowDelay)/c.shadowSeconds);
         }
     }
     double CurrentProgress(){
@@ -2047,14 +2349,38 @@ public:
     }
     void Animate(double destination,bool captured=false,bool reflow=false){
         if(!captured)CaptureMotion();animations.clear();animationIndex.clear();
+        if(destination==0)for(auto&v:views)for(auto&i:v->items)if(!i.minimized||i.source==chosen)EnsureExitShadow(*v,i);
+        const bool continuing=captureActive;
+        LARGE_INTEGER qpc;QueryPerformanceCounter(&qpc);animationStart=qpc.QuadPart;
+        DCOMPOSITION_FRAME_STATISTICS stats{};
+        if(SUCCEEDED(device->GetFrameStatistics(&stats))){
+            if(stats.currentCompositionRate.Numerator&&stats.currentCompositionRate.Denominator)
+                frameSeconds=std::clamp(double(stats.currentCompositionRate.Denominator)/stats.currentCompositionRate.Numerator,1./360,.1);
+            if(continuing&&stats.nextEstimatedFrameTime.QuadPart>=qpc.QuadPart&&stats.nextEstimatedFrameTime.QuadPart-qpc.QuadPart<frequency.QuadPart/10)
+                animationStart=stats.nextEstimatedFrameTime.QuadPart;
+        }
+        const double sampledAt=double(animationStart)/frequency.QuadPart;RefreshCapturedMotion(sampledAt);
         from=progress;to=destination;
         BOOL enabled=TRUE;SystemParametersInfo(SPI_GETCLIENTAREAANIMATION,0,&enabled,0);
         seconds=(enabled?settings.duration:0)/1000.0*(reflow?1.:std::abs(to-from));
+        AnimationClock(seconds>0);
         phase=to==1?Phase::Opening:Phase::Closing;
+        for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;bar.to=destination==1?bar.hidden:bar.shown;
+            bool atButton=std::abs(bar.from.x-bar.shown.x)+std::abs(bar.from.y-bar.shown.y)<.1;
+            bar.delay=destination==1&&atButton&&!reflow?seconds*.2:0;
+            auto property=[&](double a,double b,auto setter){Property(a,b,setter,seconds-bar.delay,bar.delay);};
+            property(bar.from.x,bar.to.x,[&](auto value){bar.position->SetOffsetX(value);});
+            property(bar.from.y,bar.to.y,[&](auto value){bar.position->SetOffsetY(value);});
+            property(TaskbarShadowEdge(*v,bar.from),TaskbarShadowEdge(*v,bar.to),[&](auto value){SetTaskbarShadowEdge(*v,value);});
+        }
         for(auto&v:views)for(auto&i:v->items){
             Box a=i.motionFrom,b=destination==1?i.target:ExitPose(i);i.motionTo=b;
             i.radiusTo=destination==1?OverviewRadius(*v,i.target):ExitRadius(*v,i);
             i.labelTo=destination;i.labelSeconds=(seconds+std::min(.12,seconds*.28))*.5;
+            i.shadowTo=destination==0&&(!i.minimized||i.source==chosen)?1:0;
+            i.shadowDelay=i.shadowTo>i.shadowFrom&&i.shadowFrom<.001?seconds*.65:0;
+            i.shadowSeconds=seconds-i.shadowDelay;
+            AnimateShadow(i);
             Property(a.x,b.x,[&](auto value){i.position->SetOffsetX(value);});
             Property(a.y,b.y,[&](auto value){i.position->SetOffsetY(value);});
             Property(a.w/i.pixels.cx,b.w/i.pixels.cx,[&](auto value){i.scale->SetScaleX(value);});
@@ -2073,14 +2399,12 @@ public:
                 Property(i.labelFrom,i.labelTo,[&](auto value){i.labelEffect->SetOpacity(value);},i.labelSeconds);
             }
         }
-        // Set one start AFTER building the batch. Expensive submission must not
-        // consume the beginning of the animation. Use the compositor's actual
-        // next-frame estimate instead of assuming a 120 Hz display.
-        LARGE_INTEGER qpc;QueryPerformanceCounter(&qpc);animationStart=qpc.QuadPart;
-        DCOMPOSITION_FRAME_STATISTICS stats{};
-        if(SUCCEEDED(device->GetFrameStatistics(&stats))){
-            if(stats.currentCompositionRate.Numerator&&stats.currentCompositionRate.Denominator)
-                frameSeconds=std::clamp(double(stats.currentCompositionRate.Denominator)/stats.currentCompositionRate.Numerator,1./360,.1);
+        // Position and absolute start refer to the same instant, after the
+        // expensive source preparation. Submission no longer inserts a hold
+        // or restarts from a stale pre-layout position on the next frame.
+        if(!continuing){
+            QueryPerformanceCounter(&qpc);animationStart=qpc.QuadPart;
+            device->GetFrameStatistics(&stats);
             if(stats.nextEstimatedFrameTime.QuadPart>=qpc.QuadPart&&stats.nextEstimatedFrameTime.QuadPart-qpc.QuadPart<frequency.QuadPart/10)
                 animationStart=stats.nextEstimatedFrameTime.QuadPart;
         }
@@ -2094,7 +2418,7 @@ public:
     void FinishTransition(){
         if(phase!=Phase::Opening&&phase!=Phase::Closing)return;
         if(phase==Phase::Closing)RefreshRestoredGeometry(false);
-        progress=to;StaticPose(to);device->Commit();
+        progress=to;StaticPose(to);if(phase==Phase::Opening)DetachHiddenShadows();device->Commit();AnimationClock(false);
         if(phase==Phase::Closing){End(true);return;}
         phase=Phase::Settled;
     }
@@ -2173,7 +2497,7 @@ public:
         if(restoreSource&&!IsIconic(restoreSource)){
             if(restoreHook){UnhookWinEvent(restoreHook);restoreHook=nullptr;}restoreSource=nullptr;
         }
-        HWND candidate=keyboardSelection?selectedSource:nullptr;
+        HWND candidate=keyboardSelection||gestureToken?selectedSource:nullptr;
         ClearSelection();BuildGuard guard(*this);bool targetsChanged=false;
         for(auto&v:views){
             if(freshLayout)ApplyTaskbarOrder(*v);
@@ -2200,6 +2524,7 @@ public:
             Box restored{double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
             float radius=SystemCornerRadius(i.source,v->dpi);
             bool rebound=RebindRestoredSample(*v,i,r);
+            if(EnsureExitShadow(*v,i)){AnimateShadow(i,true);rebound=true;}
             if(std::abs(restored.x-i.original.x)<.1&&std::abs(restored.y-i.original.y)<.1&&std::abs(restored.w-i.original.w)<.1&&std::abs(restored.h-i.original.h)<.1&&radius==i.nativeRadius){if(rebound)device->Commit();return;}
             if(animate){progress=CurrentProgress();CaptureMotion();}
             i.original=restored;i.nativeRadius=radius;
@@ -2216,6 +2541,7 @@ public:
         // Match the current native rectangle at handoff, including app-driven
         // size changes that may have happened while the overview was open.
         for(auto&v:views)for(auto&i:v->items){RECT r{};if(Bounds(i.source,r))i.original={double(r.left-v->bounds.left),double(r.top-v->bounds.top),double(r.right-r.left),double(r.bottom-r.top)};
+            if(i.minimized)i.minimizedOrigin=TaskbarOrigin(*v,i);
             if(i.minimized&&i.source==chosen){
                 // The selected tile grows directly into its restored window;
                 // only the other minimized tiles retreat to the taskbar edge.
@@ -2242,6 +2568,7 @@ public:
         ReconcileWindowStates(true);
     }
     void End(bool restore,bool idle=true){
+        AnimationClock(false);captureActive=false;
         ResetGesture();RemoveProp(controller,kOverviewProperty);
         if(timer)CancelWaitableTimer(timer);idleTimer=false;
         animations.clear();animationIndex.clear();
@@ -2271,7 +2598,7 @@ public:
         // Shared visuals own their private thumbnail references. Release visual
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
-        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;keyboardSelection=false;progress=0;
+        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;leftPress={};middlePress={};keyboardSelection=false;progress=0;
         if(device)device->Commit(); // Submit the filter-input detachments from Item destruction.
         if(idle&&timer&&device){
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
@@ -2279,7 +2606,8 @@ public:
         }
     }
     int Hit(const View&v,POINT p){
-        auto hit=[&](int n){const auto&i=v.items[n];Box b=CurrentBox(i);
+        const double fraction=MotionFraction();
+        auto hit=[&](int n){const auto&i=v.items[n];Box b=CurrentBox(i,fraction);
             if(p.x>=b.x&&p.x<b.right()&&p.y>=b.y&&p.y<b.bottom())return true;
             double x=b.x+(b.w-i.target.w)*.5,y=b.bottom()-v.dpi;
             double r=TitleShoulderRadius(v,i),dy=std::clamp(y+v.dpi+r-p.y,0.,r);
@@ -2306,6 +2634,18 @@ public:
         for(HWND candidate:{selectedSource,previous})if(candidate)
             for(auto&v:views)for(auto&i:v->items)if(i.source==candidate)return candidate;
         return GestureChoice(lastPointer.x,lastPointer.y);
+    }
+    HWND GestureDirection(double dx,double dy)const{
+        double length=std::hypot(dx,dy);if(length<1e-8)return selectedSource;dx/=length;dy/=length;
+        HWND initial=KeyboardStart();Box origin{};
+        for(auto&v:views)for(auto&i:v->items)if(i.source==initial){origin=i.target;origin.x+=v->bounds.left;origin.y+=v->bounds.top;}
+        for(double cone:{.82,.3}){HWND result=initial;double best=1e100;
+            for(auto&v:views)for(auto&i:v->items){if(i.source==initial)continue;
+                double x=v->bounds.left+i.target.cx()-origin.cx(),y=v->bounds.top+i.target.cy()-origin.cy(),distance=std::hypot(x,y);
+                if(distance<1)continue;double cosine=(x*dx+y*dy)/distance;if(cosine<cone)continue;
+                double score=distance*distance/std::pow(cosine,4);if(score<best){best=score;result=i.source;}}
+            if(result!=initial)return result;
+        }return initial;
     }
     HWND KeyboardChoice(UINT key)const{
         HWND initial=KeyboardStart();if(!initial)return nullptr;
@@ -2367,7 +2707,7 @@ public:
         Select(KeyboardChoice(key));
     }
     void RestoreKeyboardSelection(HWND candidate){
-        if(!keyboardSelection)return;
+        if(!keyboardSelection&&!gestureToken)return;
         for(auto&v:views)for(auto&i:v->items)if(i.source==candidate){Select(candidate);return;}
         Select(KeyboardStart());
     }
@@ -2387,7 +2727,7 @@ public:
             gestureOriginX=v->bounds.left+i.target.cx();gestureOriginY=v->bounds.top+i.target.cy();
             gestureWidth=std::max(1L,v->bounds.right-v->bounds.left);gestureHeight=std::max(1L,v->bounds.bottom-v->bounds.top);
         }
-        gestureToken=token;gestureStarted=GetTickCount64();gestureNavigating=gestureReady=false;gestureOpenedAlready=alreadyOpen;
+        gestureToken=token;gestureStarted=GetTickCount64();gestureNavigationStarted=gestureStepAt=0;gestureNavigating=gestureReady=false;gestureOpenedAlready=alreadyOpen;
         gestureBaseX=gestureBaseY=gestureLastX=gestureLastY=gestureMinY=gestureReadyX=gestureReadyY=0;
         SetProp(controller,kGestureProperty,reinterpret_cast<HANDLE>(ULONG_PTR(token)));
         CountGesture(L"WindowScatter.GestureStarts.v5");Select(initial);
@@ -2410,15 +2750,17 @@ public:
             else if(turned){gestureBaseX=0;gestureBaseY=gestureMinY;gestureNavigating=true;}
             else if(movedAfterHold){gestureBaseX=gestureReadyX;gestureBaseY=gestureReadyY;gestureNavigating=true;}
             gestureLastX=nx;gestureLastY=ny;
-            if(!gestureNavigating)return;
+            if(!gestureNavigating)return;gestureNavigationStarted=GetTickCount64();
         }
-        double x=gestureOriginX+(nx-gestureBaseX)*gestureWidth*2.25;
-        double y=gestureOriginY+(ny-gestureBaseY)*gestureHeight*2.25;
-        HWND choice=GestureChoice(x,y);if(choice!=selectedSource)CountGesture(L"WindowScatter.GestureSelections.v5");Select(choice);
+        double dx=nx-gestureBaseX,dy=ny-gestureBaseY;ULONGLONG now=GetTickCount64();
+        if(std::hypot(dx,dy)>=kGestureStep&&(!gestureStepAt||now-gestureStepAt>=90)){
+            HWND choice=GestureDirection(dx,dy);if(choice!=selectedSource){CountGesture(L"WindowScatter.GestureSelections.v5");Select(choice);}
+            gestureBaseX=nx;gestureBaseY=ny;gestureStepAt=now;
+        }
     }
     void FinishGesture(UINT token,bool commit){
         if(!gestureToken||token!=gestureToken)return;
-        if(commit&&!gestureNavigating){CountGesture(L"WindowScatter.GestureOpens.v5");ResetGesture();return;}
+        if(commit&&(!gestureNavigating||GetTickCount64()-gestureNavigationStarted<kGestureCommitTime)){CountGesture(L"WindowScatter.GestureOpens.v5");ResetGesture();return;}
         HWND target=commit?selectedSource:nullptr;ResetGesture();
         CountGesture(commit?L"WindowScatter.GestureCommits.v5":L"WindowScatter.GestureCancels.v5");
         Close(target);
@@ -2470,6 +2812,7 @@ public:
             if(msg==kWindowStateChanged){deferredWindowState=true;return 0;}
             if(msg==kTaskbarOrder){deferredTaskbar=true;return 0;}
             if(msg==kSceneChanged){HWND source=reinterpret_cast<HWND>(wp);if(std::find(deferredSceneChanges.begin(),deferredSceneChanges.end(),source)==deferredSceneChanges.end())deferredSceneChanges.push_back(source);return 0;}
+            if(msg==kTitleChanged){HWND source=reinterpret_cast<HWND>(wp);if(std::find(deferredTitleChanges.begin(),deferredTitleChanges.end(),source)==deferredTitleChanges.end())deferredTitleChanges.push_back(source);return 0;}
             if(msg>=kGestureBegin&&msg<=kGestureCancel){
                 if(msg==kGestureUpdate&&!deferredGestures.empty()&&deferredGestures.back().message==msg&&deferredGestures.back().token==wp)deferredGestures.back().data=lp;
                 else if(deferredGestures.size()<32)deferredGestures.push_back({msg,wp,lp});
@@ -2500,18 +2843,30 @@ public:
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
             else if(!device)PostMessage(controller,kWarmup,0,0);return 0;
         case kReleaseInactive:ReleaseInactiveGraphics();return 0;
-        case kWindowGone:RemoveWindowFromOverview(reinterpret_cast<HWND>(wp));return 0;
+        case kWindowGone:{
+            // A group close can produce many hide/destroy notifications at once.
+            // Remove the queued batch before one reflow, without a debounce timer.
+            std::vector<HWND> sources{reinterpret_cast<HWND>(wp)};MSG pending{};
+            for(int n=0;n<1024&&PeekMessage(&pending,controller,kWindowGone,kWindowGone,PM_REMOVE);++n)sources.push_back(reinterpret_cast<HWND>(pending.wParam));
+            RemoveWindowsFromOverview(sources);return 0;
+        }
         case kWarmup:Warmup();return 0;
-        case kWindowStateChanged:RefreshRestoredGeometry();return 0;
-        case kTaskbarOrder:TaskbarChanged();return 0;
+        case kWindowStateChanged:{MSG pending{};for(int n=0;n<1024&&PeekMessage(&pending,controller,kWindowStateChanged,kWindowStateChanged,PM_REMOVE);++n){}RefreshRestoredGeometry();return 0;}
+        case kTaskbarOrder:{MSG pending{};for(int n=0;n<1024&&PeekMessage(&pending,controller,kTaskbarOrder,kTaskbarOrder,PM_REMOVE);++n){}TaskbarChanged();return 0;}
+        case kTitleChanged:{
+            BuildGuard guard(*this);std::unordered_set<HWND> sources{reinterpret_cast<HWND>(wp)};MSG pending{};
+            for(int n=0;n<256&&PeekMessage(&pending,controller,kTitleChanged,kTitleChanged,PM_REMOVE);++n)sources.insert(reinterpret_cast<HWND>(pending.wParam));
+            bool changed=false;for(HWND source:sources)changed|=RefreshTitle(source);if(changed&&device)device->Commit();return 0;
+        }
         case kSceneChanged:{
             // Coalesce already queued geometry notifications without a polling
             // timer or an extra frame of debounce latency.
             std::vector<HWND> sources{reinterpret_cast<HWND>(wp)};MSG pending{};
             for(int n=0;n<256&&PeekMessage(&pending,controller,kSceneChanged,kSceneChanged,PM_REMOVE);++n){HWND source=reinterpret_cast<HWND>(pending.wParam);
                 if(std::find(sources.begin(),sources.end(),source)==sources.end())sources.push_back(source);}
-            sceneNeedsLayout=false;for(HWND source:sources)SceneChanged(source,true);
-            if(std::exchange(sceneNeedsLayout,false)&&(phase==Phase::Opening||phase==Phase::Settled))Relayout();return 0;
+            BuildGuard guard(*this);sceneNeedsLayout=sceneAddedWindows=false;
+            for(HWND source:sources)SceneChanged(source,true);
+            FinishSceneChanges();return 0;
         }
         case kSyncOrder:if(phase==Phase::Closing){HWND foreground=GetForegroundWindow();if(foreground==(chosen?chosen:previous)){RefreshRestoredGeometry();FollowNativeZOrder();device->Commit();}else if(!IsOurWindow(foreground))End(false);}return 0;
         case kDismiss:if(!building&&phase!=Phase::Hidden&&(wp||(phase!=Phase::Closing&&!IsOurWindow(GetForegroundWindow()))))End(false);return 0;
@@ -2529,12 +2884,28 @@ public:
             if(phase!=Phase::Hidden)HoverButtons(*v,i,point);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
         case WM_MOUSELEAVE:if(!gestureToken&&!keyboardSelection&&v&&v->selected>=0)Select(nullptr);return 0;
         case WM_LBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
-            auto button=ButtonAt(*v,i,point);if(button!=WindowButton::None){pressedButtonSource=v->items[i].source;pressedButton=button;SetCapture(hwnd);}}return 0;
+            leftPress={hwnd,i<0?nullptr:v->items[i].source,i<0?0:v->items[i].sourceProcess};
+            pressedButton=ButtonAt(*v,i,point);pressedButtonSource=pressedButton==WindowButton::None?nullptr:leftPress.source;SetCapture(hwnd);}return 0;
         case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
+            auto press=std::exchange(leftPress,LeftPress{});
             HWND pressed=std::exchange(pressedButtonSource,nullptr);auto button=std::exchange(pressedButton,WindowButton::None);if(GetCapture()==hwnd)ReleaseCapture();
+            RECT client{};GetClientRect(hwnd,&client);if(press.view!=hwnd||!PtInRect(&client,point)||press.source!=(i<0?nullptr:v->items[i].source))return 0;
+            DWORD process=0;if(press.source&&(!GetWindowThreadProcessId(press.source,&process)||(press.process&&process!=press.process)))return 0;
             if(pressed){if(i>=0&&v->items[i].source==pressed&&ButtonAt(*v,i,point)==button){if(button==WindowButton::Close)RequestClose(v->items[i]);else if(button==WindowButton::Minimize)RequestMinimize(v->items[i]);}}
             else if(ButtonAt(*v,i,point)==WindowButton::None)Close(i<0?nullptr:v->items[i].source);}return 0;
-        case WM_CAPTURECHANGED:pressedButtonSource=nullptr;pressedButton=WindowButton::None;return 0;
+        case WM_MBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int index=Hit(*v,point);middlePress={};
+            if(index>=0&&!(wp&MK_CONTROL)){const auto&i=v->items[index];middlePress={i.source,i.sourceProcess,(wp&MK_SHIFT)!=0};SetCapture(hwnd);}
+        }return 0;
+        case WM_MBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int index=Hit(*v,point);auto pressed=std::exchange(middlePress,MiddlePress{});
+            if(GetCapture()==hwnd)ReleaseCapture();
+            if(pressed.source&&index>=0&&v->items[index].source==pressed.source){
+                if(pressed.group)RequestCloseGroup(pressed.source,pressed.process);else RequestClose(pressed.source,pressed.process);
+            }
+        }return 0;
+        case WM_CANCELMODE:if(GetCapture()==hwnd)ReleaseCapture();[[fallthrough]];
+        case WM_CAPTURECHANGED:pressedButtonSource=nullptr;pressedButton=WindowButton::None;leftPress={};middlePress={};return 0;
         case WM_RBUTTONUP:Close(nullptr);return 0;
         case WM_SYSKEYDOWN:case WM_KEYDOWN:
             if(building)return 0;
@@ -2554,7 +2925,7 @@ public:
         if(!EnsureDevice())return false;
         HWND fixture=CreateWindowEx(WS_EX_TOOLWINDOW,kController,L"Scatter API probe",WS_OVERLAPPEDWINDOW,-20000,-20000,640,420,nullptr,nullptr,g_instance,nullptr);
         if(!fixture)return false;
-        auto v=std::make_unique<View>();MONITORINFO mi{sizeof(mi)};v->monitor=MonitorFromWindow(fixture,MONITOR_DEFAULTTOPRIMARY);GetMonitorInfo(v->monitor,&mi);v->bounds=mi.rcWork;
+        auto v=std::make_unique<View>();MONITORINFO mi{sizeof(mi)};v->monitor=MonitorFromWindow(fixture,MONITOR_DEFAULTTOPRIMARY);GetMonitorInfo(v->monitor,&mi);v->bounds=mi.rcMonitor;
         views.push_back(std::move(v));View&view=*views[0];
         bool ok=CreateView(view);Item i;i.source=fixture;i.original={10,10,640,420};i.target={180,130,320,210};
         if(ok)ok=CreateItem(view,i);
