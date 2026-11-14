@@ -20,8 +20,10 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/layout-mixed.gif" width="1100" alt="展开交错遮挡的窗口，用鼠标点击阅读笔记并切到前台">
+  <img src="docs/media/layout-mixed.gif" width="960" alt="按真实截图的原始比例展开窗口，选择设置窗口的布局演示">
 </p>
+
+<p align="center"><sub>动图为使用真实软件截图制作的布局演示，窗口保持截图原始比例。<a href="docs/media-sources.md">素材与演示说明</a></sub></p>
 
 ## 快速开始
 
@@ -29,7 +31,7 @@
 
 1. 下载 [WindowScatter.exe](https://github.com/SinCircle/windhawk-window-scatter/releases/latest/download/WindowScatter.exe)，双击后直接打开设置。设置页使用 Microsoft Edge WebView2 Runtime；关闭面板后释放界面进程，窗口总览继续在后台运行。
 2. 按 <kbd>Win</kbd> + <kbd>Tab</kbd> 打开总览，点击窗口预览即可切换；也可以用方向键选择后按 <kbd>Enter</kbd>。
-3. 在设置中调整动画、内存模式和开机启动；鼠标移到设置行时，点击文字旁出现的「?」查看说明。再次双击 EXE 可返回设置，也可在这里退出程序。
+3. 在设置中调整任务栏折叠、动画、内存模式和开机启动；鼠标移到设置行时，点击文字旁出现的「?」查看说明。再次双击 EXE 可返回设置，也可在这里退出程序。
 
 > 使用独立版前，请先停用 Windhawk 中的同名模组。
 
@@ -38,13 +40,13 @@
 
 1. 安装 [Windhawk](https://windhawk.net/)，打开“创建新模组”。
 2. 将 [window-scatter.wh.cpp](window-scatter.wh.cpp) 的内容粘贴到编辑器，保存、编译并启用。
-3. 在模组设置中调整动画与内存模式。
+3. 在模组设置中调整任务栏折叠、动画与内存模式。
 
 </details>
 
-## 本地开发改动
+## 1.0.5 更新
 
-保留原有平稳过渡、外部选中框与一屏布局。进入总览时任务栏沿屏幕边缘折叠，最小化窗口从对应任务栏按钮的实际矩形飞出，宽高分别过渡到窗口预览比例；退出时任务栏恢复。三指选窗按滑动方向选择邻居，支持斜向，不显示虚拟光标。
+新增「折叠任务栏」设置，默认开启；关闭后，总览中的任务栏画面留在原位。独立版和 Windhawk 模组均可调整。修复切换总览时误触发系统勿扰、任务栏突然出现铃铛的问题。
 
 批量新增、关闭窗口时合并重排，连续操作保留手势选中项。窗口改名会同步更新标题；左键拖出目标或取消捕获后松开不会误选窗口。测量范围与本机结果见[性能与验证](docs/performance.md)。
 
@@ -58,17 +60,28 @@
 
 <table>
   <tr>
-    <td><img src="docs/media/workflow-new-windows.gif" width="520" alt="新增两个窗口后自动重排，选中刚打开的阅读笔记"></td>
+    <td><img src="docs/media/workflow-new-windows.gif" width="520" alt="新增两个窗口后自动重排，选中刚打开的设置窗口"></td>
     <td><img src="docs/media/workflow-close-windows.gif" width="520" alt="连续关闭两个窗口，再切回编辑器"></td>
+  </tr>
+  <tr>
     <td><img src="docs/media/workflow-minimize-many.gif" width="520" alt="连续最小化三个窗口，清出空间后切回编辑器"></td>
-    <td><img src="docs/media/layout-fullscreen.gif" width="520" alt="从最大化编辑器后面找回阅读笔记"></td>
-    <td><img src="docs/media/layout-halves.gif" width="520" alt="左右分屏时恢复项目文件"></td>
-    <td><img src="docs/media/layout-quarters.gif" width="520" alt="找到被四分屏覆盖的笔记"></td>
+    <td><img src="docs/media/layout-fullscreen.gif" width="520" alt="从较大的编辑器窗口后面找回设置窗口"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/media/layout-halves.gif" width="520" alt="左右并排的窗口与最小化的任务管理器"></td>
+    <td><img src="docs/media/layout-quarters.gif" width="520" alt="四个分散窗口与中央设置窗口的布局演示"></td>
+  </tr>
+  <tr>
     <td><img src="docs/media/layout-floating.gif" width="520" alt="从小窗遮挡中切回编辑器"></td>
-    <td><img src="docs/media/layout-mixed.gif" width="520" alt="在横竖交错的窗口中找到阅读笔记"></td>
-    <td><img src="docs/media/layout-varied.gif" width="520" alt="从画布和参考窗口后面找到项目素材"></td>
-    <td><img src="docs/media/layout-dense.gif" width="520" alt="从十二个堆叠窗口中找到发布文件"></td>
-    <td><img src="docs/media/layout-clusters.gif" width="520" alt="在两组项目中恢复本周日程"></td>
+    <td><img src="docs/media/layout-mixed.gif" width="520" alt="在不同大小的真实界面中找到设置窗口"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/media/layout-varied.gif" width="520" alt="从不同尺寸的窗口后面找到任务管理器"></td>
+    <td><img src="docs/media/layout-dense.gif" width="520" alt="从十二个堆叠窗口中找到任务管理器"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/media/layout-clusters.gif" width="520" alt="在两组项目中恢复深色设置"></td>
+    <td><img src="docs/media/overview.gif" width="520" alt="展开、选择和退出总览的布局演示"></td>
   </tr>
 </table>
 
@@ -116,9 +129,27 @@
 
 连续操作会在布局与画面准备完成后，按合成器的交接时刻重新采样位置、圆角、标题和任务栏，减少倒退或停顿。退出阴影直接对互不重叠的边缘应用透明度，减少合成开销；重新展开完成后移除不可见阴影图层，保留可复用资源。测量范围和分阶段数据见[性能与验证](docs/performance.md)。
 
+### 任务栏折叠
+
+<p align="center">
+  <img src="docs/media/settings.png" width="560" alt="1.0.5 设置页，包含默认开启的折叠任务栏开关">
+</p>
+
+「折叠任务栏」默认开启：进入总览时沿屏幕边缘收起，退出时恢复；关闭后，任务栏画面保持原位。设置即时保存，不改变 Windows 的任务栏自动隐藏配置。独立版在设置面板中调整，Windhawk 版在模组设置中调整。
+
+<table>
+  <tr><th>开启折叠</th><th>关闭折叠</th></tr>
+  <tr>
+    <td><img src="docs/media/taskbar-fold.gif" width="520" alt="开启后任务栏随总览进入折叠，退出恢复"></td>
+    <td><img src="docs/media/taskbar-stay.gif" width="520" alt="关闭后任务栏画面在总览过程中保持原位"></td>
+  </tr>
+</table>
+
+最小化窗口仍从对应任务栏按钮的位置与宽高飞出，再连续变成窗口预览的比例。
+
 ### 多显示器
 
-各屏幕上的窗口分别排列，任务栏在进入和退出总览时连续折叠、恢复。支持不同分辨率、缩放比例和显示器位置。
+各屏幕上的窗口分别排列，任务栏遵循同一个折叠设置。支持不同分辨率、缩放比例和显示器位置。
 
 ### 内存模式
 
@@ -131,6 +162,8 @@
 ## 设计与参考
 
 macOS 和 Linux 桌面的多任务总览界面是本项目的交互参考。Window Scatter 根据自身的设计目标，独立探索窗口的空间布局、手势选窗、连续重排与最小化恢复，让窗口管理适应 Windows 上的实际使用方式。
+
+预览使用真实软件截图和应用图标，窗口外框与截图原始比例一致。动图离线生成，布局由本版本的布局算法计算，用于说明交互；它们不是桌面实录或性能测量。详见[预览素材说明](docs/media-sources.md)。
 
 ## 更多说明
 

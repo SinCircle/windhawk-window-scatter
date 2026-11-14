@@ -39,3 +39,7 @@
 [Release](https://github.com/SinCircle/windhawk-window-scatter/releases/latest) 附件中的 `SHA256SUMS.txt` 提供独立版 EXE 和模组源码的 SHA-256 校验值。
 
 [报告问题](https://github.com/SinCircle/windhawk-window-scatter/issues)时，请附上 Windows 版本、显示器布局与缩放比例、程序版本和复现步骤。
+
+## 任务栏折叠能关闭吗？
+
+可以。在独立版设置面板或 Windhawk 模组设置中关闭「折叠任务栏」。默认开启；关闭后总览内的任务栏画面保持原位，不改变 Windows 的自动隐藏设置，也不影响最小化窗口的展示与恢复。

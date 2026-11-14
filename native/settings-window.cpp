@@ -69,7 +69,7 @@ bool ParseCommand(const std::wstring&text,Command&command){
     auto number=[](const std::wstring&s,unsigned&n){if(s.empty()||s.size()>10)return false;n=0;for(auto c:s){if(c<L'0'||c>L'9'||n>(2147483647u-unsigned(c-L'0'))/10)return false;n=n*10+unsigned(c-L'0');}return true;};
     unsigned value=0;if(!number(text.substr(0,first),command.sequence)||!command.sequence||!number(text.substr(last+1),value))return false;
     command.action=text.substr(first+1,last-first-1);command.value=int(value);
-    if(command.action==L"enabled"||command.action==L"startup")return value<=1;
+    if(command.action==L"enabled"||command.action==L"startup"||command.action==L"foldTaskbar")return value<=1;
     if(command.action==L"memory")return value<=2;
     if(command.action==L"duration")return value<=900;
     return value==0&&(command.action==L"ready"||command.action==L"reconnect"||command.action==L"exit"||command.action==L"close"||command.action==L"github"||command.action==L"licenses");
@@ -114,6 +114,7 @@ struct SettingsWindow::Browser:std::enable_shared_from_this<Browser> {
         {std::lock_guard lock(owner->statusMutex);status=owner->status;label=owner->statusText;detail=owner->statusDetail;}
         const auto&p=owner->preferences;
         return L"{\"type\":\"state\",\"ack\":"+std::to_wstring(ack)+L",\"enabled\":"+(p.enabled?L"true":L"false")+
+            L",\"foldTaskbar\":"+(p.foldTaskbar?L"true":L"false")+
             L",\"startup\":"+(StartupEnabled()?L"true":L"false")+L",\"memory\":"+std::to_wstring(p.memory)+L",\"duration\":"+std::to_wstring(p.duration)+
             L",\"status\":"+std::to_wstring(status)+L",\"statusText\":"+Json(label)+L",\"statusDetail\":"+Json(detail)+L",\"version\":"+Json(kVersion)+
             L",\"theme\":"+Json(contrast?L"contrast":dark?L"dark":L"light")+L",\"systemBackground\":"+Json(HexColor(GetSysColor(COLOR_WINDOW)))+
@@ -214,6 +215,7 @@ struct SettingsWindow::Browser:std::enable_shared_from_this<Browser> {
         }else{
             auto previous=owner->preferences;auto next=previous;
             if(command.action==L"enabled")next.enabled=command.value!=0;
+            else if(command.action==L"foldTaskbar")next.foldTaskbar=command.value!=0;
             else if(command.action==L"memory")next.memory=command.value;
             else if(command.action==L"duration")next.duration=command.value;
             if(owner->callbacks.save&&owner->callbacks.save(next))owner->preferences=next;
@@ -228,9 +230,9 @@ bool SettingsWindow::Create(HINSTANCE handle,const Preferences&values,WindowCall
     WNDCLASSEX wc{sizeof(wc)};wc.hInstance=instance;wc.lpfnWndProc=Procedure;wc.lpszClassName=kManagerClass;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
     wc.hIcon=reinterpret_cast<HICON>(LoadImage(instance,MAKEINTRESOURCE(101),IMAGE_ICON,GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON),LR_SHARED));wc.hIconSm=wc.hIcon;
     if(!RegisterClassEx(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return false;
-    hwnd=CreateWindowEx(WS_EX_APPWINDOW,kManagerClass,L"Window Scatter 设置",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,560,408,nullptr,nullptr,instance,this);
+    hwnd=CreateWindowEx(WS_EX_APPWINDOW,kManagerClass,L"Window Scatter 设置",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,560,472,nullptr,nullptr,instance,this);
     if(!hwnd)return false;taskbarMessage=RegisterWindowMessage(L"TaskbarCreated");
-    UINT dpi=GetDpiForWindow(hwnd);RECT bounds{0,0,MulDiv(560,dpi,96),MulDiv(408,dpi,96)};
+    UINT dpi=GetDpiForWindow(hwnd);RECT bounds{0,0,MulDiv(560,dpi,96),MulDiv(472,dpi,96)};
     AdjustWindowRectExForDpi(&bounds,GetWindowLong(hwnd,GWL_STYLE),FALSE,GetWindowLong(hwnd,GWL_EXSTYLE),dpi);
     POINT cursor{};GetCursorPos(&cursor);MONITORINFO monitor{sizeof(monitor)};GetMonitorInfo(MonitorFromPoint(cursor,MONITOR_DEFAULTTOPRIMARY),&monitor);
     int w=bounds.right-bounds.left,h=bounds.bottom-bounds.top;

@@ -30,6 +30,7 @@ std::wstring SymbolIdentityText(const ModuleIdentity&identity);
 struct Preferences {
     bool enabled=true;
     int duration=666,memory=0;
+    bool foldTaskbar=true;
 };
 Preferences LoadPreferences(const wchar_t*key=kRegistry);
 bool SavePreferences(const Preferences&prefs,const wchar_t*key=kRegistry);

@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     An independent window overview for Windows 11, with spatial layouts, live previews and touchpad navigation.
-// @version         1.0.4
+// @version         1.0.5
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -95,7 +95,8 @@ An opaque wallpaper background covers the original windows during the overview.
 The wallpaper is beneath all window previews, with the selection outline behind
 its preview and titles above it. This is a wallpaper-backed fullscreen overview.
 Overlays cover entire monitors; a shared taskbar surface folds away on entry and
-returns on exit. Original windows are not moved, resized, hidden
+returns on exit by default. Disable Fold taskbar to keep its preview in place.
+This does not change Windows auto-hide settings. Original windows are not moved, resized, hidden
 or made transparent. Return animation follows the actual native Z order after
 activating the selected window. The last valid preview stays attached until all
 overlays have been hidden and DWM has presented the handoff. Overlay windows have
@@ -124,6 +125,9 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 - durationMs: 320
   $name: Animation duration (ms)
   $description: Non-linear motion executed by DirectComposition. 0 disables animation.
+- foldTaskbar: true
+  $name: 折叠任务栏 / Fold taskbar
+  $description: 进入总览时沿屏幕边缘收起任务栏，退出时恢复。关闭后任务栏画面保持原位，不改变 Windows 的自动隐藏设置。
 - memoryMode: auto
   $name: 内存模式 / Memory mode
   $description: 自动：内存不足时在退出总览后释放图形资源。常驻：优先响应速度。省内存：每次退出后释放，下次打开需要重新初始化。
@@ -1020,8 +1024,9 @@ public:
         if(request){CloseHandle(request);request=nullptr;}if(stop){CloseHandle(stop);stop=nullptr;}}
     ~TaskbarOrder(){Stop();}
 };
-struct Settings{bool winTab=true;int duration=320;MemoryMode memoryMode=MemoryMode::Automatic;};
+struct Settings{bool winTab=true;int duration=320;MemoryMode memoryMode=MemoryMode::Automatic;bool foldTaskbar=true;};
 static std::atomic<bool> g_winTab{true};
+static std::atomic<bool> g_foldTaskbar{true};
 static std::atomic<int> g_duration{320};
 static std::atomic<int> g_memoryMode{0};
 static std::atomic<HWND> g_controller{nullptr};
@@ -1222,7 +1227,7 @@ public:
         if(active==clockBoosted||!boostClock)return;
         if(SUCCEEDED(boostClock(active)))clockBoosted=active;
     }
-    void LoadSettings(){settings={g_winTab.load(),std::clamp(g_duration.load(),0,900),MemoryMode(std::clamp(g_memoryMode.load(),0,2))};}
+    void LoadSettings(){settings={g_winTab.load(),std::clamp(g_duration.load(),0,900),MemoryMode(std::clamp(g_memoryMode.load(),0,2)),g_foldTaskbar.load()};}
     bool LowMemory()const{
         BOOL low=FALSE;if(lowMemoryEvent&&QueryMemoryResourceNotification(lowMemoryEvent,&low))return low!=FALSE;
         MEMORYSTATUSEX status{sizeof(status)};
@@ -1459,8 +1464,10 @@ public:
         if(FAILED(hr)){Log(L"Taskbar transition surface",hr);bar.position.Reset();bar.surface.Reset();return false;}
         bar.source=source;bar.shown={double(bounds.left-v.bounds.left),double(bounds.top-v.bounds.top),double(bounds.right-bounds.left),double(bounds.bottom-bounds.top)};bar.hidden=bar.shown;
         double width=v.bounds.right-v.bounds.left,height=v.bounds.bottom-v.bounds.top;
-        if(bar.shown.w>=bar.shown.h){bar.hidden.y=bar.shown.cy()<height*.5?-bar.shown.h:height;}
-        else {bar.hidden.x=bar.shown.cx()<width*.5?-bar.shown.w:width;}
+        if(settings.foldTaskbar){
+            if(bar.shown.w>=bar.shown.h){bar.hidden.y=bar.shown.cy()<height*.5?-bar.shown.h:height;}
+            else {bar.hidden.x=bar.shown.cx()<width*.5?-bar.shown.w:width;}
+        }
         bar.from=bar.to=bar.shown;
         hr=device->CreateRectangleClip(&v.shadowClip);if(FAILED(hr))return false;
         v.shadowClip->SetLeft(0.f);v.shadowClip->SetTop(0.f);v.shadowClip->SetRight(float(width));v.shadowClip->SetBottom(float(height));
@@ -2105,6 +2112,10 @@ public:
         RECT r=v.bounds;
         v.hwnd=CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,kOverlay,L"Window Scatter",WS_POPUP,r.left,r.top,r.right-r.left,r.bottom-r.top,nullptr,nullptr,g_instance,&v);
         if(!v.hwnd)return false;
+        // This is a shell overview, not a full-screen application. Opt out
+        // before showing it so automatic full-screen detection does not
+        // enable Do Not Disturb and change the live taskbar during exit.
+        if(!SetProp(v.hwnd,L"NonRudeHWND",reinterpret_cast<HANDLE>(TRUE))){Log(L"Mark overview as non-fullscreen",HRESULT_FROM_WIN32(GetLastError()));return false;}
         v.dpi=GetDpiForWindow(v.hwnd)/96.f;
         // Our compositor already animates the scene. A native hide transition
         // could keep displaying this HWND after its composition tree is freed.
@@ -2217,6 +2228,9 @@ public:
         GetCursorPos(&lastPointer);
         for(auto&v:views)if(v->hwnd&&(!CreateDesktop(*v)||!CreateTaskbar(*v))){building=false;End(false);return false;}
         StaticPose(0);
+        // A new scene has no outgoing animation. Capture while still Hidden,
+        // before marking the visible overlays as Opening for input handling.
+        CaptureMotion();
         if(FAILED(device->Commit())){building=false;End(false);return false;}
         device->WaitForCommitCompletion();
         phase=Phase::Opening;SetProp(controller,kOverviewProperty,reinterpret_cast<HANDLE>(kShellAck));
@@ -2227,7 +2241,7 @@ public:
         destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,Event,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         windowStateHook=SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         geometryHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_NAMECHANGE,nullptr,WindowStateEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
-        building=false;Animate(1);return true;
+        building=false;Animate(1,true);return true;
     }
     template<class Setter> void Property(double a,double b,Setter setter,double duration=-1,double delay=0){
         if(duration<0)duration=seconds;
@@ -3129,6 +3143,7 @@ static void Uninit(){if(taskbar)RemoveProp(taskbar,kBridgeProperty);taskbar=null
 #ifndef SCATTER_STANDALONE
 static void ReadSettings(){
     scatter::g_winTab=Wh_GetIntSetting(L"replaceWinTab")!=0;scatter::g_duration=Wh_GetIntSetting(L"durationMs");
+    scatter::g_foldTaskbar=Wh_GetIntSetting(L"foldTaskbar")!=0;
     auto mode=Wh_GetStringSetting(L"memoryMode");
     scatter::g_memoryMode=mode&&!wcscmp(mode,L"resident")?1:mode&&!wcscmp(mode,L"saver")?2:0;
     if(mode)Wh_FreeStringSetting(mode);

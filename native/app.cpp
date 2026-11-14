@@ -56,6 +56,7 @@ private:
     bool rendererStarted=false;
     void ApplyValues(const Preferences&values){
         preferences=values;scatter::g_winTab=values.enabled;scatter::g_duration=values.duration;scatter::g_memoryMode=values.memory;
+        scatter::g_foldTaskbar=values.foldTaskbar;
         if(HWND controller=scatter::g_controller.load())PostMessage(controller,scatter::kSettings,0,0);
         if(HWND bridge=endpoint.load())PostMessage(bridge,kBridgeEnable,values.enabled,0);
     }
@@ -122,10 +123,14 @@ int SelfTest(const std::wstring&report){
     auto check=[&](bool ok,const char*text){if(output)output<<(ok?"PASS ":"FAIL ")<<text<<"\n";return ok;};
     std::wstring key=std::wstring(kRegistry)+L"\\SelfTest-"+std::to_wstring(GetCurrentProcessId());
     auto defaults=LoadPreferences(key.c_str());
-    bool success=check(defaults.duration==666&&defaults.memory==0&&defaults.enabled,"fresh defaults use 666 ms, automatic memory and system gestures");
-    Preferences prefs;prefs.enabled=false;prefs.duration=840;prefs.memory=2;
+    bool success=check(defaults.duration==666&&defaults.memory==0&&defaults.enabled&&defaults.foldTaskbar,"fresh defaults use 666 ms, automatic memory, system gestures and taskbar folding");
+    Preferences prefs;prefs.enabled=false;prefs.duration=840;prefs.memory=2;prefs.foldTaskbar=false;
     bool saved=SavePreferences(prefs,key.c_str());auto loaded=LoadPreferences(key.c_str());
-    success=check(saved&&loaded.enabled==prefs.enabled&&loaded.duration==prefs.duration&&loaded.memory==prefs.memory,"preferences persist and reload")&&success;
+    success=check(saved&&loaded.enabled==prefs.enabled&&loaded.duration==prefs.duration&&loaded.memory==prefs.memory&&!loaded.foldTaskbar,"preferences including disabled taskbar folding persist and reload")&&success;
+    HKEY legacyKey=nullptr;
+    if(RegOpenKeyEx(HKEY_CURRENT_USER,key.c_str(),0,KEY_SET_VALUE,&legacyKey)==ERROR_SUCCESS){RegDeleteValue(legacyKey,L"FoldTaskbar");RegCloseKey(legacyKey);}
+    auto legacy=LoadPreferences(key.c_str());
+    success=check(legacy.foldTaskbar&&!legacy.enabled&&legacy.duration==840&&legacy.memory==2,"upgrading existing preferences defaults folding on and preserves other settings")&&success;
     std::wstring run=key+L"\\Run";
     success=check(SetStartup(true,run.c_str(),L"Entry")&&StartupEnabled(nullptr,run.c_str(),L"Entry"),"autostart command uses quoted EXE path and --startup")&&success;
     success=check(SetStartup(false,run.c_str(),L"Entry")&&!StartupEnabled(nullptr,run.c_str(),L"Entry"),"autostart can be disabled without changing other values")&&success;

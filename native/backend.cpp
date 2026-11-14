@@ -231,13 +231,14 @@ static DWORD ReadDword(HKEY key,const wchar_t*name,DWORD fallback){DWORD value=0
 Preferences LoadPreferences(const wchar_t*path){
     Preferences prefs;HKEY key=nullptr;if(RegOpenKeyEx(HKEY_CURRENT_USER,path,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)return prefs;
     prefs.enabled=ReadDword(key,L"Enabled",1)!=0;
+    prefs.foldTaskbar=ReadDword(key,L"FoldTaskbar",1)!=0;
     prefs.duration=std::clamp<int>(ReadDword(key,L"AnimationDuration",666),0,900);
     prefs.memory=std::clamp<int>(ReadDword(key,L"MemoryMode",0),0,2);RegCloseKey(key);return prefs;
 }
 bool SavePreferences(const Preferences&prefs,const wchar_t*path){
     HKEY key=nullptr;if(RegCreateKeyEx(HKEY_CURRENT_USER,path,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS)return false;
     auto write=[&](const wchar_t*name,DWORD value){return RegSetValueEx(key,name,0,REG_DWORD,reinterpret_cast<const BYTE*>(&value),sizeof(value))==ERROR_SUCCESS;};
-    bool success=write(L"Enabled",prefs.enabled)&&write(L"AnimationDuration",std::clamp(prefs.duration,0,900))&&write(L"MemoryMode",std::clamp(prefs.memory,0,2));RegCloseKey(key);return success;
+    bool success=write(L"Enabled",prefs.enabled)&&write(L"AnimationDuration",std::clamp(prefs.duration,0,900))&&write(L"MemoryMode",std::clamp(prefs.memory,0,2))&&write(L"FoldTaskbar",prefs.foldTaskbar);RegCloseKey(key);return success;
 }
 bool StartupEnabled(std::wstring*registeredPath,const wchar_t*key,const wchar_t*value){
     wchar_t command[32768]{};DWORD bytes=sizeof(command);
