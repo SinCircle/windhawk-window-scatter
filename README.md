@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/layout-mixed.gif" width="1200" alt="展开真实应用窗口并切回编辑器">
+  <img src="docs/media/layout-mixed.gif" width="1200" alt="展开模拟窗口并选中阅读笔记">
 </p>
 
 ## 快速开始
@@ -62,10 +62,10 @@
 
 <table>
   <tr>
-    <td><img src="docs/media/workflow-new-windows.gif" width="640" alt="打开真实网页窗口后自动重排"></td>
-    <td><img src="docs/media/workflow-close-windows.gif" width="640" alt="连续关闭网页窗口后切回编辑器"></td>
-    <td><img src="docs/media/workflow-minimize-many.gif" width="640" alt="最小化网页窗口，再从底部恢复"></td>
-    <td><img src="docs/media/layout-mixed.gif" width="640" alt="从交错窗口中选择编辑器"></td>
+    <td><img src="docs/media/workflow-new-windows.gif" width="640" alt="新增模拟窗口后自动重排"></td>
+    <td><img src="docs/media/workflow-close-windows.gif" width="640" alt="连续关闭模拟窗口后切回编辑器"></td>
+    <td><img src="docs/media/workflow-minimize-many.gif" width="640" alt="连续最小化模拟窗口"></td>
+    <td><img src="docs/media/layout-mixed.gif" width="640" alt="从交错的模拟窗口中选择阅读笔记"></td>
   </tr>
 </table>
 
