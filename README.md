@@ -20,10 +20,10 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/layout-mixed.gif" width="960" alt="按真实截图的原始比例展开窗口，选择设置窗口的布局演示">
+  <img src="docs/media/layout-mixed.gif" width="960" alt="原生总览展开真实应用并切换到项目仓库">
 </p>
 
-<p align="center"><sub>动图为使用真实软件截图制作的布局演示，窗口保持截图原始比例。<a href="docs/media-sources.md">素材与演示说明</a></sub></p>
+<p align="center"><sub>动图由当前程序实录，使用浅色的真实应用窗口与公开内容。<a href="docs/media-sources.md">素材与演示说明</a></sub></p>
 
 ## 快速开始
 
@@ -44,7 +44,11 @@
 
 </details>
 
-## 1.0.5 更新
+## 1.0.6 更新
+
+修复最小化或关闭窗口后残留过大的中间间隙。Windows 聚焦壁纸的原文件失效时，改为读取对应的系统壁纸缓存，避免总览变成黑色背景。
+
+首次打开、空闲清理和释放图形资源后重新打开，均保留设定的展开动画。
 
 新增「折叠任务栏」设置，默认开启；关闭后，总览中的任务栏画面留在原位。独立版和 Windhawk 模组均可调整。修复切换总览时误触发系统勿扰、任务栏突然出现铃铛的问题。
 
@@ -60,28 +64,9 @@
 
 <table>
   <tr>
-    <td><img src="docs/media/workflow-new-windows.gif" width="520" alt="新增两个窗口后自动重排，选中刚打开的设置窗口"></td>
-    <td><img src="docs/media/workflow-close-windows.gif" width="520" alt="连续关闭两个窗口，再切回编辑器"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/media/workflow-minimize-many.gif" width="520" alt="连续最小化三个窗口，清出空间后切回编辑器"></td>
-    <td><img src="docs/media/layout-fullscreen.gif" width="520" alt="从较大的编辑器窗口后面找回设置窗口"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/media/layout-halves.gif" width="520" alt="左右并排的窗口与最小化的任务管理器"></td>
-    <td><img src="docs/media/layout-quarters.gif" width="520" alt="四个分散窗口与中央设置窗口的布局演示"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/media/layout-floating.gif" width="520" alt="从小窗遮挡中切回编辑器"></td>
-    <td><img src="docs/media/layout-mixed.gif" width="520" alt="在不同大小的真实界面中找到设置窗口"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/media/layout-varied.gif" width="520" alt="从不同尺寸的窗口后面找到任务管理器"></td>
-    <td><img src="docs/media/layout-dense.gif" width="520" alt="从十二个堆叠窗口中找到任务管理器"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/media/layout-clusters.gif" width="520" alt="在两组项目中恢复深色设置"></td>
-    <td><img src="docs/media/overview.gif" width="520" alt="展开、选择和退出总览的布局演示"></td>
+    <td><img src="docs/media/layout-mixed.gif" width="480" alt="真实浏览器和编辑器混合布局"><br>浏览器与编辑器混合布局</td>
+    <td><img src="docs/media/layout-quarters.gif" width="480" alt="使用方向键选择真实网页窗口"><br>方向键选窗</td>
+    <td><img src="docs/media/layout-varied.gif" width="480" alt="不同大小的真实应用窗口"><br>不同大小的窗口</td>
   </tr>
 </table>
 
@@ -106,10 +91,6 @@
 左右键在普通窗口区或最小化栏内选择，上下键可在两者之间切换。方向键选中后，选中框会保持；移动鼠标后恢复悬停选择。
 
 ### 最小化与恢复
-
-<p align="center">
-  <img src="docs/media/minimize.gif" width="1100" alt="在总览中最小化窗口，再从底部选择恢复">
-</p>
 
 最小化的窗口显示在底部，按任务栏应用顺序排列。点击或用方向键选中后按 <kbd>Enter</kbd> 即可恢复；取消总览不会恢复这些窗口。
 
@@ -137,14 +118,6 @@
 
 「折叠任务栏」默认开启：进入总览时沿屏幕边缘收起，退出时恢复；关闭后，任务栏画面保持原位。设置即时保存，不改变 Windows 的任务栏自动隐藏配置。独立版在设置面板中调整，Windhawk 版在模组设置中调整。
 
-<table>
-  <tr><th>开启折叠</th><th>关闭折叠</th></tr>
-  <tr>
-    <td><img src="docs/media/taskbar-fold.gif" width="520" alt="开启后任务栏随总览进入折叠，退出恢复"></td>
-    <td><img src="docs/media/taskbar-stay.gif" width="520" alt="关闭后任务栏画面在总览过程中保持原位"></td>
-  </tr>
-</table>
-
 最小化窗口仍从对应任务栏按钮的位置与宽高飞出，再连续变成窗口预览的比例。
 
 ### 多显示器
@@ -163,7 +136,7 @@
 
 macOS 和 Linux 桌面的多任务总览界面是本项目的交互参考。Window Scatter 根据自身的设计目标，独立探索窗口的空间布局、手势选窗、连续重排与最小化恢复，让窗口管理适应 Windows 上的实际使用方式。
 
-预览使用真实软件截图和应用图标，窗口外框与截图原始比例一致。动图离线生成，布局由本版本的布局算法计算，用于说明交互；它们不是桌面实录或性能测量。详见[预览素材说明](docs/media-sources.md)。
+预览录制了真实浏览器和 VS Code 窗口，展示公开网页与本项目源码。窗口内容由应用实时绘制，布局与动画由当前程序运行。录制说明见[预览素材说明](docs/media-sources.md)。
 
 ## 更多说明
 

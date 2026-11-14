@@ -2,7 +2,7 @@
 // @id              window-scatter
 // @name            Window Scatter
 // @description     An independent window overview for Windows 11, with spatial layouts, live previews and touchpad navigation.
-// @version         1.0.5
+// @version         1.0.6
 // @author          SinCircle
 // @include         windhawk.exe
 // @include         explorer.exe
@@ -151,6 +151,7 @@ https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-
 #include <wrl/client.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <shlobj.h>
 #include <propkey.h>
 #include <uiautomation.h>
 #include <appmodel.h>
@@ -937,7 +938,11 @@ static std::vector<Box> StableLayout(const std::vector<Box>&src,const std::vecto
     // Larger scenes retain the packing estimate as their search ceiling. Small
     // scenes can use the free space beyond it without an unbounded search.
     if(src.size()>24)high=std::min(high,std::max(seedScale,allKnown?oldScale:0.));
-    double history=allKnown||src.size()<=24?.35:3.;
+    // Once a window leaves this group, its old vacancy must not act like a
+    // positional anchor for its neighbours. Retain the separating directions
+    // for non-crossing motion, but solve the remaining positions afresh.
+    bool removed=allKnown&&std::any_of(previous.begin(),previous.end(),[&](const LayoutSlot&p){return p.count>int(src.size());});
+    double history=removed?0.:allKnown||src.size()<=24?.35:3.;
     auto attempt=[&](double scale){
         auto fit=FreePositions(src,seed,area,gap,caption,scale,anchors,history);
         if(!fit.boxes.empty()){low=scale;best=std::move(fit);seed=best.boxes;return true;}
@@ -1146,6 +1151,8 @@ struct DesktopCache {
     HMONITOR monitor=nullptr;RECT bounds{},display{};std::wstring path;
     FILETIME modified{};COLORREF color=0;DESKTOP_WALLPAPER_POSITION mode=DWPOS_FILL;
     ComPtr<IDCompositionSurface> surface;
+    std::wstring requestedPath;
+    FILETIME requestedModified{};
 };
 enum class Phase{Hidden,Opening,Settled,Closing};
 
@@ -1352,6 +1359,46 @@ public:
         ctx->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
         return surface->EndDraw();
     }
+    static std::vector<std::wstring> WallpaperFallbacks(const std::wstring&requested){
+        std::vector<std::wstring> paths;if(requested.empty())return paths;
+        wchar_t roaming[MAX_PATH]{};
+        if(FAILED(SHGetFolderPath(nullptr,CSIDL_APPDATA,nullptr,SHGFP_TYPE_CURRENT,roaming)))return paths;
+        std::wstring themes=std::wstring(roaming)+L"\\Microsoft\\Windows\\Themes\\";
+        // Spotlight may remove its original JPEG while Explorer retains the
+        // transcoded image. Match the source recorded in its cache metadata;
+        // never choose another monitor's image merely because it is newest.
+        std::wstring directory=themes+L"TranscodedWallpaperCache\\";
+        WIN32_FIND_DATA data{};HANDLE search=FindFirstFile((directory+L"TranscodedWallpaper_*.meta").c_str(),&data);
+        if(search!=INVALID_HANDLE_VALUE){do{
+            if(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)continue;
+            std::wstring metadata=directory+data.cFileName;
+            HANDLE file=CreateFile(metadata.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
+            if(file==INVALID_HANDLE_VALUE)continue;
+            LARGE_INTEGER size{};bool matches=false;
+            if(GetFileSizeEx(file,&size)&&size.QuadPart>0&&size.QuadPart<=65536&&size.QuadPart%sizeof(wchar_t)==0){
+                std::vector<wchar_t> contents(size_t(size.QuadPart)/sizeof(wchar_t)+1,0);DWORD read=0;
+                if(ReadFile(file,contents.data(),DWORD(size.QuadPart),&read,nullptr)&&read==size.QuadPart){
+                    for(size_t n=0;n+requested.size()<contents.size();++n)
+                        if(contents[n+requested.size()]==0&&CompareStringOrdinal(contents.data()+n,int(requested.size()),requested.data(),int(requested.size()),TRUE)==CSTR_EQUAL){matches=true;break;}
+                }
+            }
+            CloseHandle(file);if(matches)paths.push_back(metadata.substr(0,metadata.size()-5));
+        }while(FindNextFile(search,&data));FindClose(search);}
+        wchar_t current[32768]{};
+        if(SystemParametersInfo(SPI_GETDESKWALLPAPER,32768,current,0)&&!_wcsicmp(current,requested.c_str()))
+            paths.push_back(themes+L"TranscodedWallpaper");
+        return paths;
+    }
+    bool DecodeWallpaper(const std::wstring&path,ComPtr<IWICBitmap>&bitmap){
+        bitmap.Reset();if(path.empty())return false;
+        ComPtr<IWICBitmapDecoder> decoder;ComPtr<IWICBitmapFrameDecode> frame;ComPtr<IWICFormatConverter> converter;
+        HRESULT hr=imageFactory->CreateDecoderFromFilename(path.c_str(),nullptr,GENERIC_READ,WICDecodeMetadataCacheOnLoad,&decoder);
+        if(SUCCEEDED(hr))hr=decoder->GetFrame(0,&frame);
+        if(SUCCEEDED(hr))hr=imageFactory->CreateFormatConverter(&converter);
+        if(SUCCEEDED(hr))hr=converter->Initialize(frame.Get(),GUID_WICPixelFormat32bppPBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom);
+        if(SUCCEEDED(hr))hr=imageFactory->CreateBitmapFromSource(converter.Get(),WICBitmapCacheOnLoad,&bitmap);
+        return SUCCEEDED(hr);
+    }
     bool PrepareDesktop(View&v){
         MONITORINFO mi{sizeof(mi)};GetMonitorInfo(v.monitor,&mi);
         // Display/settings notifications invalidate the metadata. Between them,
@@ -1359,6 +1406,10 @@ public:
         for(const auto&cached:desktopCache)if(cached.monitor==v.monitor&&EqualRect(&cached.bounds,&v.bounds)){
             RECT expected=mi.rcMonitor;if(cached.mode==DWPOS_SPAN)expected={GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)};
             WIN32_FILE_ATTRIBUTE_DATA info{};if(!cached.path.empty())GetFileAttributesEx(cached.path.c_str(),GetFileExInfoStandard,&info);
+            if(!cached.requestedPath.empty()){
+                WIN32_FILE_ATTRIBUTE_DATA requested{};GetFileAttributesEx(cached.requestedPath.c_str(),GetFileExInfoStandard,&requested);
+                if(CompareFileTime(&cached.requestedModified,&requested.ftLastWriteTime)!=0)continue;
+            }
             if(EqualRect(&cached.display,&expected)&&CompareFileTime(&cached.modified,&info.ftLastWriteTime)==0){v.wallpaperSurface=cached.surface;return true;}
         }
         RECT display=mi.rcMonitor;COLORREF color=GetSysColor(COLOR_DESKTOP);
@@ -1379,15 +1430,10 @@ public:
         auto found=std::find_if(desktopCache.begin(),desktopCache.end(),[&](const auto&c){return c.monitor==v.monitor;});
         if(found!=desktopCache.end()&&found->path==path&&found->mode==mode&&found->color==color&&
            EqualRect(&found->bounds,&v.bounds)&&EqualRect(&found->display,&display)&&CompareFileTime(&found->modified,&fileInfo.ftLastWriteTime)==0){v.wallpaperSurface=found->surface;return true;}
+        std::wstring requestedPath=path;FILETIME requestedModified=fileInfo.ftLastWriteTime;
         ComPtr<IWICBitmap> bitmapSource;
-        {
-            ComPtr<IWICBitmapDecoder> decoder;ComPtr<IWICBitmapFrameDecode> frame;ComPtr<IWICFormatConverter> converter;
-            HRESULT hr=path.empty()?E_FAIL:imageFactory->CreateDecoderFromFilename(path.c_str(),nullptr,GENERIC_READ,WICDecodeMetadataCacheOnLoad,&decoder);
-            if(SUCCEEDED(hr))hr=decoder->GetFrame(0,&frame);
-            if(SUCCEEDED(hr))hr=imageFactory->CreateFormatConverter(&converter);
-            if(SUCCEEDED(hr))hr=converter->Initialize(frame.Get(),GUID_WICPixelFormat32bppPBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom);
-            if(SUCCEEDED(hr))imageFactory->CreateBitmapFromSource(converter.Get(),WICBitmapCacheOnLoad,&bitmapSource);
-        }
+        if(!DecodeWallpaper(path,bitmapSource))for(const auto&fallback:WallpaperFallbacks(path))
+            if(DecodeWallpaper(fallback,bitmapSource)){path=fallback;fileInfo={};GetFileAttributesEx(path.c_str(),GetFileExInfoStandard,&fileInfo);break;}
         UINT width=v.bounds.right-v.bounds.left,height=v.bounds.bottom-v.bounds.top;
         HRESULT hr=Paint(v.wallpaperSurface,width,height,true,[&](ID2D1DeviceContext*ctx){
             // This opaque base is mandatory: excluding a live window may leave
@@ -1405,9 +1451,12 @@ public:
         });
         if(FAILED(hr)){Log(L"Prepare wallpaper",hr);return false;}
         DesktopCache entry{v.monitor,v.bounds,display,path,fileInfo.ftLastWriteTime,color,mode,v.wallpaperSurface};
+        if(path!=requestedPath){entry.requestedPath=requestedPath;entry.requestedModified=requestedModified;}
         // COM/painting can dispatch a settings notification that invalidates
         // the cache; never retain an iterator across those calls.
-        std::erase_if(desktopCache,[&](const auto&c){return c.monitor==v.monitor;});desktopCache.push_back(std::move(entry));
+        std::erase_if(desktopCache,[&](const auto&c){return c.monitor==v.monitor;});
+        // A transient decode failure must not become a permanent black cache.
+        if(bitmapSource||requestedPath.empty())desktopCache.push_back(std::move(entry));
         return true;
     }
     static BOOL CALLBACK WarmMonitor(HMONITOR monitor,HDC,LPRECT,LPARAM data){
