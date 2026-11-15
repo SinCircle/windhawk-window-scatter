@@ -2159,8 +2159,14 @@ public:
     }
     bool CreateView(View&v){
         RECT r=v.bounds;
-        v.hwnd=CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,kOverlay,L"Window Scatter",WS_POPUP,r.left,r.top,r.right-r.left,r.bottom-r.top,nullptr,nullptr,g_instance,&v);
+        // The scene already has an opaque wallpaper. Give DWM an opaque
+        // window backing as well, so it can occlude the desktop below it.
+        v.hwnd=CreateWindowEx(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,kOverlay,L"Window Scatter",WS_POPUP,r.left,r.top,r.right-r.left,r.bottom-r.top,nullptr,nullptr,g_instance,&v);
         if(!v.hwnd)return false;
+        HDC backing=GetDC(v.hwnd);if(!backing)return false;
+        RECT client{};GetClientRect(v.hwnd,&client);
+        int painted=FillRect(backing,&client,static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        ReleaseDC(v.hwnd,backing);if(!painted)return false;
         // This is a shell overview, not a full-screen application. Opt out
         // before showing it so automatic full-screen detection does not
         // enable Do Not Disturb and change the live taskbar during exit.
