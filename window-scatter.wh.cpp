@@ -2436,7 +2436,7 @@ public:
         phase=to==1?Phase::Opening:Phase::Closing;
         for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;bar.to=destination==1?bar.hidden:bar.shown;
             bool atButton=std::abs(bar.from.x-bar.shown.x)+std::abs(bar.from.y-bar.shown.y)<.1;
-            bar.delay=destination==1&&atButton&&!reflow?seconds*.2:0;
+            bar.delay=destination==1&&atButton&&!reflow?seconds*.12:0;
             auto property=[&](double a,double b,auto setter){Property(a,b,setter,seconds-bar.delay,bar.delay);};
             property(bar.from.x,bar.to.x,[&](auto value){bar.position->SetOffsetX(value);});
             property(bar.from.y,bar.to.y,[&](auto value){bar.position->SetOffsetY(value);});
