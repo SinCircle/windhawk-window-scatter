@@ -72,6 +72,8 @@ file timestamps and display/theme notifications invalidate stale backgrounds.
 DWM supplies the live window surface and its transparency. The existing native
 DirectComposition rectangle clip applies 8 DIP corners, including to maximized
 and snapped previews, and removes DWM corner shadow pixels outside that shape.
+During the exit shadow fade this extra clip relaxes to the native DWM edge,
+preserving the shadow inside the rounded corner cutouts at handoff.
 No corner texture or filter-effect graph is used. The eight clip radius properties
 share one compositor animation per distinct radius transition, submitted once.
 The outline follows the same circular corners at a constant 4 DIP gap and tracks
@@ -1094,10 +1096,12 @@ struct Item {
     Box layoutAnchor;bool anchorMinimized=false;LayoutSlot anchorSlot,layoutSlot;
     Box motionFrom,motionTo;
     float radiusFrom=0,radiusTo=0;
+    double radiusDelay=0,radiusSeconds=0;
     double labelFrom=0,labelTo=0,labelSeconds=0;
     double shadowFrom=0,shadowTo=0,shadowDelay=0,shadowSeconds=0;
     struct MotionCapture {
         Box from,to;float radiusFrom=0,radiusTo=0;
+        double radiusDelay=0,radiusSeconds=0;
         double labelFrom=0,labelTo=0,labelSeconds=0;
         double shadowFrom=0,shadowTo=0,shadowDelay=0,shadowSeconds=0;
         bool active=false;
@@ -2048,7 +2052,13 @@ public:
     static Box HiddenPose(const Item&i){return i.minimized?i.minimizedOrigin:i.original;}
     static float HiddenRadius(const View&v,const Item&i){return i.minimized?OverviewRadius(v,i.minimizedOrigin):i.nativeRadius;}
     Box ExitPose(const Item&i)const{return i.minimized&&i.source!=chosen?i.minimizedOrigin:i.original;}
-    float ExitRadius(const View&v,const Item&i)const{return i.minimized&&i.source!=chosen?HiddenRadius(v,i):i.nativeRadius;}
+    float ExitRadius(const View&v,const Item&i)const{
+        if(i.minimized&&i.source!=chosen)return HiddenRadius(v,i);
+        // The shared DWM surface already contains the native rounded edge and
+        // the shadow inside its corner cutouts. Once the exterior shadow fades
+        // in, release our overview clip so it does not cut those pixels twice.
+        return i.shadow.root?0.f:i.nativeRadius;
+    }
     static void ActivateWindow(HWND target,bool restoreMinimized){
         if(!IsWindow(target))return;
         if(!restoreMinimized&&IsIconic(target))return;
@@ -2351,7 +2361,7 @@ public:
             if(i.label){i.label->SetOffsetX(float((b.w-i.target.w)*.5));i.label->SetOffsetY(float(b.h-v->dpi));i.labelEffect->SetOpacity(float(p));}
             i.labelFrom=i.labelTo=p;i.labelSeconds=0;
             float radius=float(ExitRadius(*v,i)+(OverviewRadius(*v,i.target)-ExitRadius(*v,i))*p);
-            SetCorners(i,radius);i.radiusFrom=i.radiusTo=radius;i.motionFrom=i.motionTo=b;
+            SetCorners(i,radius);i.radiusFrom=i.radiusTo=radius;i.radiusDelay=i.radiusSeconds=0;i.motionFrom=i.motionTo=b;
             i.shadowFrom=i.shadowTo=phase==Phase::Closing&&p==0&&(!i.minimized||i.source==chosen)?1:0;
             i.shadowDelay=i.shadowSeconds=0;
             if(i.shadow.root){i.shadow.opacity->SetOpacity(float(i.shadowTo));
@@ -2368,6 +2378,9 @@ public:
         return i.shadowFrom+(i.shadowTo-i.shadowFrom)*Curve(i.shadowSeconds<=0?1:(now-start-i.shadowDelay)/i.shadowSeconds);
     }
     double CurrentShadowOpacity(const Item&i)const{return CurrentShadowOpacity(i,Now());}
+    float CurrentRadius(const Item&i,double now)const{
+        return float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*Curve(i.radiusSeconds<=0?1:(now-start-i.radiusDelay)/i.radiusSeconds));
+    }
     void AnimateShadow(Item&i,bool join=false){
         if(!i.shadow.root)return;
         auto property=[&](double a,double b,double duration,double delay,auto setter){
@@ -2392,8 +2405,8 @@ public:
         for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;
             bar.capturedFrom=bar.from;bar.capturedTo=bar.to;bar.capturedDelay=bar.delay;bar.from=CurrentTaskbarBox(*v,now);}
         for(auto&v:views)for(auto&i:v->items){
-            i.captured={i.motionFrom,i.motionTo,i.radiusFrom,i.radiusTo,i.labelFrom,i.labelTo,i.labelSeconds,i.shadowFrom,i.shadowTo,i.shadowDelay,i.shadowSeconds,captureActive};
-            i.radiusFrom=phase==Phase::Hidden?HiddenRadius(*v,i):phase==Phase::Settled?OverviewRadius(*v,i.target):float(i.radiusFrom+(i.radiusTo-i.radiusFrom)*t);
+            i.captured={i.motionFrom,i.motionTo,i.radiusFrom,i.radiusTo,i.radiusDelay,i.radiusSeconds,i.labelFrom,i.labelTo,i.labelSeconds,i.shadowFrom,i.shadowTo,i.shadowDelay,i.shadowSeconds,captureActive};
+            i.radiusFrom=phase==Phase::Hidden?HiddenRadius(*v,i):phase==Phase::Settled?OverviewRadius(*v,i.target):CurrentRadius(i,now);
             i.motionFrom=CurrentBox(i,t);i.labelFrom=CurrentLabelOpacity(i,now);i.shadowFrom=CurrentShadowOpacity(i,now);
         }
     }
@@ -2406,7 +2419,8 @@ public:
         if(progress==captureProgress)progress=captureFrom+(captureTo-captureFrom)*t;
         for(auto&v:views)if(v->taskbar.position){auto&bar=v->taskbar;bar.from=Mix(bar.capturedFrom,bar.capturedTo,Curve(captureSeconds<=bar.capturedDelay?1:(elapsed-bar.capturedDelay)/(captureSeconds-bar.capturedDelay)));}
         for(auto&v:views)for(auto&i:v->items)if(std::exchange(i.captured.active,false)){const auto&c=i.captured;
-            i.motionFrom=Mix(c.from,c.to,t);i.radiusFrom=float(c.radiusFrom+(c.radiusTo-c.radiusFrom)*t);
+            i.motionFrom=Mix(c.from,c.to,t);
+            i.radiusFrom=float(c.radiusFrom+(c.radiusTo-c.radiusFrom)*Curve(c.radiusSeconds<=0?1:(elapsed-c.radiusDelay)/c.radiusSeconds));
             i.labelFrom=c.labelFrom+(c.labelTo-c.labelFrom)*Curve(c.labelSeconds<=0?1:elapsed/c.labelSeconds);
             i.shadowFrom=c.shadowFrom+(c.shadowTo-c.shadowFrom)*Curve(c.shadowSeconds<=0?1:(elapsed-c.shadowDelay)/c.shadowSeconds);
         }
@@ -2449,6 +2463,8 @@ public:
             i.shadowTo=destination==0&&(!i.minimized||i.source==chosen)?1:0;
             i.shadowDelay=i.shadowTo>i.shadowFrom&&i.shadowFrom<.001?seconds*.65:0;
             i.shadowSeconds=seconds-i.shadowDelay;
+            i.radiusDelay=destination==0&&i.shadow.root?i.shadowDelay:0;
+            i.radiusSeconds=seconds-i.radiusDelay;
             AnimateShadow(i);
             Property(a.x,b.x,[&](auto value){i.position->SetOffsetX(value);});
             Property(a.y,b.y,[&](auto value){i.position->SetOffsetY(value);});
@@ -2456,7 +2472,7 @@ public:
             Property(a.h/i.pixels.cy,b.h/i.pixels.cy,[&](auto value){i.scale->SetScaleY(value);});
             Property(a.w,b.w,[&](auto value){i.clip->SetRight(value);});
             Property(a.h,b.h,[&](auto value){i.clip->SetBottom(value);});
-            Property(i.radiusFrom,i.radiusTo,[&](auto value){SetCorners(i,value);});
+            Property(i.radiusFrom,i.radiusTo,[&](auto value){SetCorners(i,value);},i.radiusSeconds,i.radiusDelay);
             if(i.borderAttached){
                 Property((a.w+2*i.Outset())/i.borderWidth,(b.w+2*i.Outset())/i.borderWidth,[&](auto value){i.borderScale->SetScaleX(value);});
                 Property((a.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,(b.h+TitleProtrusion(*v,i)+2*i.Outset())/i.borderHeight,[&](auto value){i.borderScale->SetScaleY(value);});
@@ -2594,7 +2610,7 @@ public:
             float radius=SystemCornerRadius(i.source,v->dpi);
             bool rebound=RebindRestoredSample(*v,i,r);
             if(EnsureExitShadow(*v,i)){AnimateShadow(i,true);rebound=true;}
-            if(std::abs(restored.x-i.original.x)<.1&&std::abs(restored.y-i.original.y)<.1&&std::abs(restored.w-i.original.w)<.1&&std::abs(restored.h-i.original.h)<.1&&radius==i.nativeRadius){if(rebound)device->Commit();return;}
+            if(std::abs(restored.x-i.original.x)<.1&&std::abs(restored.y-i.original.y)<.1&&std::abs(restored.w-i.original.w)<.1&&std::abs(restored.h-i.original.h)<.1&&radius==i.nativeRadius&&i.radiusTo==ExitRadius(*v,i)){if(rebound)device->Commit();return;}
             if(animate){progress=CurrentProgress();CaptureMotion();}
             i.original=restored;i.nativeRadius=radius;
             if(animate)Animate(0,true);
