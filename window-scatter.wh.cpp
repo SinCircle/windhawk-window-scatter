@@ -29,9 +29,12 @@ Click a window to switch; hover a preview and click its close button to ask the
 application to close it. Middle click also closes the clicked preview; Shift+
 middle click closes its application's taskbar windows across processes, monitors
 and virtual desktops, including minimized windows. Save prompts remain native.
+Right click a preview or its title to minimize or restore it within the overview.
+Restoring preserves its normal/maximized state without activating the window.
+Right clicking the background does nothing; the overview stays open.
 Arrow keys select nearby previews, including minimized
 windows and other monitors; Enter switches to the selection. Moving the mouse
-resumes hover selection. Escape or a background click cancels. Tab does not
+resumes hover selection. Escape or a left background click cancels. Tab does not
 cycle candidates. Shift+Win+Tab opens the original Windows Task View, even when
 this overview is already open. Alt+Tab retains its native behavior.
 No tray icon is created. Window titles are shown, with a system-accent
@@ -1189,6 +1192,7 @@ public:
     WindowButton pressedButton=WindowButton::None;
     struct LeftPress {HWND view=nullptr,source=nullptr;DWORD process=0;} leftPress;
     struct MiddlePress {HWND source=nullptr;DWORD process=0;bool group=false;} middlePress;
+    struct RightPress {HWND view=nullptr,source=nullptr;DWORD process=0;bool minimized=false;} rightPress;
     POINT lastPointer{};
     bool keyboardSelection=false;
     UINT gestureToken=0;
@@ -1829,6 +1833,14 @@ public:
         // moves the retained preview to the shelf after minimization succeeds.
         return PostMessage(i.source,WM_SYSCOMMAND,SC_MINIMIZE,0)!=FALSE;
     }
+    static bool RequestRestoreInOverview(const Item&i){
+        DWORD process=0;GetWindowThreadProcessId(i.source,&process);
+        if(!IsWindow(i.source)||!IsIconic(i.source)||(i.sourceProcess&&process!=i.sourceProcess))return false;
+        // Restore the saved normal/maximized state without activating the source:
+        // foreground activation would dismiss the overview. Native state events
+        // promote the preview only after the source actually accepts restoration.
+        return ShowWindowAsync(i.source,SW_SHOWNOACTIVATE)!=FALSE;
+    }
     void RemoveWindowFromOverview(HWND source){
         RemoveWindowsFromOverview({source});
     }
@@ -1846,6 +1858,7 @@ public:
         CaptureMotion();ClearSelection();if(removed.contains(pressedButtonSource)){pressedButtonSource=nullptr;pressedButton=WindowButton::None;}
         if(removed.contains(middlePress.source))middlePress={};
         if(removed.contains(leftPress.source))leftPress={};
+        if(removed.contains(rightPress.source)){if(GetCapture()==rightPress.view)ReleaseCapture();rightPress={};}
         BuildGuard guard(*this);size_t remaining=0;
         for(auto&v:views){
             for(auto&i:v->items)if(removed.contains(i.source))v->windows->RemoveVisual(i.position.Get());
@@ -2683,7 +2696,7 @@ public:
         // Shared visuals own their private thumbnail references. Release visual
         // trees and destroy destinations; don't treat private IDs as public registrations.
         for(auto&v:views){v->items.clear();v->desktop.Reset();v->wallpaperSurface.Reset();v->windows.Reset();v->root.Reset();v->target.Reset();if(v->hwnd)DestroyWindow(v->hwnd);}
-        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;leftPress={};middlePress={};keyboardSelection=false;progress=0;
+        views.clear();previous=chosen=selectedSource=pressedButtonSource=nullptr;pressedButton=WindowButton::None;leftPress={};middlePress={};rightPress={};keyboardSelection=false;progress=0;
         if(device)device->Commit(); // Submit the filter-input detachments from Item destruction.
         if(idle&&timer&&device){
             if(ShouldReleaseGraphics())PostMessage(controller,kReleaseInactive,0,0);
@@ -2969,6 +2982,7 @@ public:
             if(phase!=Phase::Hidden)HoverButtons(*v,i,point);TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);}return 0;
         case WM_MOUSELEAVE:if(!gestureToken&&!keyboardSelection&&v&&v->selected>=0)Select(nullptr);return 0;
         case WM_LBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
+            rightPress={};
             leftPress={hwnd,i<0?nullptr:v->items[i].source,i<0?0:v->items[i].sourceProcess};
             pressedButton=ButtonAt(*v,i,point);pressedButtonSource=pressedButton==WindowButton::None?nullptr:leftPress.source;SetCapture(hwnd);}return 0;
         case WM_LBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int i=Hit(*v,point);
@@ -2979,6 +2993,7 @@ public:
             if(pressed){if(i>=0&&v->items[i].source==pressed&&ButtonAt(*v,i,point)==button){if(button==WindowButton::Close)RequestClose(v->items[i]);else if(button==WindowButton::Minimize)RequestMinimize(v->items[i]);}}
             else if(ButtonAt(*v,i,point)==WindowButton::None)Close(i<0?nullptr:v->items[i].source);}return 0;
         case WM_MBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){
+            rightPress={};
             POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int index=Hit(*v,point);middlePress={};
             if(index>=0&&!(wp&MK_CONTROL)){const auto&i=v->items[index];middlePress={i.source,i.sourceProcess,(wp&MK_SHIFT)!=0};SetCapture(hwnd);}
         }return 0;
@@ -2989,9 +3004,24 @@ public:
                 if(pressed.group)RequestCloseGroup(pressed.source,pressed.process);else RequestClose(pressed.source,pressed.process);
             }
         }return 0;
+        case WM_RBUTTONDOWN:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int index=Hit(*v,point);
+            rightPress={};leftPress={};middlePress={};pressedButtonSource=nullptr;pressedButton=WindowButton::None;
+            // Moving capture between overview monitors synchronously clears the
+            // old press. Record the new target only after that notification.
+            if(index>=0){SetCapture(hwnd);const auto&i=v->items[index];rightPress={hwnd,i.source,i.sourceProcess,IsIconic(i.source)!=FALSE};}
+        }return 0;
+        case WM_RBUTTONUP:if(v&&(phase==Phase::Settled||phase==Phase::Opening)){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int index=Hit(*v,point);auto pressed=std::exchange(rightPress,RightPress{});
+            if(GetCapture()==hwnd)ReleaseCapture();
+            RECT client{};GetClientRect(hwnd,&client);
+            if(pressed.view!=hwnd||!PtInRect(&client,point)||index<0||v->items[index].source!=pressed.source)return 0;
+            DWORD process=0;if(!GetWindowThreadProcessId(pressed.source,&process)||(pressed.process&&process!=pressed.process)||
+                (IsIconic(pressed.source)!=FALSE)!=pressed.minimized)return 0;
+            if(pressed.minimized)RequestRestoreInOverview(v->items[index]);else RequestMinimize(v->items[index]);
+        }return 0;
         case WM_CANCELMODE:if(GetCapture()==hwnd)ReleaseCapture();[[fallthrough]];
-        case WM_CAPTURECHANGED:pressedButtonSource=nullptr;pressedButton=WindowButton::None;leftPress={};middlePress={};return 0;
-        case WM_RBUTTONUP:Close(nullptr);return 0;
+        case WM_CAPTURECHANGED:pressedButtonSource=nullptr;pressedButton=WindowButton::None;leftPress={};middlePress={};rightPress={};return 0;
         case WM_SYSKEYDOWN:case WM_KEYDOWN:
             if(building)return 0;
             if(wp==VK_ESCAPE){Close(nullptr);return 0;}
